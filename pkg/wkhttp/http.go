@@ -57,7 +57,10 @@ func ParseTokenCacheInfo(raw string) (*TokenCacheInfo, error) {
 	}
 	var info TokenCacheInfo
 	if err := json.Unmarshal([]byte(raw), &info); err == nil {
-		if strings.TrimSpace(info.UID) == "" || info.Name == "" {
+		// 允许新注册用户昵称为空。
+		// 注册开启“必须完善资料”后，name 会先为空；如果这里继续要求 Name 非空，
+		// 头像上传、昵称更新等需要鉴权的接口会返回 401，导致完善资料页面循环。
+		if strings.TrimSpace(info.UID) == "" {
 			return nil, errors.New("token有误")
 		}
 		return &info, nil
