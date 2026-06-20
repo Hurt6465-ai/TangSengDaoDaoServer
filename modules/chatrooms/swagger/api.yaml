@@ -1,0 +1,23 @@
+openapi: 3.0.0
+info:
+  title: open topic chatrooms
+  version: 1.0.0
+paths:
+  /v1/chatrooms/list:
+    get:
+      summary: list open topic chatrooms
+  /v1/chatrooms/create:
+    post:
+      summary: create open topic chatroom
+  /v1/chatrooms/enter:
+    post:
+      summary: enter open topic chatroom
+  /v1/chatrooms/pin:
+    post:
+      summary: pin or unpin topic chatroom
+  /v1/chatrooms/delete:
+    post:
+      summary: delete topic chatroom
+  /v1/chatrooms/message-hook:
+    post:
+      summary: update last reply preview by IM callback
