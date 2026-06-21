@@ -3,10 +3,10 @@ name: 🐳 Docker (Multi-Arch)
 on:
   workflow_dispatch: {}
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   push:
-    branches: [ "main" ]
-    tags: [ "*" ]
+    branches: ["main"]
+    tags: ["*"]
 
 env:
   REGISTRY: ghcr.io
@@ -23,16 +23,31 @@ jobs:
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 🐹 Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.20'
-       
+          cache: true
+
       - name: 🧱 Build binaries
+        shell: bash
         run: |
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o linux_amd64
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o linux_arm64
+          set -euo pipefail
+          GIT_COMMIT="$(git rev-parse HEAD)"
+          GIT_COMMIT_DATE="$(git log --date=iso8601-strict -1 --pretty=%ct)"
+          GIT_VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo sso-chatrooms)"
+          if [ -n "$(git status --porcelain)" ]; then
+            GIT_TREE_STATE="dirty"
+          else
+            GIT_TREE_STATE="clean"
+          fi
+          LDFLAGS="-w -extldflags '-static' -X main.Commit=${GIT_COMMIT} -X main.CommitDate=${GIT_COMMIT_DATE} -X main.Version=${GIT_VERSION} -X main.TreeState=${GIT_TREE_STATE}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -installsuffix cgo -o linux_amd64 ./main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -installsuffix cgo -o linux_arm64 ./main.go
+          chmod +x linux_amd64 linux_arm64
 
       - name: 🛠️ Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
