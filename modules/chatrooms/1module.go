@@ -3,7 +3,6 @@ package chatrooms
 import (
 	"context"
 	"embed"
-	"fmt"
 	"time"
 
 	wkcommon "github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
