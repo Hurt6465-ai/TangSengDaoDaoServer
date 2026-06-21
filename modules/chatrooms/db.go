@@ -195,7 +195,7 @@ func (d *db) softDelete(roomID string) error {
 	}
 	// 解散原生群并删除成员。客户端下一次同步会话时不再把该公开话题当成有效群。
 	_, _ = tx.Update("group_member").Set("is_deleted", 1).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
-	_, _ = tx.Update("`group`").Set("status", 2).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
+	_, _ = tx.Update("group").Set("status", 2).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
 	return tx.Commit()
 }
 
