@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 )
 
@@ -63,6 +64,10 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 	if err := s.db.create(room); err != nil {
 		return nil, err
 	}
+	if err := s.syncIMChannel(room, []string{room.CreatorUID}); err != nil {
+		_ = s.db.softDelete(room.RoomID)
+		return nil, err
+	}
 	return room, nil
 }
 
@@ -77,8 +82,19 @@ func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
 	}
 	if uid != "" {
 		user, _ := s.db.queryUserMeta(uid)
-		_ = s.db.addMember(room.RoomID, room.ChannelID, uid, user.Name, user.Avatar)
-		_ = s.db.ensureNativeGroupMember(room.ChannelID, uid, room.CreatorUID, 0)
+		if err := s.db.addMember(room.RoomID, room.ChannelID, uid, user.Name, user.Avatar); err != nil {
+			return nil, err
+		}
+		uids, _ := s.db.memberUIDs(room.ChannelID)
+		if len(uids) == 0 {
+			uids = []string{uid}
+		}
+		if err := s.syncIMChannel(room, uids); err != nil {
+			return nil, err
+		}
+		if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
+			return nil, err
+		}
 	}
 	return room, nil
 }
@@ -147,6 +163,49 @@ func (s *Service) ChannelGet(channelID string, loginUID string) (*TopicRoom, err
 		_ = s.db.loadUnread(room, loginUID)
 	}
 	return room, nil
+}
+
+func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {
+	if room == nil || room.ChannelID == "" {
+		return nil
+	}
+	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		ChannelID:   room.ChannelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: compactUIDs(subscribers),
+	})
+}
+
+func (s *Service) addIMSubscribers(channelID string, subscribers []string) error {
+	if channelID == "" {
+		return nil
+	}
+	uids := compactUIDs(subscribers)
+	if len(uids) == 0 {
+		return nil
+	}
+	return s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: uids,
+	})
+}
+
+func compactUIDs(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, uid := range in {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		out = append(out, uid)
+	}
+	return out
 }
 
 func (s *Service) ttl() time.Duration {
