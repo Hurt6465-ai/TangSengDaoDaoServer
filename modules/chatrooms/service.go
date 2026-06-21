@@ -1,7 +1,6 @@
 package chatrooms
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,7 +18,7 @@ type Service struct {
 
 func NewService(ctx *config.Context) *Service {
 	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL}
-	// 事件驱动：IM消息入库后自动更新话题摘要、回复数、过期时间和参与头像。
+	// 事件驱动更新：避免话题有回复但 expire_at 不续期，导致“正在聊的话题 3 小时后消失”。
 	ctx.AddMessagesListener(svc.listenerMessages)
 	return svc
 }
@@ -178,49 +177,6 @@ func (s *Service) ChannelGet(channelID string, loginUID string) (*TopicRoom, err
 	return room, nil
 }
 
-func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {
-	if room == nil || room.ChannelID == "" {
-		return nil
-	}
-	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-		ChannelID:   room.ChannelID,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: compactUIDs(subscribers),
-	})
-}
-
-func (s *Service) addIMSubscribers(channelID string, subscribers []string) error {
-	if channelID == "" {
-		return nil
-	}
-	uids := compactUIDs(subscribers)
-	if len(uids) == 0 {
-		return nil
-	}
-	return s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
-		ChannelID:   channelID,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: uids,
-	})
-}
-
-func compactUIDs(in []string) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(in))
-	for _, uid := range in {
-		uid = strings.TrimSpace(uid)
-		if uid == "" {
-			continue
-		}
-		if _, ok := seen[uid]; ok {
-			continue
-		}
-		seen[uid] = struct{}{}
-		out = append(out, uid)
-	}
-	return out
-}
-
 func (s *Service) listenerMessages(messages []*config.MessageResp) {
 	if len(messages) == 0 {
 		return
@@ -237,7 +193,7 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 			user.UID = msg.FromUID
 		}
 		text, msgType := messagePreview(msg)
-		createdAt := int64(msg.Timestamp) * 1000
+		createdAt := msg.Timestamp * 1000
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
@@ -270,10 +226,33 @@ func messagePreview(msg *config.MessageResp) (string, string) {
 			}
 		}
 	}
-	if raw, err := json.Marshal(payload); err == nil && len(raw) > 0 {
-		return previewText(msgType), msgType
+	return previewText(msgType), msgType
+}
+
+func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {
+	if room == nil || room.ChannelID == "" {
+		return nil
 	}
-	return "[消息]", msgType
+	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
+		ChannelID:   room.ChannelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: compactUIDs(subscribers),
+	})
+}
+
+func (s *Service) addIMSubscribers(channelID string, subscribers []string) error {
+	if channelID == "" {
+		return nil
+	}
+	uids := compactUIDs(subscribers)
+	if len(uids) == 0 {
+		return nil
+	}
+	return s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+		Subscribers: uids,
+	})
 }
 
 func (s *Service) deleteIMChannel(channelID string) error {
@@ -284,6 +263,23 @@ func (s *Service) deleteIMChannel(channelID string) error {
 		ChannelID:   channelID,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 	})
+}
+
+func compactUIDs(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, uid := range in {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		out = append(out, uid)
+	}
+	return out
 }
 
 func (s *Service) ttl() time.Duration {
