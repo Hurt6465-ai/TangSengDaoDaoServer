@@ -193,7 +193,7 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 			user.UID = msg.FromUID
 		}
 		text, msgType := messagePreview(msg)
-		createdAt := msg.Timestamp * 1000
+		createdAt := int64(msg.Timestamp) * 1000
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
