@@ -40,7 +40,6 @@ func init() {
 						return nil, err
 					}
 					return map[string]interface{}{
-						"large":       1,
 						"topic_room":  1,
 						"expire_at":   room.ExpireAt,
 						"reply_count": room.ReplyCount,
