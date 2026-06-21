@@ -40,6 +40,7 @@ func init() {
 						return nil, err
 					}
 					return map[string]interface{}{
+						"large":       1,
 						"topic_room":  1,
 						"expire_at":   room.ExpireAt,
 						"reply_count": room.ReplyCount,
@@ -74,7 +75,7 @@ func newChannelRespWithTopicRoom(room *TopicRoom) *model.ChannelResp {
 	resp.Channel.ChannelID = room.ChannelID
 	resp.Channel.ChannelType = uint8(wkcommon.ChannelTypeGroup)
 	resp.Name = room.Title
-	resp.Logo = ""
+	resp.Logo = room.CreatorAvatar
 	resp.Save = 1
 	resp.Category = "topic_room"
 	resp.Extra = map[string]interface{}{
