@@ -1,6 +1,7 @@
 package chatrooms
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,7 +18,10 @@ type Service struct {
 }
 
 func NewService(ctx *config.Context) *Service {
-	return &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL}
+	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL}
+	// 事件驱动：IM消息入库后自动更新话题摘要、回复数、过期时间和参与头像。
+	ctx.AddMessagesListener(svc.listenerMessages)
+	return svc
 }
 
 func (s *Service) List(uid string) ([]*TopicRoom, error) {
@@ -58,6 +62,7 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 		CreatorUID:      user.UID,
 		CreatorName:     user.Name,
 		CreatorAvatar:   user.Avatar,
+		ReplyUsers:      []ReplyAvatar{{UID: user.UID, Name: user.Name, Avatar: user.Avatar}},
 		CreatedAt:       ts,
 		ExpireAt:        ts + int64(s.ttl()/time.Millisecond),
 	}
@@ -112,7 +117,14 @@ func (s *Service) Delete(req RoomReq) error {
 	if roomID == "" {
 		roomID = req.ChannelID
 	}
-	return s.db.softDelete(roomID)
+	room, _ := s.db.get(roomID)
+	if err := s.db.softDelete(roomID); err != nil {
+		return err
+	}
+	if room != nil {
+		_ = s.deleteIMChannel(room.ChannelID)
+	}
+	return nil
 }
 
 func (s *Service) MessageWebhook(req *MessageWebhookReq) (*TopicRoom, error) {
@@ -140,6 +152,7 @@ func (s *Service) CleanupExpired(limit uint64) (int, error) {
 			continue
 		}
 		if err := s.db.softDelete(room.RoomID); err == nil {
+			_ = s.deleteIMChannel(room.ChannelID)
 			count++
 		}
 	}
@@ -206,6 +219,71 @@ func compactUIDs(in []string) []string {
 		out = append(out, uid)
 	}
 	return out
+}
+
+func (s *Service) listenerMessages(messages []*config.MessageResp) {
+	if len(messages) == 0 {
+		return
+	}
+	for _, msg := range messages {
+		if msg == nil || msg.ChannelType != common.ChannelTypeGroup.Uint8() || msg.ChannelID == "" {
+			continue
+		}
+		if !s.db.isTopicChannel(msg.ChannelID) {
+			continue
+		}
+		user, _ := s.db.queryUserMeta(msg.FromUID)
+		if user.UID == "" {
+			user.UID = msg.FromUID
+		}
+		text, msgType := messagePreview(msg)
+		createdAt := int64(msg.Timestamp) * 1000
+		if createdAt <= 0 {
+			createdAt = time.Now().UnixMilli()
+		}
+		_, _ = s.db.updateLastReply(msg.ChannelID, &MessageWebhookReq{
+			ChannelID:   msg.ChannelID,
+			FromUID:     user.UID,
+			FromName:    user.Name,
+			FromAvatar:  user.Avatar,
+			Text:        text,
+			MessageType: msgType,
+			CreatedAt:   createdAt,
+		})
+	}
+}
+
+func messagePreview(msg *config.MessageResp) (string, string) {
+	payload, err := msg.GetPayloadMap()
+	if err != nil || payload == nil {
+		return "[消息]", "message"
+	}
+	msgType := "message"
+	if v, ok := payload["type"]; ok {
+		msgType = fmt.Sprint(v)
+	}
+	for _, key := range []string{"content", "text", "summary"} {
+		if v, ok := payload[key]; ok {
+			text := strings.TrimSpace(fmt.Sprint(v))
+			if text != "" && text != "<nil>" {
+				return text, msgType
+			}
+		}
+	}
+	if raw, err := json.Marshal(payload); err == nil && len(raw) > 0 {
+		return previewText(msgType), msgType
+	}
+	return "[消息]", msgType
+}
+
+func (s *Service) deleteIMChannel(channelID string) error {
+	if channelID == "" {
+		return nil
+	}
+	return s.ctx.IMDelChannel(&config.ChannelDeleteReq{
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeGroup.Uint8(),
+	})
 }
 
 func (s *Service) ttl() time.Duration {
