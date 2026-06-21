@@ -78,6 +78,7 @@ func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
 	if uid != "" {
 		user, _ := s.db.queryUserMeta(uid)
 		_ = s.db.addMember(room.RoomID, room.ChannelID, uid, user.Name, user.Avatar)
+		_ = s.db.ensureNativeGroupMember(room.ChannelID, uid, room.CreatorUID, 0)
 	}
 	return room, nil
 }
