@@ -304,7 +304,7 @@ func (s *Service) refreshGroupAvatar(channelID string, uids []string) error {
 			GroupNo: channelID,
 			Members: members,
 		},
-	})
+	}, nil)
 	if err != nil {
 		return err
 	}
