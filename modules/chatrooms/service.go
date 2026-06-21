@@ -6,8 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
 )
 
 type Service struct {
@@ -72,6 +74,7 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 		_ = s.db.softDelete(room.RoomID)
 		return nil, err
 	}
+	_ = s.refreshGroupAvatar(room.ChannelID, []string{room.CreatorUID})
 	return room, nil
 }
 
@@ -99,6 +102,7 @@ func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
 		if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
 			return nil, err
 		}
+		_ = s.refreshGroupAvatar(room.ChannelID, uids)
 	}
 	return room, nil
 }
@@ -280,6 +284,32 @@ func compactUIDs(in []string) []string {
 		out = append(out, uid)
 	}
 	return out
+}
+
+func (s *Service) refreshGroupAvatar(channelID string, uids []string) error {
+	if channelID == "" {
+		return nil
+	}
+	members := compactUIDs(uids)
+	if len(members) == 0 {
+		return nil
+	}
+	if len(members) > 9 {
+		members = members[:9]
+	}
+	eventID, err := s.ctx.EventBegin(&wkevent.Data{
+		Event: event.GroupAvatarUpdate,
+		Type:  wkevent.CMD,
+		Data: &config.CMDGroupAvatarUpdateReq{
+			GroupNo: channelID,
+			Members: members,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	s.ctx.EventCommit(eventID)
+	return nil
 }
 
 func (s *Service) ttl() time.Duration {
