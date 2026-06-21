@@ -24,7 +24,12 @@ func newDB(ctx *config.Context) *db {
 
 func (d *db) create(room *TopicRoom) error {
 	users, _ := json.Marshal(room.ReplyUsers)
-	_, err := d.session.InsertInto("topic_rooms").Columns(
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	_, err = tx.InsertInto("topic_rooms").Columns(
 		"room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "reply_users_json",
@@ -38,7 +43,18 @@ func (d *db) create(room *TopicRoom) error {
 	if err != nil {
 		return err
 	}
-	return d.addMember(room.RoomID, room.ChannelID, room.CreatorUID, room.CreatorName, room.CreatorAvatar)
+	// 同步写入唐僧原生 group/group_member 表。
+	// 这样进入话题房后，原生群聊页面能拿到成员信息，消息也能按普通群聊发送。
+	if err = d.ensureNativeGroupTx(room, tx); err != nil {
+		return err
+	}
+	if err = d.ensureNativeGroupMemberTx(room.ChannelID, room.CreatorUID, room.CreatorUID, 1, tx); err != nil {
+		return err
+	}
+	if err = d.addMemberTx(room.RoomID, room.ChannelID, room.CreatorUID, room.CreatorName, room.CreatorAvatar, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *db) addMember(roomID, channelID, uid, name, avatar string) error {
@@ -48,6 +64,50 @@ func (d *db) addMember(roomID, channelID, uid, name, avatar string) error {
 	_, err := d.session.InsertBySql(`INSERT INTO topic_room_members(room_id,channel_id,uid,name,avatar,last_read_at,created_at,updated_at)
         VALUES(?,?,?,?,?,0,UNIX_TIMESTAMP()*1000,NOW())
         ON DUPLICATE KEY UPDATE name=VALUES(name), avatar=VALUES(avatar), updated_at=NOW()`, roomID, channelID, uid, name, avatar).Exec()
+	return err
+}
+
+func (d *db) addMemberTx(roomID, channelID, uid, name, avatar string, tx *dbr.Tx) error {
+	if roomID == "" || uid == "" {
+		return nil
+	}
+	_, err := tx.InsertBySql(`INSERT INTO topic_room_members(room_id,channel_id,uid,name,avatar,last_read_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,0,UNIX_TIMESTAMP()*1000,NOW())
+        ON DUPLICATE KEY UPDATE name=VALUES(name), avatar=VALUES(avatar), updated_at=NOW()`, roomID, channelID, uid, name, avatar).Exec()
+	return err
+}
+
+func (d *db) ensureNativeGroupTx(room *TopicRoom, tx *dbr.Tx) error {
+	if room == nil || room.ChannelID == "" {
+		return nil
+	}
+	version := time.Now().UnixMilli()
+	_, err := tx.InsertBySql("INSERT INTO `group`(group_no,name,creator,status,version,allow_view_history_msg,created_at,updated_at) VALUES(?,?,?,?,?,1,NOW(),NOW()) ON DUPLICATE KEY UPDATE name=VALUES(name), status=1, updated_at=NOW()",
+		room.ChannelID, room.Title, room.CreatorUID, 1, version).Exec()
+	return err
+}
+
+func (d *db) ensureNativeGroupMember(channelID, uid, inviteUID string, role int) error {
+	if channelID == "" || uid == "" {
+		return nil
+	}
+	version := time.Now().UnixMilli()
+	_, err := d.session.InsertBySql(`INSERT INTO group_member(group_no,uid,remark,role,version,is_deleted,status,vercode,robot,invite_uid,created_at,updated_at)
+        VALUES(?,?,?,?,?,0,1,?,0,?,NOW(),NOW())
+        ON DUPLICATE KEY UPDATE is_deleted=0, status=1, role=IF(role=1,role,VALUES(role)), updated_at=NOW()`,
+		channelID, uid, "", role, version, fmt.Sprintf("topic_%d", time.Now().UnixNano()), inviteUID).Exec()
+	return err
+}
+
+func (d *db) ensureNativeGroupMemberTx(channelID, uid, inviteUID string, role int, tx *dbr.Tx) error {
+	if channelID == "" || uid == "" {
+		return nil
+	}
+	version := time.Now().UnixMilli()
+	_, err := tx.InsertBySql(`INSERT INTO group_member(group_no,uid,remark,role,version,is_deleted,status,vercode,robot,invite_uid,created_at,updated_at)
+        VALUES(?,?,?,?,?,0,1,?,0,?,NOW(),NOW())
+        ON DUPLICATE KEY UPDATE is_deleted=0, status=1, role=IF(role=1,role,VALUES(role)), updated_at=NOW()`,
+		channelID, uid, "", role, version, fmt.Sprintf("topic_%d", time.Now().UnixNano()), inviteUID).Exec()
 	return err
 }
 
