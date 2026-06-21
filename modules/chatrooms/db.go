@@ -29,7 +29,6 @@ func (d *db) create(room *TopicRoom) error {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
-
 	_, err = tx.InsertInto("topic_rooms").Columns(
 		"room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
@@ -83,7 +82,7 @@ func (d *db) ensureNativeGroupTx(tx *dbr.Tx, room *TopicRoom) error {
 	if room == nil || room.ChannelID == "" {
 		return nil
 	}
-	version := time.Now().UnixNano() / int64(time.Millisecond)
+	version := time.Now().UnixMilli()
 	_, err := tx.InsertBySql("INSERT INTO `group`(group_no,name,avatar,creator,status,forbidden,invite,forbidden_add_friend,allow_view_history_msg,version,group_type,category,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW()) ON DUPLICATE KEY UPDATE name=VALUES(name), avatar=IF(avatar='',VALUES(avatar),avatar), creator=IF(creator='',VALUES(creator),creator), status=1, category='topic_room', updated_at=NOW()",
 		room.ChannelID, room.Title, room.CreatorAvatar, room.CreatorUID, 1, 0, 0, 0, 1, version, 0, "topic_room").Exec()
 	return err
@@ -96,7 +95,7 @@ func (d *db) addMemberTx(tx *dbr.Tx, roomID, channelID, uid, name, avatar string
 	if role != 1 {
 		role = 0
 	}
-	version := time.Now().UnixNano() / int64(time.Millisecond)
+	version := time.Now().UnixMilli()
 	_, err := tx.InsertBySql(`INSERT INTO topic_room_members(room_id,channel_id,uid,name,avatar,last_read_at,created_at,updated_at)
         VALUES(?,?,?,?,?,0,UNIX_TIMESTAMP()*1000,NOW())
         ON DUPLICATE KEY UPDATE name=VALUES(name), avatar=VALUES(avatar), updated_at=NOW()`, roomID, channelID, uid, name, avatar).Exec()
@@ -118,16 +117,12 @@ func (d *db) memberUIDs(channelID string) ([]string, error) {
 
 func (d *db) list(loginUID string) ([]*TopicRoom, error) {
 	rooms := make([]*TopicRoom, 0)
-	query := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+	// 不再按 loginUID 隐藏已加入话题。之前隐藏会导致用户发完/进完话题后，聊天室广场立刻“消失”。
+	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").
-		Where("status=1")
-	if loginUID != "" {
-		// 聊天室广场只做“发现公开群”。用户已经进入过的话题会出现在消息会话列表，广场默认隐藏，避免重复。
-		query = query.Where("NOT EXISTS (SELECT 1 FROM topic_room_members m WHERE m.room_id=topic_rooms.room_id AND m.uid=?)", loginUID)
-	}
-	_, err := query.
+		Where("status=1").
 		OrderBy("pinned DESC").
 		OrderBy("(hot_until > UNIX_TIMESTAMP()*1000) DESC").
 		OrderBy("COALESCE(NULLIF(last_reply_at,0),created_at) DESC").
@@ -198,7 +193,7 @@ func (d *db) softDelete(roomID string) error {
 	if _, err = tx.Update("topic_rooms").Set("status", 0).Set("updated_at", dbr.Expr("NOW()")).Where("room_id=? OR channel_id=?", roomID, roomID).Exec(); err != nil {
 		return err
 	}
-	// 让原生消息会话同步时自动消失：唐僧会话同步会过滤掉已解散群/非成员群。
+	// 解散原生群并删除成员。客户端下一次同步会话时不再把该公开话题当成有效群。
 	_, _ = tx.Update("group_member").Set("is_deleted", 1).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
 	_, _ = tx.Update("`group`").Set("status", 2).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
 	return tx.Commit()
@@ -223,7 +218,7 @@ func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRo
 	if update.FromUID != "" {
 		_ = d.addMember(room.RoomID, room.ChannelID, update.FromUID, update.FromName, update.FromAvatar)
 	}
-	users := dedupReplyUsers(room.CreatorUID, append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
+	users := dedupReplyUsers("", append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
 	usersJSON, _ := json.Marshal(users)
 	expireAt := ts + int64(DefaultTTL/time.Millisecond)
 	hotUntil := ts + int64(10*time.Minute/time.Millisecond)
@@ -306,7 +301,7 @@ func dedupReplyUsers(creatorUID string, in []ReplyAvatar, max int) []ReplyAvatar
 		if key == "" {
 			key = u.Avatar
 		}
-		if key == "" || key == creatorUID {
+		if key == "" {
 			continue
 		}
 		if _, ok := seen[key]; ok {
