@@ -1,3 +1,4 @@
+-- +migrate Up
 CREATE TABLE IF NOT EXISTS topic_rooms (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   room_id VARCHAR(64) NOT NULL UNIQUE,
@@ -45,3 +46,7 @@ CREATE TABLE IF NOT EXISTS topic_room_members (
   KEY idx_topic_room_members_channel (channel_id),
   KEY idx_topic_room_members_uid (uid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- +migrate Down
+DROP TABLE IF EXISTS topic_room_members;
+DROP TABLE IF EXISTS topic_rooms;
