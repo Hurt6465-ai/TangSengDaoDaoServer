@@ -21,7 +21,7 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		x := ctx.(*config.Context)
 		api := New(x)
-		StartCleanupLoop(context.Background(), api.service, time.Minute, 100)
+		StartCleanupLoop(context.Background(), api.service, 10*time.Minute, 100)
 		return register.Module{
 			Name:     "chatrooms",
 			SQLDir:   register.NewSQLFS(sqlFS),
