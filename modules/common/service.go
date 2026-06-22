@@ -1,324 +1,143 @@
-package chatrooms
+package common
 
 import (
 	"errors"
 	"fmt"
-	"strings"
+	"math/rand"
+	"sync"
 	"time"
 
-	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
-	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
-	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
+	"go.uber.org/zap"
 )
 
-type Service struct {
-	ctx *config.Context
-	db  *db
-	TTL time.Duration
+var onceSerce sync.Once
+
+// IService IService
+type IService interface {
+	GetAppConfig() (*AppConfigResp, error)
+	// 获取短编号
+	GetShortno() (string, error)
+	SetShortnoUsed(shortno string, business string) error
 }
 
-func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL}
-	// 事件驱动更新：避免话题有回复但 expire_at 不续期，导致“正在聊的话题 3 小时后消失”。
-	ctx.AddMessagesListener(svc.listenerMessages)
-	return svc
+// NewService NewService
+func NewService(ctx *config.Context) IService {
+	return newService(ctx)
 }
 
-func (s *Service) List(uid string) ([]*TopicRoom, error) {
-	return s.db.list(uid)
+type service struct {
+	ctx         *config.Context
+	appConfigDB *appConfigDB
+	shortnoDB   *shortnoDB
+	shortnoLock sync.RWMutex
 }
 
-func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
-	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		return nil, errors.New("话题名不能为空")
+func newService(ctx *config.Context) *service {
+	// if ctx.GetConfig().ShortNo.NumOn {
+	onceSerce.Do(func() {
+		go runGenShortnoTask(ctx)
+	})
+	// }
+
+	return &service{
+		ctx:         ctx,
+		appConfigDB: newAppConfigDB(ctx),
+		shortnoDB:   newShortnoDB(ctx),
 	}
-	if loginUID == "" {
-		return nil, errors.New("未登录")
-	}
-	if req.Tag == "" {
-		req.Tag = "闲谈"
-	}
-	if req.Language == "" {
-		req.Language = "中文"
-	}
-	user, err := s.db.queryUserMeta(loginUID)
+}
+
+// GetAppConfig GetAppConfig
+func (s *service) GetAppConfig() (*AppConfigResp, error) {
+	appConfigM, err := s.appConfigDB.query()
 	if err != nil {
 		return nil, err
 	}
-	if user.UID == "" {
-		user.UID = loginUID
-	}
-	ts := time.Now().UnixMilli()
-	roomID := fmt.Sprintf("topic_%d", time.Now().UnixNano())
-	room := &TopicRoom{
-		RoomID:           roomID,
-		Title:            title,
-		Tag:              req.Tag,
-		Language:         req.Language,
-		BackgroundIndex:  int(ts%12) + 1,
-		ChannelID:        roomID,
-		ChannelType:      ChannelTypeGroup,
-		CreatorUID:       user.UID,
-		CreatorName:      user.Name,
-		CreatorAvatar:    user.Avatar,
-		ParticipantCount: 1,
-		ReplyUsers:       []ReplyAvatar{{UID: user.UID, Name: user.Name, Avatar: user.Avatar}},
-		CreatedAt:        ts,
-		ExpireAt:         ts + int64(s.ttl()/time.Millisecond),
-	}
-	if err := s.db.create(room); err != nil {
-		return nil, err
-	}
-	if err := s.syncIMChannel(room, []string{room.CreatorUID}); err != nil {
-		_ = s.db.softDelete(room.RoomID)
-		return nil, err
-	}
-	_ = s.refreshGroupAvatar(room.ChannelID, []string{room.CreatorUID})
-	return room, nil
+
+	return &AppConfigResp{
+		RSAPublicKey:                   appConfigM.RSAPublicKey,
+		Version:                        appConfigM.Version,
+		SuperToken:                     appConfigM.SuperToken,
+		SuperTokenOn:                   appConfigM.SuperTokenOn,
+		WelcomeMessage:                 appConfigM.WelcomeMessage,
+		NewUserJoinSystemGroup:         appConfigM.NewUserJoinSystemGroup,
+		SearchByPhone:                  appConfigM.SearchByPhone,
+		RegisterInviteOn:               appConfigM.RegisterInviteOn,
+		SendWelcomeMessageOn:           appConfigM.SendWelcomeMessageOn,
+		InviteSystemAccountJoinGroupOn: appConfigM.InviteSystemAccountJoinGroupOn,
+		RegisterUserMustCompleteInfoOn: appConfigM.RegisterUserMustCompleteInfoOn,
+		ChannelPinnedMessageMaxCount:   appConfigM.ChannelPinnedMessageMaxCount,
+	}, nil
 }
 
-func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
-	}
-	room, err := s.db.get(roomID)
+func (s *service) GetShortno() (string, error) {
+
+	s.shortnoLock.Lock() // 这里需要加锁 要不然多线程下会出现shortNo重复的问题
+	defer s.shortnoLock.Unlock()
+
+	shortnoM, err := s.shortnoDB.queryVail()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	if uid != "" {
-		user, _ := s.db.queryUserMeta(uid)
-		if err := s.db.addMember(room.RoomID, room.ChannelID, uid, user.Name, user.Avatar); err != nil {
-			return nil, err
-		}
-		if refreshed, err := s.db.get(room.RoomID); err == nil {
-			room = refreshed
-		}
-		uids, _ := s.db.memberUIDs(room.ChannelID)
-		if len(uids) == 0 {
-			uids = []string{uid}
-		}
-		if err := s.syncIMChannel(room, uids); err != nil {
-			return nil, err
-		}
-		if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
-			return nil, err
-		}
-		_ = s.refreshGroupAvatar(room.ChannelID, uids)
+	if shortnoM == nil {
+		return "", errors.New("没有短编号可分配")
 	}
-	return room, nil
-}
-
-func (s *Service) Pin(req RoomReq) (*TopicRoom, error) {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
-	}
-	return s.db.updatePin(roomID, req.Pinned)
-}
-
-func (s *Service) Delete(req RoomReq) error {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
-	}
-	room, _ := s.db.get(roomID)
-	if err := s.db.softDelete(roomID); err != nil {
-		return err
-	}
-	if room != nil {
-		_ = s.deleteIMChannel(room.ChannelID)
-	}
-	return nil
-}
-
-func (s *Service) MessageWebhook(req *MessageWebhookReq) (*TopicRoom, error) {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
-	}
-	if roomID == "" {
-		return nil, errors.New("缺少 room_id/channel_id")
-	}
-	return s.db.updateLastReply(roomID, req)
-}
-
-func (s *Service) CleanupExpired(limit uint64) (int, error) {
-	if limit == 0 {
-		limit = 100
-	}
-	rooms, err := s.db.expired(time.Now().UnixMilli(), limit)
+	err = s.shortnoDB.updateLock(shortnoM.Shortno, 1)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	count := 0
-	for _, room := range rooms {
-		if room == nil {
+	return shortnoM.Shortno, nil
+}
+
+func (s *service) SetShortnoUsed(shortno string, business string) error {
+	return s.shortnoDB.updateUsed(shortno, 1, business)
+}
+
+// 开启生成短编号任务
+func runGenShortnoTask(ctx *config.Context) {
+	shortnoDB := newShortnoDB(ctx)
+	errorSleep := time.Second * 2
+	for {
+		count, err := shortnoDB.queryVailCount()
+		if err != nil {
+			time.Sleep(errorSleep)
 			continue
 		}
-		if err := s.db.softDelete(room.RoomID); err == nil {
-			_ = s.deleteIMChannel(room.ChannelID)
-			count++
-		}
-	}
-	return count, nil
-}
-
-func (s *Service) IsTopicChannel(channelID string) bool {
-	return s.db.isTopicChannel(channelID)
-}
-
-func (s *Service) Subscribers(channelID string) ([]string, error) {
-	return s.db.memberUIDs(channelID)
-}
-
-func (s *Service) ChannelGet(channelID string, loginUID string) (*TopicRoom, error) {
-	room, err := s.db.get(channelID)
-	if err != nil {
-		return nil, err
-	}
-	if loginUID != "" {
-		_ = s.db.loadUnread(room, loginUID)
-	}
-	return room, nil
-}
-
-func (s *Service) listenerMessages(messages []*config.MessageResp) {
-	if len(messages) == 0 {
-		return
-	}
-	for _, msg := range messages {
-		if msg == nil || msg.ChannelType != common.ChannelTypeGroup.Uint8() || msg.ChannelID == "" {
-			continue
-		}
-		if !s.db.isTopicChannel(msg.ChannelID) {
-			continue
-		}
-		user, _ := s.db.queryUserMeta(msg.FromUID)
-		if user.UID == "" {
-			user.UID = msg.FromUID
-		}
-		text, msgType := messagePreview(msg)
-		createdAt := int64(msg.Timestamp) * 1000
-		if createdAt <= 0 {
-			createdAt = time.Now().UnixMilli()
-		}
-		_, _ = s.db.updateLastReply(msg.ChannelID, &MessageWebhookReq{
-			ChannelID:   msg.ChannelID,
-			FromUID:     user.UID,
-			FromName:    user.Name,
-			FromAvatar:  user.Avatar,
-			Text:        text,
-			MessageType: msgType,
-			CreatedAt:   createdAt,
-		})
-	}
-}
-
-func messagePreview(msg *config.MessageResp) (string, string) {
-	payload, err := msg.GetPayloadMap()
-	if err != nil || payload == nil {
-		return "[消息]", "message"
-	}
-	msgType := "message"
-	if v, ok := payload["type"]; ok {
-		msgType = fmt.Sprint(v)
-	}
-	for _, key := range []string{"content", "text", "summary"} {
-		if v, ok := payload[key]; ok {
-			text := strings.TrimSpace(fmt.Sprint(v))
-			if text != "" && text != "<nil>" {
-				return text, msgType
+		if count < 10000 {
+			shortnos := generateNums(ctx.GetConfig().ShortNo.NumLen, 100)
+			if len(shortnos) > 0 {
+				err = shortnoDB.inserts(shortnos)
+				if err != nil {
+					ctx.Error("添加短编号失败！", zap.Error(err))
+				}
 			}
 		}
+		time.Sleep(time.Second * 30)
 	}
-	return previewText(msgType), msgType
 }
 
-func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {
-	if room == nil || room.ChannelID == "" {
-		return nil
+func generateNums(len int, count int) []string {
+	var nums = make([]string, 0, count)
+	rd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := count; i > 0; i-- {
+		var num = rd.Int63n(1e16)
+		nums = append(nums, fmt.Sprintf("%016d", num)[0:len])
 	}
-	return s.ctx.IMCreateOrUpdateChannel(&config.ChannelCreateReq{
-		ChannelID:   room.ChannelID,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: compactUIDs(subscribers),
-	})
+	return nums
+
 }
 
-func (s *Service) addIMSubscribers(channelID string, subscribers []string) error {
-	if channelID == "" {
-		return nil
-	}
-	uids := compactUIDs(subscribers)
-	if len(uids) == 0 {
-		return nil
-	}
-	return s.ctx.IMAddSubscriber(&config.SubscriberAddReq{
-		ChannelID:   channelID,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-		Subscribers: uids,
-	})
-}
-
-func (s *Service) deleteIMChannel(channelID string) error {
-	if channelID == "" {
-		return nil
-	}
-	return s.ctx.IMDelChannel(&config.ChannelDeleteReq{
-		ChannelID:   channelID,
-		ChannelType: common.ChannelTypeGroup.Uint8(),
-	})
-}
-
-func compactUIDs(in []string) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(in))
-	for _, uid := range in {
-		uid = strings.TrimSpace(uid)
-		if uid == "" {
-			continue
-		}
-		if _, ok := seen[uid]; ok {
-			continue
-		}
-		seen[uid] = struct{}{}
-		out = append(out, uid)
-	}
-	return out
-}
-
-func (s *Service) refreshGroupAvatar(channelID string, uids []string) error {
-	if channelID == "" {
-		return nil
-	}
-	members := compactUIDs(uids)
-	if len(members) == 0 {
-		return nil
-	}
-	if len(members) > 9 {
-		members = members[:9]
-	}
-	eventID, err := s.ctx.EventBegin(&wkevent.Data{
-		Event: event.GroupAvatarUpdate,
-		Type:  wkevent.CMD,
-		Data: &config.CMDGroupAvatarUpdateReq{
-			GroupNo: channelID,
-			Members: members,
-		},
-	}, nil)
-	if err != nil {
-		return err
-	}
-	s.ctx.EventCommit(eventID)
-	return nil
-}
-
-func (s *Service) ttl() time.Duration {
-	if s.TTL <= 0 {
-		return DefaultTTL
-	}
-	return s.TTL
+type AppConfigResp struct {
+	RSAPublicKey                   string
+	Version                        int
+	SuperToken                     string
+	SuperTokenOn                   int
+	WelcomeMessage                 string // 登录欢迎语
+	NewUserJoinSystemGroup         int    // 新用户是否加入系统群聊
+	SearchByPhone                  int    // 是否可通过手机号搜索
+	RegisterInviteOn               int    // 是否开启注册邀请
+	SendWelcomeMessageOn           int    // 是否发送登录欢迎语
+	InviteSystemAccountJoinGroupOn int    // 是否允许邀请系统账号进入群聊
+	RegisterUserMustCompleteInfoOn int    // 是否要求注册用户必须填写完整信息
+	ChannelPinnedMessageMaxCount   int    // 频道置顶消息最大数量
 }
