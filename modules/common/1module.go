@@ -44,10 +44,13 @@ func init() {
 						"topic_room": 1,
 						"name":       room.Title,
 						// 先用发布者头像，避免群资料页/会话列表出现空白头像；后台仍会异步生成 groups/{groupNo}/avatar。
-						"logo":              room.CreatorAvatar,
-						"expire_at":         room.ExpireAt,
-						"reply_count":       room.ReplyCount,
-						"participant_count": room.ParticipantCount,
+						"logo":                     room.CreatorAvatar,
+						"creator_uid":              room.CreatorUID,
+						"creator_name":             room.CreatorName,
+						"creator_avatar":           room.CreatorAvatar,
+						"creator_avatar_cache_key": "",
+						"expire_at":                room.ExpireAt,
+						"reply_count":              room.ReplyCount,
 					}, nil
 				},
 				Subscribers: func(channelID string, channelType uint8) ([]string, error) {
@@ -85,17 +88,20 @@ func newChannelRespWithTopicRoom(room *TopicRoom) *model.ChannelResp {
 	resp.Save = 1
 	resp.Category = "topic_room"
 	resp.Extra = map[string]interface{}{
-		"topic_room":           1,
-		"room_id":              room.RoomID,
-		"tag":                  room.Tag,
-		"language":             room.Language,
-		"last_reply_text":      room.LastReplyText,
-		"last_reply_at":        room.LastReplyAt,
-		"reply_count":          room.ReplyCount,
-		"participant_count":    room.ParticipantCount,
-		"unread_count":         room.UnreadCount,
-		"mention_unread_count": room.MentionUnreadCount,
-		"expire_at":            room.ExpireAt,
+		"topic_room":               1,
+		"room_id":                  room.RoomID,
+		"tag":                      room.Tag,
+		"language":                 room.Language,
+		"creator_uid":              room.CreatorUID,
+		"creator_name":             room.CreatorName,
+		"creator_avatar":           room.CreatorAvatar,
+		"creator_avatar_cache_key": "",
+		"last_reply_text":          room.LastReplyText,
+		"last_reply_at":            room.LastReplyAt,
+		"reply_count":              room.ReplyCount,
+		"unread_count":             room.UnreadCount,
+		"mention_unread_count":     room.MentionUnreadCount,
+		"expire_at":                room.ExpireAt,
 	}
 	return resp
 }
