@@ -32,12 +32,12 @@ func (d *db) create(room *TopicRoom) error {
 	_, err = tx.InsertInto("topic_rooms").Columns(
 		"room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
-		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "reply_users_json",
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json",
 		"pinned", "hot", "hot_until", "status", "created_at", "expire_at",
 	).Values(
 		room.RoomID, room.Title, room.Tag, room.Language, room.BackgroundURL, room.BackgroundIndex, room.ChannelID, room.ChannelType,
 		room.CreatorUID, room.CreatorName, room.CreatorAvatar, room.LastReplyUID, room.LastReplyName, room.LastReplyAvatar,
-		room.LastReplyText, room.LastReplyType, room.LastReplyAt, room.ReplyCount, string(users),
+		room.LastReplyText, room.LastReplyType, room.LastReplyAt, room.ReplyCount, room.ParticipantCount, string(users),
 		room.Pinned, room.Hot, room.HotUntil, 1, room.CreatedAt, room.ExpireAt,
 	).Exec()
 	if err != nil {
@@ -46,7 +46,7 @@ func (d *db) create(room *TopicRoom) error {
 	if err = d.ensureNativeGroupTx(tx, room); err != nil {
 		return err
 	}
-	if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, room.CreatorUID, room.CreatorName, room.CreatorAvatar, 1); err != nil {
+	if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, room.CreatorUID, room.CreatorName, room.CreatorAvatar, 1, false); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -72,7 +72,7 @@ func (d *db) addMember(roomID, channelID, uid, name, avatar string) error {
 	if uid == room.CreatorUID {
 		role = 1
 	}
-	if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, uid, name, avatar, role); err != nil {
+	if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, uid, name, avatar, role, true); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -88,7 +88,7 @@ func (d *db) ensureNativeGroupTx(tx *dbr.Tx, room *TopicRoom) error {
 	return err
 }
 
-func (d *db) addMemberTx(tx *dbr.Tx, roomID, channelID, uid, name, avatar string, role int) error {
+func (d *db) addMemberTx(tx *dbr.Tx, roomID, channelID, uid, name, avatar string, role int, countParticipant bool) error {
 	if roomID == "" || channelID == "" || uid == "" {
 		return nil
 	}
@@ -96,11 +96,18 @@ func (d *db) addMemberTx(tx *dbr.Tx, roomID, channelID, uid, name, avatar string
 		role = 0
 	}
 	version := time.Now().UnixMilli()
-	_, err := tx.InsertBySql(`INSERT INTO topic_room_members(room_id,channel_id,uid,name,avatar,last_read_at,created_at,updated_at)
+	res, err := tx.InsertBySql(`INSERT INTO topic_room_members(room_id,channel_id,uid,name,avatar,last_read_at,created_at,updated_at)
         VALUES(?,?,?,?,?,0,UNIX_TIMESTAMP()*1000,NOW())
         ON DUPLICATE KEY UPDATE name=VALUES(name), avatar=VALUES(avatar), updated_at=NOW()`, roomID, channelID, uid, name, avatar).Exec()
 	if err != nil {
 		return err
+	}
+	if countParticipant && res != nil {
+		if affected, _ := res.RowsAffected(); affected == 1 {
+			if _, err = tx.Update("topic_rooms").Set("participant_count", dbr.Expr("participant_count+1")).Set("updated_at", dbr.Expr("NOW()")).Where("room_id=?", roomID).Exec(); err != nil {
+				return err
+			}
+		}
 	}
 	_, err = tx.InsertBySql(`INSERT INTO group_member(group_no,uid,remark,role,version,is_deleted,status,vercode,robot,invite_uid,created_at,updated_at)
         VALUES(?,?,?,?,?,0,1,CONCAT(?, '@2'),0,'',NOW(),NOW())
@@ -120,7 +127,7 @@ func (d *db) list(loginUID string) ([]*TopicRoom, error) {
 	// 不再按 loginUID 隐藏已加入话题。之前隐藏会导致用户发完/进完话题后，聊天室广场立刻“消失”。
 	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
-		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").
 		Where("status=1").
 		OrderBy("pinned DESC").
@@ -147,7 +154,7 @@ func (d *db) get(roomID string) (*TopicRoom, error) {
 	rooms := make([]*TopicRoom, 0)
 	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
-		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).Limit(1).Load(&rooms)
 	if err != nil {
 		return nil, err

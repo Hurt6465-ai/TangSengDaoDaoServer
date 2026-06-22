@@ -51,6 +51,7 @@ func init() {
 						"creator_avatar_cache_key": "",
 						"expire_at":                room.ExpireAt,
 						"reply_count":              room.ReplyCount,
+						"participant_count":        room.ParticipantCount,
 					}, nil
 				},
 				Subscribers: func(channelID string, channelType uint8) ([]string, error) {
@@ -99,6 +100,7 @@ func newChannelRespWithTopicRoom(room *TopicRoom) *model.ChannelResp {
 		"last_reply_text":          room.LastReplyText,
 		"last_reply_at":            room.LastReplyAt,
 		"reply_count":              room.ReplyCount,
+		"participant_count":        room.ParticipantCount,
 		"unread_count":             room.UnreadCount,
 		"mention_unread_count":     room.MentionUnreadCount,
 		"expire_at":                room.ExpireAt,

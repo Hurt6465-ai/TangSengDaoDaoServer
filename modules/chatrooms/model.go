@@ -27,6 +27,7 @@ type TopicRoom struct {
 	LastReplyType      string        `json:"last_reply_type" db:"last_reply_type"`
 	LastReplyAt        int64         `json:"last_reply_at" db:"last_reply_at"`
 	ReplyCount         int           `json:"reply_count" db:"reply_count"`
+	ParticipantCount   int           `json:"participant_count" db:"participant_count"`
 	ReplyUsers         []ReplyAvatar `json:"reply_users" db:"-"`
 	ReplyUsersJSON     string        `json:"-" db:"reply_users_json"`
 	UnreadCount        int           `json:"unread_count" db:"-"`
