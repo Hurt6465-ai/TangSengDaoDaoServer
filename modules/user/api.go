@@ -634,7 +634,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 		}
 		if key == "name" {
 			// 将重新设置token设置到缓存（这里主要是更新登录者的name）
-			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), wkhttp.EncodeTokenCacheInfo(loginUID, fmt.Sprintf("%v", value), c.GetLoginRole()))
+			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), wkhttp.EncodeTokenCacheInfo(loginUID, safeTokenCacheName(loginUID, fmt.Sprintf("%v", value)), c.GetLoginRole()))
 			if err != nil {
 				u.Error("重新设置token缓存失败！", zap.Error(err))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
@@ -1094,7 +1094,7 @@ func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *device
 		}
 	}
 
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userInfo.UID, userInfo.Name, userInfo.Role), u.ctx.GetConfig().Cache.TokenExpire)
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userInfo.UID, safeTokenCacheName(userInfo.UID, userInfo.Name), userInfo.Role), u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		tokenSpan.Finish()
@@ -1579,7 +1579,7 @@ func (u *User) loginWithAuthCode(c *wkhttp.Context) {
 	}
 
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userModel.UID, userModel.Name, ""), u.ctx.GetConfig().Cache.TokenExpire)
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userModel.UID, safeTokenCacheName(userModel.UID, userModel.Name), ""), u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))
@@ -2180,7 +2180,7 @@ func (u *User) loginCheckPhone(c *wkhttp.Context) {
 	}
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userInfo.UID, userInfo.Name, ""), u.ctx.GetConfig().Cache.TokenExpire)
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userInfo.UID, safeTokenCacheName(userInfo.UID, userInfo.Name), ""), u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		c.ResponseError(errors.New("设置token缓存失败！"))
@@ -2489,6 +2489,18 @@ func (u *User) getForgetPwdSMS(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
+// safeTokenCacheName 返回写入 token 缓存的 name。
+// 数据库和登录返回值仍然保留真实昵称，可以为空；
+// 但旧版 ServerLib 的 token 解析可能要求 token 缓存里的 name 非空，
+// 所以空昵称用户先用 uid 作为缓存占位，避免 /v1/user/current、头像上传等鉴权接口 401。
+func safeTokenCacheName(uid, name string) string {
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name
+	}
+	return strings.TrimSpace(uid)
+}
+
 // 是否允许更新
 func allowUpdateUserField(field string) bool {
 	allowfields := []string{"sex", "short_no", "name", "search_by_phone", "search_by_short", "new_msg_notice", "msg_show_detail", "voice_on", "shock_on", "msg_expire_second"}
@@ -2559,9 +2571,9 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 
 	userModel := &Model{}
 	userModel.UID = createUser.UID
-	// 注册阶段不再自动生成随机昵称。
-	// Android 端注册时传空 name，服务端就保存空 name，随后进入完善资料页。
-	// token 鉴权只依赖 UID，允许未完善资料用户继续上传头像、保存昵称，避免注册后循环跳登录。
+	// 注册阶段允许昵称为空。
+	// 必须完善资料时，Android 会根据返回的空 name 进入完善资料页；
+	// 这里不要再随机生成昵称，否则会绕过完善资料流程。
 	userModel.Name = strings.TrimSpace(createUser.Name)
 	userModel.Sex = createUser.Sex
 	userModel.Vercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.User)
@@ -2650,7 +2662,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	u.ctx.EventCommit(eventID)
 	token := util.GenerUUID()
 	// 将token设置到缓存
-	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userModel.UID, userModel.Name, userModel.Role), u.ctx.GetConfig().Cache.TokenExpire)
+	err = u.ctx.Cache().SetAndExpire(u.ctx.GetConfig().Cache.TokenCachePrefix+token, wkhttp.EncodeTokenCacheInfo(userModel.UID, safeTokenCacheName(userModel.UID, userModel.Name), userModel.Role), u.ctx.GetConfig().Cache.TokenExpire)
 	if err != nil {
 		u.Error("设置token缓存失败！", zap.Error(err))
 		return nil, err
