@@ -8,7 +8,6 @@ import (
 	"hash/crc32"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -2560,21 +2559,10 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 
 	userModel := &Model{}
 	userModel.UID = createUser.UID
-	rand.Seed(time.Now().Unix())
-	if createUser.Name != "" {
-		userModel.Name = createUser.Name
-	} else {
-		appconfig, err := u.commonService.GetAppConfig()
-		if err != nil {
-			u.Error("获取应用配置失败！", zap.Error(err))
-			return nil, err
-		}
-		if appconfig != nil && appconfig.RegisterUserMustCompleteInfoOn == 1 {
-			userModel.Name = ""
-		} else {
-			userModel.Name = Names[rand.Intn(len(Names)-1)]
-		}
-	}
+	// 注册阶段不再自动生成随机昵称。
+	// Android 端注册时传空 name，服务端就保存空 name，随后进入完善资料页。
+	// token 鉴权只依赖 UID，允许未完善资料用户继续上传头像、保存昵称，避免注册后循环跳登录。
+	userModel.Name = strings.TrimSpace(createUser.Name)
 	userModel.Sex = createUser.Sex
 	userModel.Vercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.User)
 	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
