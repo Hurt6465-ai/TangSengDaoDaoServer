@@ -276,32 +276,43 @@ func (d *db) queryUserMeta(uid string) (UserMeta, error) {
 		return UserMeta{}, nil
 	}
 	var user struct {
-		UID         string `db:"uid"`
-		Name        string `db:"name"`
-		CountryCode string `db:"country_code"`
-		Country     string `db:"country"`
+		UID  string `db:"uid"`
+		Name string `db:"name"`
 	}
 	rows := make([]*struct {
-		UID         string `db:"uid"`
-		Name        string `db:"name"`
-		CountryCode string `db:"country_code"`
-		Country     string `db:"country"`
+		UID  string `db:"uid"`
+		Name string `db:"name"`
 	}, 0)
-	_, err := d.session.Select("uid", "name", "country_code", "country").From("user").Where("uid=?", uid).Limit(1).Load(&rows)
+	_, err := d.session.Select("uid", "name").From("user").Where("uid=?", uid).Limit(1).Load(&rows)
 	if err != nil {
 		return UserMeta{}, err
 	}
 	if len(rows) > 0 {
 		user.UID = rows[0].UID
 		user.Name = rows[0].Name
-		user.CountryCode = rows[0].CountryCode
-		user.Country = rows[0].Country
 	}
-	return UserMeta{UID: uid, Name: user.Name, Avatar: fmt.Sprintf("users/%s/avatar", uid), CountryCode: user.CountryCode, Country: user.Country}, nil
+	meta := UserMeta{UID: uid, Name: user.Name, Avatar: fmt.Sprintf("users/%s/avatar", uid)}
+	if !d.hasUserCountryColumns() {
+		return meta, nil
+	}
+	countryRows := make([]*struct {
+		UID         string `db:"uid"`
+		CountryCode string `db:"country_code"`
+		Country     string `db:"country"`
+	}, 0)
+	_, err = d.session.Select("uid", "country_code", "country").From("user").Where("uid=?", uid).Limit(1).Load(&countryRows)
+	if err != nil {
+		return meta, nil
+	}
+	if len(countryRows) > 0 {
+		meta.CountryCode = countryRows[0].CountryCode
+		meta.Country = countryRows[0].Country
+	}
+	return meta, nil
 }
 
 func (d *db) enrichRoomUserCountries(r *TopicRoom) {
-	if r == nil {
+	if r == nil || !d.hasUserCountryColumns() {
 		return
 	}
 	uids := make([]string, 0, len(r.ReplyUsers)+1)
@@ -344,6 +355,12 @@ func (d *db) enrichRoomUserCountries(r *TopicRoom) {
 			r.ReplyUsers[i].Country = row.Country
 		}
 	}
+}
+
+func (d *db) hasUserCountryColumns() bool {
+	var count int
+	_, err := d.session.Select("COUNT(*)").From("information_schema.COLUMNS").Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME in ?", "user", []string{"country_code", "country"}).Load(&count)
+	return err == nil && count >= 2
 }
 
 func compactUIDsForDB(in []string) []string {
