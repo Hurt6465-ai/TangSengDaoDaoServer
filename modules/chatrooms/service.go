@@ -122,10 +122,12 @@ func (s *Service) Delete(req RoomReq) error {
 		roomID = req.ChannelID
 	}
 	room, _ := s.db.get(roomID)
+	uids := s.topicRoomMemberUIDs(room)
 	if err := s.db.softDelete(roomID); err != nil {
 		return err
 	}
 	if room != nil {
+		s.notifyTopicRoomDeleted(room.ChannelID, uids, "deleted")
 		_ = s.deleteIMChannel(room.ChannelID)
 	}
 	return nil
@@ -155,7 +157,9 @@ func (s *Service) CleanupExpired(limit uint64) (int, error) {
 		if room == nil {
 			continue
 		}
+		uids := s.topicRoomMemberUIDs(room)
 		if err := s.db.softDelete(room.RoomID); err == nil {
+			s.notifyTopicRoomDeleted(room.ChannelID, uids, "expired")
 			_ = s.deleteIMChannel(room.ChannelID)
 			count++
 		}
@@ -258,6 +262,43 @@ func (s *Service) addIMSubscribers(channelID string, subscribers []string) error
 		ChannelType: common.ChannelTypeGroup.Uint8(),
 		Subscribers: uids,
 	})
+}
+
+func (s *Service) topicRoomMemberUIDs(room *TopicRoom) []string {
+	if room == nil || room.ChannelID == "" {
+		return nil
+	}
+	uids, _ := s.db.memberUIDs(room.ChannelID)
+	if len(uids) == 0 && room.CreatorUID != "" {
+		uids = []string{room.CreatorUID}
+	}
+	return compactUIDs(uids)
+}
+
+func (s *Service) notifyTopicRoomDeleted(channelID string, subscribers []string, reason string) {
+	if channelID == "" {
+		return
+	}
+	uids := compactUIDs(subscribers)
+	if len(uids) == 0 {
+		return
+	}
+	if reason == "" {
+		reason = "deleted"
+	}
+	for _, uid := range uids {
+		_ = s.ctx.SendCMD(config.MsgCMDReq{
+			ChannelID:   uid,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+			CMD:         "topicRoomDeleted",
+			Param: map[string]interface{}{
+				"channel_id":   channelID,
+				"room_id":      channelID,
+				"channel_type": common.ChannelTypeGroup.Uint8(),
+				"reason":       reason,
+			},
+		})
+	}
 }
 
 func (s *Service) deleteIMChannel(channelID string) error {
