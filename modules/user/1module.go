@@ -181,8 +181,8 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	extraMap["intro"] = user.Intro
 	extraMap["country_code"] = user.CountryCode
 	extraMap["country"] = user.Country
-	extraMap["native_languages"] = parseUserLanguageList(user.NativeLanguages)
-	extraMap["learning_languages"] = parseUserLanguageList(user.LearningLanguages)
+	extraMap["native_languages"] = user.NativeLanguages
+	extraMap["learning_languages"] = user.LearningLanguages
 	extraMap["birthday"] = user.Birthday
 	extraMap["chat_pwd_on"] = user.ChatPwdOn
 	extraMap["short_no"] = user.ShortNo
