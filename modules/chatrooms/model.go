@@ -20,6 +20,8 @@ type TopicRoom struct {
 	CreatorUID         string        `json:"creator_uid" db:"creator_uid"`
 	CreatorName        string        `json:"creator_name" db:"creator_name"`
 	CreatorAvatar      string        `json:"creator_avatar" db:"creator_avatar"`
+	CreatorCountryCode string        `json:"creator_country_code,omitempty" db:"-"`
+	CreatorCountry     string        `json:"creator_country,omitempty" db:"-"`
 	LastReplyUID       string        `json:"last_reply_uid" db:"last_reply_uid"`
 	LastReplyName      string        `json:"last_reply_name" db:"last_reply_name"`
 	LastReplyAvatar    string        `json:"last_reply_avatar" db:"last_reply_avatar"`
@@ -45,6 +47,8 @@ type ReplyAvatar struct {
 	Name           string `json:"name"`
 	Avatar         string `json:"avatar"`
 	AvatarCacheKey string `json:"avatar_cache_key,omitempty"`
+	CountryCode    string `json:"country_code,omitempty"`
+	Country        string `json:"country,omitempty"`
 	Flag           string `json:"flag,omitempty"`
 }
 
@@ -80,7 +84,9 @@ type MessageWebhookReq struct {
 }
 
 type UserMeta struct {
-	UID    string
-	Name   string
-	Avatar string
+	UID         string
+	Name        string
+	Avatar      string
+	CountryCode string
+	Country     string
 }

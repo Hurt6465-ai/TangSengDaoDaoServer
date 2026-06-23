@@ -140,6 +140,7 @@ func (d *db) list(loginUID string) ([]*TopicRoom, error) {
 	}
 	for _, r := range rooms {
 		decodeReplyUsers(r)
+		d.enrichRoomUserCountries(r)
 		if loginUID != "" {
 			_ = d.loadUnread(r, loginUID)
 		}
@@ -163,6 +164,7 @@ func (d *db) get(roomID string) (*TopicRoom, error) {
 		return nil, ErrNotFound
 	}
 	decodeReplyUsers(rooms[0])
+	d.enrichRoomUserCountries(rooms[0])
 	return rooms[0], nil
 }
 
@@ -225,7 +227,21 @@ func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRo
 	if update.FromUID != "" {
 		_ = d.addMember(room.RoomID, room.ChannelID, update.FromUID, update.FromName, update.FromAvatar)
 	}
-	users := dedupReplyUsers("", append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
+	fromCountryCode := ""
+	fromCountry := ""
+	if update.FromUID != "" {
+		if userMeta, err := d.queryUserMeta(update.FromUID); err == nil {
+			if update.FromName == "" {
+				update.FromName = userMeta.Name
+			}
+			if update.FromAvatar == "" {
+				update.FromAvatar = userMeta.Avatar
+			}
+			fromCountryCode = userMeta.CountryCode
+			fromCountry = userMeta.Country
+		}
+	}
+	users := dedupReplyUsers("", append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar, CountryCode: fromCountryCode, Country: fromCountry}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
 	usersJSON, _ := json.Marshal(users)
 	expireAt := ts + int64(DefaultTTL/time.Millisecond)
 	hotUntil := ts + int64(10*time.Minute/time.Millisecond)
@@ -260,22 +276,91 @@ func (d *db) queryUserMeta(uid string) (UserMeta, error) {
 		return UserMeta{}, nil
 	}
 	var user struct {
-		UID  string `db:"uid"`
-		Name string `db:"name"`
+		UID         string `db:"uid"`
+		Name        string `db:"name"`
+		CountryCode string `db:"country_code"`
+		Country     string `db:"country"`
 	}
 	rows := make([]*struct {
-		UID  string `db:"uid"`
-		Name string `db:"name"`
+		UID         string `db:"uid"`
+		Name        string `db:"name"`
+		CountryCode string `db:"country_code"`
+		Country     string `db:"country"`
 	}, 0)
-	_, err := d.session.Select("uid", "name").From("user").Where("uid=?", uid).Limit(1).Load(&rows)
+	_, err := d.session.Select("uid", "name", "country_code", "country").From("user").Where("uid=?", uid).Limit(1).Load(&rows)
 	if err != nil {
 		return UserMeta{}, err
 	}
 	if len(rows) > 0 {
 		user.UID = rows[0].UID
 		user.Name = rows[0].Name
+		user.CountryCode = rows[0].CountryCode
+		user.Country = rows[0].Country
 	}
-	return UserMeta{UID: uid, Name: user.Name, Avatar: fmt.Sprintf("users/%s/avatar", uid)}, nil
+	return UserMeta{UID: uid, Name: user.Name, Avatar: fmt.Sprintf("users/%s/avatar", uid), CountryCode: user.CountryCode, Country: user.Country}, nil
+}
+
+func (d *db) enrichRoomUserCountries(r *TopicRoom) {
+	if r == nil {
+		return
+	}
+	uids := make([]string, 0, len(r.ReplyUsers)+1)
+	if r.CreatorUID != "" {
+		uids = append(uids, r.CreatorUID)
+	}
+	for _, u := range r.ReplyUsers {
+		if u.UID != "" {
+			uids = append(uids, u.UID)
+		}
+	}
+	uids = compactUIDsForDB(uids)
+	if len(uids) == 0 {
+		return
+	}
+	rows := make([]*struct {
+		UID         string `db:"uid"`
+		CountryCode string `db:"country_code"`
+		Country     string `db:"country"`
+	}, 0)
+	_, err := d.session.Select("uid", "country_code", "country").From("user").Where("uid in ?", uids).Load(&rows)
+	if err != nil {
+		return
+	}
+	meta := map[string]*struct {
+		UID         string `db:"uid"`
+		CountryCode string `db:"country_code"`
+		Country     string `db:"country"`
+	}{}
+	for _, row := range rows {
+		meta[row.UID] = row
+	}
+	if row := meta[r.CreatorUID]; row != nil {
+		r.CreatorCountryCode = row.CountryCode
+		r.CreatorCountry = row.Country
+	}
+	for i := range r.ReplyUsers {
+		if row := meta[r.ReplyUsers[i].UID]; row != nil {
+			r.ReplyUsers[i].CountryCode = row.CountryCode
+			r.ReplyUsers[i].Country = row.Country
+		}
+	}
+}
+
+func compactUIDsForDB(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, uid := range in {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		out = append(out, uid)
+	}
+	return out
 }
 
 func (d *db) loadUnread(r *TopicRoom, uid string) error {

@@ -53,20 +53,22 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 	ts := time.Now().UnixMilli()
 	roomID := fmt.Sprintf("topic_%d", time.Now().UnixNano())
 	room := &TopicRoom{
-		RoomID:           roomID,
-		Title:            title,
-		Tag:              req.Tag,
-		Language:         req.Language,
-		BackgroundIndex:  int(ts%12) + 1,
-		ChannelID:        roomID,
-		ChannelType:      ChannelTypeGroup,
-		CreatorUID:       user.UID,
-		CreatorName:      user.Name,
-		CreatorAvatar:    user.Avatar,
-		ParticipantCount: 1,
-		ReplyUsers:       []ReplyAvatar{{UID: user.UID, Name: user.Name, Avatar: user.Avatar}},
-		CreatedAt:        ts,
-		ExpireAt:         ts + int64(s.ttl()/time.Millisecond),
+		RoomID:             roomID,
+		Title:              title,
+		Tag:                req.Tag,
+		Language:           req.Language,
+		BackgroundIndex:    int(ts%12) + 1,
+		ChannelID:          roomID,
+		ChannelType:        ChannelTypeGroup,
+		CreatorUID:         user.UID,
+		CreatorName:        user.Name,
+		CreatorAvatar:      user.Avatar,
+		CreatorCountryCode: user.CountryCode,
+		CreatorCountry:     user.Country,
+		ParticipantCount:   1,
+		ReplyUsers:         []ReplyAvatar{{UID: user.UID, Name: user.Name, Avatar: user.Avatar, CountryCode: user.CountryCode, Country: user.Country}},
+		CreatedAt:          ts,
+		ExpireAt:           ts + int64(s.ttl()/time.Millisecond),
 	}
 	if err := s.db.create(room); err != nil {
 		return nil, err
