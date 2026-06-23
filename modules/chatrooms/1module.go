@@ -60,7 +60,7 @@ func init() {
 					return api.service.Subscribers(channelID)
 				},
 				Whitelist: func(channelID string, channelType uint8) ([]string, error) {
-					// 话题房不做普通好友校验，不开启发送白名单限制。
+					// 话题房是公开聊天室，不做普通好友校验，也不限制发送白名单。
 					return []string{}, nil
 				},
 			},
