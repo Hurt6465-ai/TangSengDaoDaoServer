@@ -2,7 +2,6 @@ package user
 
 import (
 	"context"
-	"strings"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/db"
@@ -24,20 +23,19 @@ func NewDB(ctx *config.Context) *DB {
 	}
 }
 
-// ensureProfileColumns keeps the user profile extension columns available on old databases.
-// The SQL migration under modules/user/sql is still kept for clean installs; this runtime
-// guard makes existing deployments recover automatically after an upgrade.
+// QueryByKeyword 通过用户名查询用户信息
+
 func (d *DB) ensureProfileColumns() error {
 	columns := []struct {
 		name string
-		sql  string
+		ddl  string
 	}{
-		{"intro", "ALTER TABLE `user` ADD COLUMN intro VARCHAR(500) NOT NULL DEFAULT '' COMMENT '自我介绍'"},
-		{"country_code", "ALTER TABLE `user` ADD COLUMN country_code VARCHAR(10) NOT NULL DEFAULT '' COMMENT '国籍/地区ISO代码'"},
-		{"country", "ALTER TABLE `user` ADD COLUMN country VARCHAR(80) NOT NULL DEFAULT '' COMMENT '国籍/地区显示名'"},
-		{"native_languages", "ALTER TABLE `user` ADD COLUMN native_languages VARCHAR(500) NOT NULL DEFAULT '' COMMENT '母语JSON数组，最多5个'"},
-		{"learning_languages", "ALTER TABLE `user` ADD COLUMN learning_languages VARCHAR(500) NOT NULL DEFAULT '' COMMENT '学习语言JSON数组，最多5个'"},
-		{"birthday", "ALTER TABLE `user` ADD COLUMN birthday VARCHAR(20) NOT NULL DEFAULT '' COMMENT '出生日期 yyyy-MM-dd'"},
+		{"intro", "ALTER TABLE `user` ADD COLUMN `intro` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '自我介绍'"},
+		{"country_code", "ALTER TABLE `user` ADD COLUMN `country_code` VARCHAR(10) NOT NULL DEFAULT '' COMMENT '国籍/地区ISO代码'"},
+		{"country", "ALTER TABLE `user` ADD COLUMN `country` VARCHAR(80) NOT NULL DEFAULT '' COMMENT '国籍/地区显示名'"},
+		{"native_languages", "ALTER TABLE `user` ADD COLUMN `native_languages` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '母语JSON数组，最多5个'"},
+		{"learning_languages", "ALTER TABLE `user` ADD COLUMN `learning_languages` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '学习语言JSON数组，最多5个'"},
+		{"birthday", "ALTER TABLE `user` ADD COLUMN `birthday` VARCHAR(20) NOT NULL DEFAULT '' COMMENT '出生日期 yyyy-MM-dd'"},
 	}
 	for _, column := range columns {
 		exists, err := d.userColumnExists(column.name)
@@ -47,10 +45,8 @@ func (d *DB) ensureProfileColumns() error {
 		if exists {
 			continue
 		}
-		if _, err = d.session.InsertBySql(column.sql).Exec(); err != nil {
-			if !isDuplicateColumnError(err) {
-				return err
-			}
+		if _, err = d.session.UpdateBySql(column.ddl).Exec(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -58,7 +54,8 @@ func (d *DB) ensureProfileColumns() error {
 
 func (d *DB) userColumnExists(columnName string) (bool, error) {
 	var count int
-	_, err := d.session.Select("COUNT(*)").From("information_schema.COLUMNS").
+	err := d.session.Select("COUNT(*)").
+		From("information_schema.COLUMNS").
 		Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?", "user", columnName).
 		LoadOne(&count)
 	if err != nil {
@@ -67,15 +64,6 @@ func (d *DB) userColumnExists(columnName string) (bool, error) {
 	return count > 0, nil
 }
 
-func isDuplicateColumnError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "duplicate column name")
-}
-
-// QueryByKeyword 通过用户名查询用户信息
 func (d *DB) QueryByKeyword(keyword string) (*Model, error) {
 	var model *Model
 	_, err := d.session.Select("*").From("user").Where("(short_no=? and short_no<>'') or (username=? and username<>'') or (phone=? and phone<>'') ", keyword, keyword, keyword).Load(&model)
