@@ -107,6 +107,9 @@ func New(ctx *config.Context) *User {
 		commonService:            common2.NewService(ctx),
 		appService:               app.NewService(ctx),
 	}
+	if err := u.db.ensureProfileColumns(); err != nil {
+		u.Error("自动检查用户资料字段失败", zap.Error(err))
+	}
 	u.updateSystemUserToken()
 	u.AddSystemUids()
 	source.SetUserProvider(u)
