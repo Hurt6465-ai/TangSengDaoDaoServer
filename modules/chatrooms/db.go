@@ -358,9 +358,15 @@ func (d *db) enrichRoomUserCountries(r *TopicRoom) {
 }
 
 func (d *db) hasUserCountryColumns() bool {
+	return d.hasUserColumn("country_code") && d.hasUserColumn("country")
+}
+
+func (d *db) hasUserColumn(columnName string) bool {
 	var count int
-	_, err := d.session.Select("COUNT(*)").From("information_schema.COLUMNS").Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME in ?", "user", []string{"country_code", "country"}).Load(&count)
-	return err == nil && count >= 2
+	_, err := d.session.Select("COUNT(*)").From("information_schema.COLUMNS").
+		Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?", "user", columnName).
+		LoadOne(&count)
+	return err == nil && count > 0
 }
 
 func compactUIDsForDB(in []string) []string {
