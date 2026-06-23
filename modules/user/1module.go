@@ -178,6 +178,12 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	resp.FlameSecond = user.FlameSecond
 	extraMap := make(map[string]interface{})
 	extraMap["sex"] = user.Sex
+	extraMap["intro"] = user.Intro
+	extraMap["country_code"] = user.CountryCode
+	extraMap["country"] = user.Country
+	extraMap["native_languages"] = parseUserLanguageList(user.NativeLanguages)
+	extraMap["learning_languages"] = parseUserLanguageList(user.LearningLanguages)
+	extraMap["birthday"] = user.Birthday
 	extraMap["chat_pwd_on"] = user.ChatPwdOn
 	extraMap["short_no"] = user.ShortNo
 	extraMap["source_desc"] = user.SourceDesc

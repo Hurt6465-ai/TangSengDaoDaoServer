@@ -865,6 +865,12 @@ type UserDetailResp struct {
 	Mute                int               `json:"mute"`                   // 免打扰
 	Top                 int               `json:"top"`                    // 置顶
 	Sex                 int               `json:"sex"`                    //性别1:男
+	Intro               string            `json:"intro"`                  //自我介绍
+	CountryCode         string            `json:"country_code"`           //国籍/地区ISO代码
+	Country             string            `json:"country"`                //国籍/地区显示名
+	NativeLanguages     []string          `json:"native_languages"`       //母语，最多5个
+	LearningLanguages   []string          `json:"learning_languages"`     //学习语言，最多5个
+	Birthday            string            `json:"birthday"`               //出生日期
 	Category            string            `json:"category"`               //用户分类 '客服'
 	ShortNo             string            `json:"short_no"`               // 用户唯一短编号
 	ChatPwdOn           int               `json:"chat_pwd_on"`            //是否开启聊天密码
@@ -909,6 +915,42 @@ type GroupMemberResp struct {
 	UpdatedAt          string `json:"updated_at"`
 }
 
+func parseUserLanguageList(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return []string{}
+	}
+	var arr []string
+	if strings.HasPrefix(value, "[") {
+		if err := util.ReadJsonByByte([]byte(value), &arr); err == nil {
+			return compactProfileStrings(arr, 5)
+		}
+	}
+	value = strings.NewReplacer("，", ",", "、", ",", ";", ",", "；", ",").Replace(value)
+	parts := strings.Split(value, ",")
+	return compactProfileStrings(parts, 5)
+}
+
+func compactProfileStrings(values []string, max int) []string {
+	result := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+		if max > 0 && len(result) >= max {
+			break
+		}
+	}
+	return result
+}
+
 func NewUserDetailResp(m *Detail, remark, loginUID string, sourceFrom string, onLine int, lastOffline int, deviceFlag config.DeviceFlag, follow int, status int, beDeleted int, beBlacklist int, setting *SettingModel, vercode string) *UserDetailResp {
 	self := loginUID == m.UID
 
@@ -933,35 +975,41 @@ func NewUserDetailResp(m *Detail, remark, loginUID string, sourceFrom string, on
 	}
 
 	return &UserDetailResp{
-		UID:            m.UID,
-		Name:           m.Name,
-		Email:          email,
-		Zone:           zone,
-		Phone:          phone,
-		Mute:           m.Mute,
-		Top:            m.Top,
-		Sex:            m.Sex,
-		ChatPwdOn:      m.ChatPwdOn,
-		Category:       m.Category,
-		ShortNo:        m.ShortNo,
-		Screenshot:     m.Screenshot,
-		RevokeRemind:   m.RevokeRemind,
-		Receipt:        m.Receipt,
-		Online:         onLine,
-		LastOffline:    lastOffline,
-		DeviceFlag:     deviceFlag,
-		Follow:         follow,
-		SourceDesc:     sourceFrom,
-		Remark:         remark,
-		IsUploadAvatar: m.IsUploadAvatar,
-		Status:         status,
-		Robot:          m.Robot,
-		Username:       username,
-		BeDeleted:      beDeleted,
-		BeBlacklist:    beBlacklist,
-		IsDestroy:      m.IsDestroy,
-		Flame:          flame,
-		FlameSecond:    flameSecond,
-		Vercode:        vercode,
+		UID:               m.UID,
+		Name:              m.Name,
+		Email:             email,
+		Zone:              zone,
+		Phone:             phone,
+		Mute:              m.Mute,
+		Top:               m.Top,
+		Sex:               m.Sex,
+		Intro:             m.Intro,
+		CountryCode:       m.CountryCode,
+		Country:           m.Country,
+		NativeLanguages:   parseUserLanguageList(m.NativeLanguages),
+		LearningLanguages: parseUserLanguageList(m.LearningLanguages),
+		Birthday:          m.Birthday,
+		ChatPwdOn:         m.ChatPwdOn,
+		Category:          m.Category,
+		ShortNo:           m.ShortNo,
+		Screenshot:        m.Screenshot,
+		RevokeRemind:      m.RevokeRemind,
+		Receipt:           m.Receipt,
+		Online:            onLine,
+		LastOffline:       lastOffline,
+		DeviceFlag:        deviceFlag,
+		Follow:            follow,
+		SourceDesc:        sourceFrom,
+		Remark:            remark,
+		IsUploadAvatar:    m.IsUploadAvatar,
+		Status:            status,
+		Robot:             m.Robot,
+		Username:          username,
+		BeDeleted:         beDeleted,
+		BeBlacklist:       beBlacklist,
+		IsDestroy:         m.IsDestroy,
+		Flame:             flame,
+		FlameSecond:       flameSecond,
+		Vercode:           vercode,
 	}
 }

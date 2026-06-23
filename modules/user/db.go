@@ -317,6 +317,12 @@ type Model struct {
 	Password          string // 用户密码
 	Category          string //用户分类
 	Sex               int    //性别
+	Intro             string //自我介绍
+	CountryCode       string //国籍/地区ISO代码
+	Country           string //国籍/地区显示名
+	NativeLanguages   string //母语JSON数组
+	LearningLanguages string //学习语言JSON数组
+	Birthday          string //出生日期
 	ShortNo           string //唯一短编号
 	ShortStatus       int    //唯一短编号是否修改0.否1.是
 	Zone              string //区号

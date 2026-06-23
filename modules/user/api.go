@@ -533,12 +533,17 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 	}
 
 	for key, value := range reqMap {
+		field, valueString, err := normalizeUserUpdateField(key, value)
+		if err != nil {
+			c.ResponseError(err)
+			return
+		}
 		//是否允许更新此field
-		if !allowUpdateUserField(key) {
+		if !allowUpdateUserField(field) {
 			c.ResponseError(errors.New("不允许更新【" + key + "】"))
 			return
 		}
-		if key == "short_no" {
+		if field == "short_no" {
 			if u.ctx.GetConfig().ShortNo.EditOff {
 				c.ResponseError(errors.New("不允许编辑！"))
 				return
@@ -547,13 +552,13 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				c.ResponseError(errors.New("用户短编号只能修改一次"))
 				return
 			}
-			if len(fmt.Sprintf("%s", value)) < 6 || len(fmt.Sprintf("%s", value)) > 20 {
+			if len(valueString) < 6 || len(valueString) > 20 {
 				c.ResponseError(errors.New("短号须以字母开头，仅支持使用6～20个字母、数字、下划线、减号自由组合"))
 				return
 			}
 			isLetter := true
 			isIncludeNum := false
-			for index, r := range fmt.Sprintf("%s", value) {
+			for index, r := range valueString {
 				if !unicode.IsLetter(r) && index == 0 {
 					isLetter = false
 					break
@@ -574,7 +579,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 				c.ResponseError(errors.New("短号须以字母开头，仅支持使用6～20个字母、数字、下划线、减号自由组合"))
 				return
 			}
-			users, err = u.db.QueryUserWithOnlyShortNo(fmt.Sprintf("%s", value))
+			users, err = u.db.QueryUserWithOnlyShortNo(valueString)
 			if err != nil {
 				u.Error("通过short_no查询用户失败！", zap.Error(err), zap.String("shortNo", key))
 				c.ResponseError(errors.New("通过short_no查询用户失败！"))
@@ -597,7 +602,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 					panic(err)
 				}
 			}()
-			err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%s", value), loginUID)
+			err = u.db.UpdateUsersWithField(field, valueString, loginUID)
 			if err != nil {
 				c.ResponseError(errors.New("修改用户资料失败"))
 				tx.Rollback()
@@ -605,7 +610,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 			}
 			err = u.db.UpdateUsersWithField("short_status", "1", loginUID)
 			if err != nil {
-				u.Error("修改用户资料失败", zap.Error(err), zap.Any(key, value))
+				u.Error("修改用户资料失败", zap.Error(err), zap.String(field, valueString))
 				c.ResponseError(errors.New("修改用户资料失败"))
 				tx.Rollback()
 				return
@@ -621,20 +626,20 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 			return
 		}
 		//修改用户信息
-		if key == "name" && value != nil && value.(string) == "" { // 修改名字
+		if field == "name" && valueString == "" { // 修改名字
 			c.ResponseError(errors.New("名字不能为空！"))
 			return
 		}
 
-		err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%s", value), loginUID)
+		err = u.db.UpdateUsersWithField(field, valueString, loginUID)
 		if err != nil {
 			u.Error("修改用户资料失败", zap.Error(err))
 			c.ResponseError(errors.New("修改用户资料失败"))
 			return
 		}
-		if key == "name" {
+		if field == "name" {
 			// 将重新设置token设置到缓存（这里主要是更新登录者的name）
-			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), wkhttp.EncodeTokenCacheInfo(loginUID, safeTokenCacheName(loginUID, fmt.Sprintf("%v", value)), c.GetLoginRole()))
+			err = u.ctx.Cache().Set(u.ctx.GetConfig().Cache.TokenCachePrefix+c.GetHeader("token"), wkhttp.EncodeTokenCacheInfo(loginUID, safeTokenCacheName(loginUID, valueString), c.GetLoginRole()))
 			if err != nil {
 				u.Error("重新设置token缓存失败！", zap.Error(err))
 				c.ResponseError(errors.New("重新设置token缓存失败！"))
@@ -2503,13 +2508,144 @@ func safeTokenCacheName(uid, name string) string {
 
 // 是否允许更新
 func allowUpdateUserField(field string) bool {
-	allowfields := []string{"sex", "short_no", "name", "search_by_phone", "search_by_short", "new_msg_notice", "msg_show_detail", "voice_on", "shock_on", "msg_expire_second"}
+	allowfields := []string{
+		"sex", "short_no", "name", "search_by_phone", "search_by_short", "new_msg_notice", "msg_show_detail", "voice_on", "shock_on", "msg_expire_second",
+		"intro", "country_code", "country", "native_languages", "learning_languages", "birthday",
+	}
 	for _, allowFiled := range allowfields {
 		if field == allowFiled {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeUserUpdateField(field string, value interface{}) (string, string, error) {
+	field = strings.TrimSpace(field)
+	switch field {
+	case "nationality_code":
+		field = "country_code"
+	case "nationality", "country_name":
+		field = "country"
+	case "native_language":
+		field = "native_languages"
+	case "learning_language":
+		field = "learning_languages"
+	case "gender":
+		field = "sex"
+	}
+
+	switch field {
+	case "native_languages", "learning_languages":
+		languages, err := normalizeUserLanguageValue(value, 5)
+		if err != nil {
+			return field, "", err
+		}
+		data, err := json.Marshal(languages)
+		if err != nil {
+			return field, "", err
+		}
+		return field, string(data), nil
+	case "country_code":
+		return field, strings.ToUpper(normalizeUserStringValue(value)), nil
+	case "sex":
+		return field, normalizeUserSexValue(value), nil
+	default:
+		return field, normalizeUserStringValue(value), nil
+	}
+}
+
+func normalizeUserStringValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	case bool:
+		if v {
+			return "1"
+		}
+		return "0"
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", value))
+	}
+}
+
+func normalizeUserSexValue(value interface{}) string {
+	text := strings.ToLower(normalizeUserStringValue(value))
+	switch text {
+	case "男", "male", "m", "1":
+		return "1"
+	case "女", "female", "f", "0":
+		return "0"
+	case "其他", "other", "2":
+		return "2"
+	default:
+		return text
+	}
+}
+
+func normalizeUserLanguageValue(value interface{}, max int) ([]string, error) {
+	items := make([]string, 0)
+	switch v := value.(type) {
+	case []interface{}:
+		for _, item := range v {
+			items = append(items, normalizeUserStringValue(item))
+		}
+	case []string:
+		items = append(items, v...)
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return []string{}, nil
+		}
+		if strings.HasPrefix(text, "[") {
+			var arr []string
+			if err := json.Unmarshal([]byte(text), &arr); err == nil {
+				items = append(items, arr...)
+			} else {
+				items = splitUserLanguageText(text)
+			}
+		} else {
+			items = splitUserLanguageText(text)
+		}
+	default:
+		text := normalizeUserStringValue(value)
+		if text != "" {
+			items = splitUserLanguageText(text)
+		}
+	}
+
+	result := make([]string, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+		if max > 0 && len(result) > max {
+			return nil, errors.New("语言最多选择5个")
+		}
+	}
+	return result, nil
+}
+
+func splitUserLanguageText(text string) []string {
+	text = strings.NewReplacer("，", ",", "、", ",", ";", ",", "；", ",").Replace(text)
+	return strings.Split(text, ",")
 }
 
 func (u *User) createUser(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, invite *model.Invite) {
@@ -2797,23 +2933,29 @@ type deviceReq struct {
 }
 
 type loginUserDetailResp struct {
-	UID             string  `json:"uid"`
-	AppID           string  `json:"app_id"`
-	Name            string  `json:"name"`
-	Username        string  `json:"username"`
-	Sex             int     `json:"sex"`               //性别1:男
-	Category        string  `json:"category"`          //用户分类 '客服'
-	ShortNo         string  `json:"short_no"`          // 用户唯一短编号
-	Zone            string  `json:"zone"`              //区号
-	Phone           string  `json:"phone"`             //手机号
-	Token           string  `json:"token"`             //token
-	ChatPwd         string  `json:"chat_pwd"`          //聊天密码
-	LockScreenPwd   string  `json:"lock_screen_pwd"`   // 锁屏密码
-	LockAfterMinute int     `json:"lock_after_minute"` // 在N分钟后锁屏
-	Setting         setting `json:"setting"`
-	RSAPublicKey    string  `json:"rsa_public_key"` // 应用公钥做一些消息验证 base64编码
-	ShortStatus     int     `json:"short_status"`
-	MsgExpireSecond int64   `json:"msg_expire_second"` // 消息过期时长
+	UID               string   `json:"uid"`
+	AppID             string   `json:"app_id"`
+	Name              string   `json:"name"`
+	Username          string   `json:"username"`
+	Sex               int      `json:"sex"`                //性别1:男
+	Intro             string   `json:"intro"`              //自我介绍
+	CountryCode       string   `json:"country_code"`       //国籍/地区ISO代码
+	Country           string   `json:"country"`            //国籍/地区显示名
+	NativeLanguages   []string `json:"native_languages"`   //母语
+	LearningLanguages []string `json:"learning_languages"` //学习语言
+	Birthday          string   `json:"birthday"`           //出生日期
+	Category          string   `json:"category"`           //用户分类 '客服'
+	ShortNo           string   `json:"short_no"`           // 用户唯一短编号
+	Zone              string   `json:"zone"`               //区号
+	Phone             string   `json:"phone"`              //手机号
+	Token             string   `json:"token"`              //token
+	ChatPwd           string   `json:"chat_pwd"`           //聊天密码
+	LockScreenPwd     string   `json:"lock_screen_pwd"`    // 锁屏密码
+	LockAfterMinute   int      `json:"lock_after_minute"`  // 在N分钟后锁屏
+	Setting           setting  `json:"setting"`
+	RSAPublicKey      string   `json:"rsa_public_key"` // 应用公钥做一些消息验证 base64编码
+	ShortStatus       int      `json:"short_status"`
+	MsgExpireSecond   int64    `json:"msg_expire_second"` // 消息过期时长
 }
 
 type setting struct {
@@ -2837,22 +2979,28 @@ type blacklistResp struct {
 func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginUserDetailResp {
 
 	return &loginUserDetailResp{
-		UID:             m.UID,
-		AppID:           m.AppID,
-		Name:            m.Name,
-		Username:        m.Username,
-		Sex:             m.Sex,
-		Category:        m.Category,
-		ShortNo:         m.ShortNo,
-		Zone:            m.Zone,
-		Phone:           m.Phone,
-		Token:           token,
-		ChatPwd:         m.ChatPwd,
-		LockScreenPwd:   m.LockScreenPwd,
-		LockAfterMinute: m.LockAfterMinute,
-		ShortStatus:     m.ShortStatus,
-		RSAPublicKey:    base64.StdEncoding.EncodeToString([]byte(ctx.GetConfig().AppRSAPubKey)),
-		MsgExpireSecond: m.MsgExpireSecond,
+		UID:               m.UID,
+		AppID:             m.AppID,
+		Name:              m.Name,
+		Username:          m.Username,
+		Sex:               m.Sex,
+		Intro:             m.Intro,
+		CountryCode:       m.CountryCode,
+		Country:           m.Country,
+		NativeLanguages:   parseUserLanguageList(m.NativeLanguages),
+		LearningLanguages: parseUserLanguageList(m.LearningLanguages),
+		Birthday:          m.Birthday,
+		Category:          m.Category,
+		ShortNo:           m.ShortNo,
+		Zone:              m.Zone,
+		Phone:             m.Phone,
+		Token:             token,
+		ChatPwd:           m.ChatPwd,
+		LockScreenPwd:     m.LockScreenPwd,
+		LockAfterMinute:   m.LockAfterMinute,
+		ShortStatus:       m.ShortStatus,
+		RSAPublicKey:      base64.StdEncoding.EncodeToString([]byte(ctx.GetConfig().AppRSAPubKey)),
+		MsgExpireSecond:   m.MsgExpireSecond,
 		Setting: setting{
 			SearchByPhone:     m.SearchByPhone,
 			SearchByShort:     m.SearchByShort,
