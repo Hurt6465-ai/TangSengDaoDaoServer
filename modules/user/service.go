@@ -871,6 +871,9 @@ type UserDetailResp struct {
 	NativeLanguages     []string          `json:"native_languages"`       //母语，最多5个
 	LearningLanguages   []string          `json:"learning_languages"`     //学习语言，最多5个
 	Birthday            string            `json:"birthday"`               //出生日期
+	Tags                []string          `json:"tags"`                   //个人主页标签
+	ProfileCover        string            `json:"profile_cover"`          //个人主页背景墙图片路径
+	ProfileImages       []string          `json:"profile_images"`         //个人主页照片墙图片路径
 	Category            string            `json:"category"`               //用户分类 '客服'
 	ShortNo             string            `json:"short_no"`               // 用户唯一短编号
 	ChatPwdOn           int               `json:"chat_pwd_on"`            //是否开启聊天密码
@@ -916,6 +919,10 @@ type GroupMemberResp struct {
 }
 
 func parseUserLanguageList(value string) []string {
+	return parseUserStringList(value, 5)
+}
+
+func parseUserStringList(value string, max int) []string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return []string{}
@@ -923,12 +930,12 @@ func parseUserLanguageList(value string) []string {
 	var arr []string
 	if strings.HasPrefix(value, "[") {
 		if err := util.ReadJsonByByte([]byte(value), &arr); err == nil {
-			return compactProfileStrings(arr, 5)
+			return compactProfileStrings(arr, max)
 		}
 	}
-	value = strings.NewReplacer("，", ",", "、", ",", ";", ",", "；", ",").Replace(value)
+	value = strings.NewReplacer("，", ",", "、", ",", ";", ",", "；", ",", "\n", ",").Replace(value)
 	parts := strings.Split(value, ",")
-	return compactProfileStrings(parts, 5)
+	return compactProfileStrings(parts, max)
 }
 
 func compactProfileStrings(values []string, max int) []string {
@@ -989,6 +996,9 @@ func NewUserDetailResp(m *Detail, remark, loginUID string, sourceFrom string, on
 		NativeLanguages:   parseUserLanguageList(m.NativeLanguages),
 		LearningLanguages: parseUserLanguageList(m.LearningLanguages),
 		Birthday:          m.Birthday,
+		Tags:              parseUserStringList(m.Tags, 20),
+		ProfileCover:      m.ProfileCover,
+		ProfileImages:     parseUserStringList(m.ProfileImages, 9),
 		ChatPwdOn:         m.ChatPwdOn,
 		Category:          m.Category,
 		ShortNo:           m.ShortNo,

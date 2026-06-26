@@ -184,6 +184,9 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	extraMap["native_languages"] = user.NativeLanguages
 	extraMap["learning_languages"] = user.LearningLanguages
 	extraMap["birthday"] = user.Birthday
+	extraMap["tags"] = user.Tags
+	extraMap["profile_cover"] = user.ProfileCover
+	extraMap["profile_images"] = user.ProfileImages
 	extraMap["chat_pwd_on"] = user.ChatPwdOn
 	extraMap["short_no"] = user.ShortNo
 	extraMap["source_desc"] = user.SourceDesc

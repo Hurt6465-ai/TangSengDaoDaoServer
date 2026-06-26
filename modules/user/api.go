@@ -2514,6 +2514,7 @@ func allowUpdateUserField(field string) bool {
 	allowfields := []string{
 		"sex", "short_no", "name", "search_by_phone", "search_by_short", "new_msg_notice", "msg_show_detail", "voice_on", "shock_on", "msg_expire_second",
 		"intro", "country_code", "country", "native_languages", "learning_languages", "birthday",
+		"tags", "profile_cover", "profile_images",
 	}
 	for _, allowFiled := range allowfields {
 		if field == allowFiled {
@@ -2534,6 +2535,12 @@ func normalizeUserUpdateField(field string, value interface{}) (string, string, 
 		field = "native_languages"
 	case "learning_language":
 		field = "learning_languages"
+	case "profile_tags", "interest_tags":
+		field = "tags"
+	case "cover", "cover_url":
+		field = "profile_cover"
+	case "images", "photos", "profile_photos":
+		field = "profile_images"
 	case "gender":
 		field = "sex"
 	}
@@ -2549,6 +2556,28 @@ func normalizeUserUpdateField(field string, value interface{}) (string, string, 
 			return field, "", err
 		}
 		return field, string(data), nil
+	case "tags":
+		items, err := normalizeUserStringListValue(value, 20, "标签最多20个")
+		if err != nil {
+			return field, "", err
+		}
+		data, err := json.Marshal(items)
+		if err != nil {
+			return field, "", err
+		}
+		return field, string(data), nil
+	case "profile_images":
+		items, err := normalizeUserStringListValue(value, 9, "主页图片最多9张")
+		if err != nil {
+			return field, "", err
+		}
+		data, err := json.Marshal(items)
+		if err != nil {
+			return field, "", err
+		}
+		return field, string(data), nil
+	case "profile_cover":
+		return field, normalizeProfileImagePath(value), nil
 	case "country_code":
 		return field, strings.ToUpper(normalizeUserStringValue(value)), nil
 	case "sex":
@@ -2644,6 +2673,75 @@ func normalizeUserLanguageValue(value interface{}, max int) ([]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func normalizeUserStringListValue(value interface{}, max int, maxErr string) ([]string, error) {
+	items := make([]string, 0)
+	switch v := value.(type) {
+	case []interface{}:
+		for _, item := range v {
+			items = append(items, normalizeUserStringValue(item))
+		}
+	case []string:
+		items = append(items, v...)
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return []string{}, nil
+		}
+		if strings.HasPrefix(text, "[") {
+			var arr []string
+			if err := json.Unmarshal([]byte(text), &arr); err == nil {
+				items = append(items, arr...)
+			} else {
+				items = splitUserProfileListText(text)
+			}
+		} else {
+			items = splitUserProfileListText(text)
+		}
+	default:
+		text := normalizeUserStringValue(value)
+		if text != "" {
+			items = splitUserProfileListText(text)
+		}
+	}
+
+	result := make([]string, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+		if max > 0 && len(result) > max {
+			if maxErr == "" {
+				maxErr = "数量超过限制"
+			}
+			return nil, errors.New(maxErr)
+		}
+	}
+	return result, nil
+}
+
+func splitUserProfileListText(text string) []string {
+	text = strings.NewReplacer("，", ",", "、", ",", ";", ",", "；", ",", "\n", ",").Replace(text)
+	return strings.Split(text, ",")
+}
+
+func normalizeProfileImagePath(value interface{}) string {
+	text := normalizeUserStringValue(value)
+	if text == "" {
+		return ""
+	}
+	// 前端上传接口返回的是 file/preview/common/profile/xxx.webp；这里不补域名，只保存相对路径，方便 WKApiConfig.getShowUrl 统一展示。
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, "/")
+	return text
 }
 
 func splitUserLanguageText(text string) []string {
@@ -2947,6 +3045,9 @@ type loginUserDetailResp struct {
 	NativeLanguages   []string `json:"native_languages"`   //母语
 	LearningLanguages []string `json:"learning_languages"` //学习语言
 	Birthday          string   `json:"birthday"`           //出生日期
+	Tags              []string `json:"tags"`               //个人主页标签
+	ProfileCover      string   `json:"profile_cover"`      //个人主页背景墙图片路径
+	ProfileImages     []string `json:"profile_images"`     //个人主页照片墙图片路径
 	Category          string   `json:"category"`           //用户分类 '客服'
 	ShortNo           string   `json:"short_no"`           // 用户唯一短编号
 	Zone              string   `json:"zone"`               //区号
@@ -2993,6 +3094,9 @@ func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginU
 		NativeLanguages:   parseUserLanguageList(m.NativeLanguages),
 		LearningLanguages: parseUserLanguageList(m.LearningLanguages),
 		Birthday:          m.Birthday,
+		Tags:              parseUserStringList(m.Tags, 20),
+		ProfileCover:      m.ProfileCover,
+		ProfileImages:     parseUserStringList(m.ProfileImages, 9),
 		Category:          m.Category,
 		ShortNo:           m.ShortNo,
 		Zone:              m.Zone,

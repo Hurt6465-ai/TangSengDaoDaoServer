@@ -36,6 +36,9 @@ func (d *DB) ensureProfileColumns() error {
 		{"native_languages", "ALTER TABLE `user` ADD COLUMN `native_languages` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '母语JSON数组，最多5个'"},
 		{"learning_languages", "ALTER TABLE `user` ADD COLUMN `learning_languages` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '学习语言JSON数组，最多5个'"},
 		{"birthday", "ALTER TABLE `user` ADD COLUMN `birthday` VARCHAR(20) NOT NULL DEFAULT '' COMMENT '出生日期 yyyy-MM-dd'"},
+		{"tags", "ALTER TABLE `user` ADD COLUMN `tags` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '个人主页标签JSON数组'"},
+		{"profile_cover", "ALTER TABLE `user` ADD COLUMN `profile_cover` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '个人主页背景墙图片路径'"},
+		{"profile_images", "ALTER TABLE `user` ADD COLUMN `profile_images` VARCHAR(2000) NOT NULL DEFAULT '' COMMENT '个人主页照片墙JSON数组'"},
 	}
 	for _, column := range columns {
 		exists, err := d.userColumnExists(column.name)
@@ -363,6 +366,9 @@ type Model struct {
 	NativeLanguages   string //母语JSON数组
 	LearningLanguages string //学习语言JSON数组
 	Birthday          string //出生日期
+	Tags              string //个人主页标签JSON数组
+	ProfileCover      string //个人主页背景墙图片路径
+	ProfileImages     string //个人主页照片墙JSON数组
 	ShortNo           string //唯一短编号
 	ShortStatus       int    //唯一短编号是否修改0.否1.是
 	Zone              string //区号
