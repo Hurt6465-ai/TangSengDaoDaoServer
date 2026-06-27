@@ -8,10 +8,12 @@ import (
 	// 先注册 chatrooms 可让 datasource 优先识别 topic room，避免走普通群好友校验。
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/chatrooms"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/common"
+	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/feed"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/file"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/group"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/message"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/openapi"
+	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/partners"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/qrcode"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/report"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/robot"
