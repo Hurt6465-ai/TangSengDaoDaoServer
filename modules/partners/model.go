@@ -43,29 +43,29 @@ type LocationResp struct {
 
 type PartnerUser struct {
 	UID               string   `json:"uid" db:"uid"`
-	ID                string   `json:"id,omitempty" db:"uid"`
+	ID                string   `json:"id,omitempty" db:"-"`
 	Name              string   `json:"name" db:"name"`
 	Username          string   `json:"username" db:"username"`
 	Avatar            string   `json:"avatar" db:"avatar"`
-	AvatarCacheKey    string   `json:"avatar_cache_key"`
+	AvatarCacheKey    string   `json:"avatar_cache_key" db:"-"`
 	Sex               int      `json:"sex" db:"sex"`
-	Age               int      `json:"age"`
+	Age               int      `json:"age" db:"-"`
 	Birthday          string   `json:"birthday" db:"birthday"`
 	Intro             string   `json:"intro" db:"intro"`
 	CountryCode       string   `json:"country_code" db:"country_code"`
 	Country           string   `json:"country" db:"country"`
-	NativeLanguages   []string `json:"native_languages"`
-	LearningLanguages []string `json:"learning_languages"`
-	Tags              []string `json:"tags"`
+	NativeLanguages   []string `json:"native_languages" db:"-"`
+	LearningLanguages []string `json:"learning_languages" db:"-"`
+	Tags              []string `json:"tags" db:"-"`
 	ProfileCover      string   `json:"profile_cover" db:"profile_cover"`
-	ProfileImages     []string `json:"profile_images"`
+	ProfileImages     []string `json:"profile_images" db:"-"`
 	Follow            int      `json:"follow" db:"follow"`
 	Vercode           string   `json:"vercode" db:"vercode"`
 	Online            int      `json:"online" db:"online"`
 	LastOffline       int      `json:"last_offline" db:"last_offline"`
 	LastActiveAt      int64    `json:"last_active_at" db:"last_active_at"`
 	DistanceMeters    int      `json:"distance_meters" db:"distance_meters"`
-	Nearby            int      `json:"nearby"`
+	Nearby            int      `json:"nearby" db:"-"`
 	Score             float64  `json:"score" db:"score"`
 
 	NativeLanguagesRaw   string `json:"-" db:"native_languages"`
