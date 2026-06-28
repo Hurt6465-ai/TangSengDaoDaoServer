@@ -56,22 +56,22 @@ type FeedPost struct {
 	UpdatedAt      int64        `json:"updated_at" db:"updated_at_ms"`
 	LastActiveAt   int64        `json:"last_active_at" db:"last_active_at"`
 	Score          float64      `json:"score" db:"score"`
-	User           *FeedUser    `json:"user"`
-	Media          []*FeedMedia `json:"media"`
+	User           *FeedUser    `json:"user" db:"-"`
+	Media          []*FeedMedia `json:"media" db:"-"`
 }
 
 type FeedUser struct {
 	UID               string   `json:"uid" db:"user_uid"`
 	Name              string   `json:"name" db:"user_name"`
 	Username          string   `json:"username" db:"username"`
-	Avatar            string   `json:"avatar"`
-	AvatarCacheKey    string   `json:"avatar_cache_key"`
+	Avatar            string   `json:"avatar" db:"-"`
+	AvatarCacheKey    string   `json:"avatar_cache_key" db:"-"`
 	CountryCode       string   `json:"country_code" db:"country_code"`
 	Country           string   `json:"country" db:"country"`
-	Age               int      `json:"age"`
+	Age               int      `json:"age" db:"-"`
 	Birthday          string   `json:"birthday" db:"birthday"`
-	NativeLanguages   []string `json:"native_languages"`
-	LearningLanguages []string `json:"learning_languages"`
+	NativeLanguages   []string `json:"native_languages" db:"-"`
+	LearningLanguages []string `json:"learning_languages" db:"-"`
 	Follow            int      `json:"follow" db:"follow"`
 	Vercode           string   `json:"vercode" db:"vercode"`
 
@@ -104,7 +104,7 @@ type FeedComment struct {
 	Content          string    `json:"content" db:"content"`
 	ReplyToCommentID string    `json:"reply_to_comment_id" db:"reply_to_comment_id"`
 	CreatedAt        int64     `json:"created_at" db:"created_at_ms"`
-	User             *FeedUser `json:"user"`
+	User             *FeedUser `json:"user" db:"-"`
 }
 
 func (u *FeedUser) Normalize() {
