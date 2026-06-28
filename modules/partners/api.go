@@ -27,6 +27,7 @@ func (p *Partners) Route(r *wkhttp.WKHttp) {
 	partners := r.Group("/v1/partners", p.ctx.AuthMiddleware(r))
 	{
 		partners.GET("", p.list)
+		partners.GET("/list", p.list)
 		partners.GET("/nearby", p.nearby)
 		partners.POST("/location", p.location)
 		partners.POST("/greet", p.greet)
