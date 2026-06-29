@@ -18,6 +18,15 @@ func newDB(ctx *config.Context) *db {
 	return &db{session: ctx.DB(), ctx: ctx}
 }
 
+type partnerContactModel struct {
+	UID               string `db:"uid"`
+	ToUID             string `db:"to_uid"`
+	RequesterUID      string `db:"requester_uid"`
+	Status            int    `db:"status"`
+	RequesterMsgCount int    `db:"requester_msg_count"`
+	LastMsgAt         int64  `db:"last_msg_at"`
+}
+
 type locationModel struct {
 	UID          string  `db:"uid"`
 	Lat          float64 `db:"lat"`
@@ -137,6 +146,8 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
         IFNULL(pg.last_greet_at,0) AS last_greet_at,
         IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
         IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
+        IFNULL(pc.status,-1) AS contact_status,
+        IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
         UNIX_TIMESTAMP(u.created_at) AS created_at_unix,
         UNIX_TIMESTAMP(u.updated_at) AS updated_at_unix,
         ` + distanceSelect + `
@@ -150,6 +161,7 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
         ) fr ON fr.to_uid=u.uid
         LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=u.uid
         LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
+        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
         LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
         LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
         ` + locationJoin + `
@@ -164,7 +176,7 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 
 	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+len(whereDistanceArgs)+9)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
-	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
+	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
 	orderedArgs = append(orderedArgs, whereDistanceArgs...)
 	orderedArgs = append(orderedArgs, limit+1, offset)
 
@@ -216,6 +228,7 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
             SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
         ) fr ON fr.to_uid=u.uid
         LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
+        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
         LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
         LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
         WHERE u.uid<>? AND u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')=''
@@ -264,6 +277,8 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
         IFNULL(pg.last_greet_at,0) AS last_greet_at,
         IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
         IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
+        IFNULL(pc.status,-1) AS contact_status,
+        IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
         UNIX_TIMESTAMP(u.created_at) AS created_at_unix,
         UNIX_TIMESTAMP(u.updated_at) AS updated_at_unix,
         ` + distanceSelect + `
@@ -277,6 +292,7 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
         ) fr ON fr.to_uid=u.uid
         LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=u.uid
         LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
+        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
         LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
         LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
         ` + locationJoin + `
@@ -288,7 +304,7 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
 
 	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+8)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
-	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, uids, loginUID)
+	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, uids, loginUID)
 	var list []*PartnerUser
 	_, err := d.session.SelectBySql(sql, orderedArgs...).Load(&list)
 	if err != nil {
@@ -369,7 +385,7 @@ func (d *db) recordGreeting(uid, toUID, text, source string) (*GreetingResp, err
 	if err != nil {
 		return nil, err
 	}
-	return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: now, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, Text: text, Msg: "已打招呼"}, nil
+	return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: now, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: text, Msg: "已打招呼"}, nil
 }
 
 type greetingStats struct {
@@ -436,6 +452,44 @@ func clampLimit(limit int) int {
 func roughGeoHash(lat, lng float64) string {
 	// 轻量粗格子：不引入 geohash 依赖。查询先靠距离表达式，后续可升级 geohash。
 	return strconv.Itoa(int((lat+90)*10)) + ":" + strconv.Itoa(int((lng+180)*10))
+}
+
+func (d *db) getPartnerContact(uid, toUID string) (*partnerContactModel, error) {
+	if uid == "" || toUID == "" {
+		return nil, nil
+	}
+	var model *partnerContactModel
+	_, err := d.session.Select("uid", "to_uid", "requester_uid", "status", "IFNULL(requester_msg_count,0) requester_msg_count", "IFNULL(last_msg_at,0) last_msg_at").
+		From("partner_contacts").
+		Where("uid=? AND to_uid=?", uid, toUID).
+		Load(&model)
+	if err != nil {
+		return nil, err
+	}
+	return model, nil
+}
+
+func (d *db) incrementPendingRequesterMsgCount(uid, toUID string, now int64) (int, error) {
+	if uid == "" || toUID == "" || uid == toUID {
+		return 0, nil
+	}
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	_, err := d.session.Update("partner_contacts").
+		Set("requester_msg_count", dbr.Expr("LEAST(IFNULL(requester_msg_count,0)+1, ?)", MaxPendingGreetingMessages)).
+		Set("last_msg_at", now).
+		Set("updated_at", now).
+		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=?", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
+		Exec()
+	if err != nil {
+		return 0, err
+	}
+	contact, err := d.getPartnerContact(uid, toUID)
+	if err != nil || contact == nil {
+		return 0, err
+	}
+	return contact.RequesterMsgCount, nil
 }
 
 func (d *db) ensurePendingContact(uid, toUID string, now int64) error {

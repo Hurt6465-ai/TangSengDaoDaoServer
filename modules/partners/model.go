@@ -23,6 +23,10 @@ const (
 	GreetingSameTargetCooldown = 7 * 24 * time.Hour
 	GreetingMaxTextLen         = 80
 
+	MaxPendingGreetingMessages = 3
+	SecondGreetingCooldown     = 30 * time.Minute
+	ThirdGreetingCooldown      = 24 * time.Hour
+
 	PartnerContactStatusPending = 0
 	PartnerContactStatusActive  = 1
 	PartnerContactStatusIgnored = 2
@@ -92,19 +96,19 @@ type LocationResp struct {
 }
 
 type GreetingResp struct {
-	Status         int    `json:"status"`
-	ToUID          string `json:"to_uid"`
-	TargetUID      string `json:"target_uid"`
-	LastGreetAt    int64  `json:"last_greet_at"`
-	NextAllowedAt  int64  `json:"next_allowed_at,omitempty"`
-	HelloSent      int    `json:"hello_sent"`
-	GreetingStatus int    `json:"greeting_status"`
-	ContactStatus  int    `json:"contact_status"`
-	Text           string `json:"text,omitempty"`
-	Msg            string `json:"msg,omitempty"`
+	Status            int    `json:"status"`
+	ToUID             string `json:"to_uid"`
+	TargetUID         string `json:"target_uid"`
+	LastGreetAt       int64  `json:"last_greet_at"`
+	NextAllowedAt     int64  `json:"next_allowed_at,omitempty"`
+	HelloSent         int    `json:"hello_sent"`
+	GreetingStatus    int    `json:"greeting_status"`
+	ContactStatus     int    `json:"contact_status"`
+	RequesterMsgCount int    `json:"requester_msg_count"`
+	MaxGreetingCount  int    `json:"max_greeting_count"`
+	Text              string `json:"text,omitempty"`
+	Msg               string `json:"msg,omitempty"`
 }
-
-
 
 type ExposureReq struct {
 	Items []ExposureItem `json:"items"`
@@ -159,6 +163,9 @@ type PartnerUser struct {
 	Score             float64  `json:"score" db:"score"`
 	HelloSent         int      `json:"hello_sent" db:"hello_sent"`
 	GreetingStatus    int      `json:"greeting_status" db:"greeting_status"`
+	ContactStatus     int      `json:"contact_status" db:"contact_status"`
+	RequesterMsgCount int      `json:"requester_msg_count" db:"requester_msg_count"`
+	MaxGreetingCount  int      `json:"max_greeting_count" db:"-"`
 
 	SeenCount   int   `json:"-" db:"seen_count"`
 	LastSeenAt  int64 `json:"-" db:"last_seen_at"`
@@ -196,6 +203,9 @@ func (p *PartnerUser) Normalize() {
 	}
 	if p.DistanceMeters > 0 && p.DistanceMeters <= NearbyRadiusMeters {
 		p.Nearby = 1
+	}
+	if p.MaxGreetingCount <= 0 {
+		p.MaxGreetingCount = MaxPendingGreetingMessages
 	}
 	if strings.TrimSpace(p.Name) == "" {
 		if strings.TrimSpace(p.Username) != "" {

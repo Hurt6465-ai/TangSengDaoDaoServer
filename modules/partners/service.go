@@ -75,8 +75,10 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 	}
 	window := s.pickCandidateWindow(loginUID, pool, PartnerRankWindowSize)
 	if len(window) == 0 {
-		// 当天 served 已经把池子消耗完时，刷新候选池再试一次。
+		// 当天 served/seen 已经把池子消耗完时，刷新候选池再试一次。
+		// 语伴早期用户量少，允许进入下一轮随机循环，不让前端刷到尽头黑住。
 		s.clearServed(loginUID)
+		s.clearSeenDay(loginUID)
 		pool, err = s.rebuildCandidatePool(loginUID, req)
 		if err != nil {
 			return nil, 0, err
@@ -93,19 +95,11 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 	viewerProfile, _ := s.db.profileMe(loginUID)
 	list = RankPartners(list, loginUID, req.Round(), viewerProfile)
 	list = filterFeedPartners(list)
-
-	// Mark invalid/filtered UIDs from this rank window as served too, otherwise a
-	// cached candidate_pool can keep returning the same deleted/banned/no-photo
-	// UIDs and the App may see empty pages with has_more=1. Do not mark the whole
-	// window, because valid but not-yet-returned candidates should remain for the
-	// next page.
-	s.markServedUIDs(loginUID, invalidWindowUIDs(window, list))
-
 	hasMore := 0
 	if len(list) > limit {
 		hasMore = 1
 		list = list[:limit]
-	} else if len(pool) > len(window) {
+	} else if len(pool) > 0 {
 		hasMore = 1
 	}
 	s.markServed(loginUID, list)
@@ -200,34 +194,14 @@ func (s *Service) redisSetMembers(key string) map[string]struct{} {
 }
 
 func (s *Service) markServed(loginUID string, list []*PartnerUser) {
-	if len(list) == 0 {
+	if loginUID == "" || len(list) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
 		return
 	}
-	uids := make([]string, 0, len(list))
+	members := make([]interface{}, 0, len(list))
 	for _, p := range list {
 		if p != nil && p.UID != "" {
-			uids = append(uids, p.UID)
+			members = append(members, p.UID)
 		}
-	}
-	s.markServedUIDs(loginUID, uids)
-}
-
-func (s *Service) markServedUIDs(loginUID string, uids []string) {
-	if loginUID == "" || len(uids) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
-		return
-	}
-	members := make([]interface{}, 0, len(uids))
-	seen := map[string]struct{}{}
-	for _, uid := range uids {
-		uid = strings.TrimSpace(uid)
-		if uid == "" || uid == loginUID {
-			continue
-		}
-		if _, ok := seen[uid]; ok {
-			continue
-		}
-		seen[uid] = struct{}{}
-		members = append(members, uid)
 	}
 	if len(members) == 0 {
 		return
@@ -235,29 +209,6 @@ func (s *Service) markServedUIDs(loginUID string, uids []string) {
 	key := s.servedKey(loginUID)
 	_ = s.ctx.GetRedisConn().SAdd(key, members...)
 	_ = s.ctx.GetRedisConn().Expire(key, 24*time.Hour)
-}
-
-func invalidWindowUIDs(window []string, valid []*PartnerUser) []string {
-	if len(window) == 0 {
-		return nil
-	}
-	validSet := map[string]struct{}{}
-	for _, p := range valid {
-		if p != nil && p.UID != "" {
-			validSet[p.UID] = struct{}{}
-		}
-	}
-	invalid := make([]string, 0)
-	for _, uid := range window {
-		uid = strings.TrimSpace(uid)
-		if uid == "" {
-			continue
-		}
-		if _, ok := validSet[uid]; !ok {
-			invalid = append(invalid, uid)
-		}
-	}
-	return invalid
 }
 
 func (s *Service) clearServed(loginUID string) {
@@ -377,7 +328,59 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	if blocked {
 		return nil, ErrGreetingBlacklisted
 	}
+
 	now := time.Now().UnixMilli()
+	contact, err := s.db.getPartnerContact(uid, toUID)
+	if err != nil {
+		return nil, err
+	}
+	if contact != nil {
+		if contact.Status == PartnerContactStatusActive {
+			return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusActive, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已经可以聊天"}, nil
+		}
+		if contact.Status == PartnerContactStatusBlocked || contact.Status == PartnerContactStatusIgnored {
+			return nil, ErrGreetingBlacklisted
+		}
+		if contact.Status == PartnerContactStatusPending {
+			if contact.RequesterUID != uid {
+				return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}, nil
+			}
+			allowed, nextAt, msg := canSendPendingGreeting(contact.RequesterMsgCount, contact.LastMsgAt, now)
+			if !allowed {
+				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}, ErrGreetingDuplicate
+			}
+			stats, err := s.db.greetingStats(uid, toUID, now)
+			if err != nil {
+				return nil, err
+			}
+			if stats.HourCount >= GreetingHourLimit {
+				return nil, ErrGreetingHourLimit
+			}
+			if stats.DayCount >= GreetingDayLimit {
+				return nil, ErrGreetingDayLimit
+			}
+			text := normalizeGreetingText(req.Text)
+			source := normalizeGreetingSource(req.Source)
+			resp, err := s.db.recordGreeting(uid, toUID, text, source)
+			if err != nil {
+				return nil, err
+			}
+			count, err := s.db.incrementPendingRequesterMsgCount(uid, toUID, resp.LastGreetAt)
+			if err != nil {
+				return nil, err
+			}
+			resp.RequesterMsgCount = count
+			resp.MaxGreetingCount = MaxPendingGreetingMessages
+			if err := s.addPartnerWhitelist(uid, toUID); err != nil {
+				return nil, err
+			}
+			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt); err != nil {
+				return nil, err
+			}
+			return resp, nil
+		}
+	}
+
 	stats, err := s.db.greetingStats(uid, toUID, now)
 	if err != nil {
 		return nil, err
@@ -390,17 +393,11 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	}
 	cooldownMs := int64(GreetingSameTargetCooldown / time.Millisecond)
 	if stats.LastTargetGreetAt > 0 && now-stats.LastTargetGreetAt < cooldownMs {
-		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, Msg: ErrGreetingDuplicate.Error()}
+		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
 		return resp, ErrGreetingDuplicate
 	}
 	text := normalizeGreetingText(req.Text)
-	source := strings.TrimSpace(req.Source)
-	if source == "" {
-		source = "partner_browse"
-	}
-	if utf8.RuneCountInString(source) > 32 {
-		source = string([]rune(source)[:32])
-	}
+	source := normalizeGreetingSource(req.Source)
 	resp, err := s.db.recordGreeting(uid, toUID, text, source)
 	if err != nil {
 		return nil, err
@@ -408,6 +405,8 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	if err := s.db.ensurePendingContact(uid, toUID, resp.LastGreetAt); err != nil {
 		return nil, err
 	}
+	resp.RequesterMsgCount = 1
+	resp.MaxGreetingCount = MaxPendingGreetingMessages
 	if err := s.addPartnerWhitelist(uid, toUID); err != nil {
 		return nil, err
 	}
@@ -415,6 +414,44 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		return nil, err
 	}
 	return resp, nil
+}
+
+func normalizeGreetingSource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "partner_browse"
+	}
+	if utf8.RuneCountInString(source) > 32 {
+		source = string([]rune(source)[:32])
+	}
+	return source
+}
+
+func canSendPendingGreeting(count int, lastMsgAt int64, now int64) (bool, int64, string) {
+	if count >= MaxPendingGreetingMessages {
+		return false, 0, "对方还没回复，最多只能打招呼3次"
+	}
+	if count <= 0 {
+		return true, 0, ""
+	}
+	lastMsgAt = normalizeMillis(lastMsgAt)
+	if lastMsgAt <= 0 {
+		return true, 0, ""
+	}
+	var cooldown time.Duration
+	if count == 1 {
+		cooldown = SecondGreetingCooldown
+	} else {
+		cooldown = ThirdGreetingCooldown
+	}
+	nextAt := lastMsgAt + int64(cooldown/time.Millisecond)
+	if now < nextAt {
+		if count == 1 {
+			return false, nextAt, "稍后再试，对方还没回复"
+		}
+		return false, nextAt, "明天再试，对方还没回复"
+	}
+	return true, 0, ""
 }
 
 func normalizeGreetingText(text string) string {
@@ -495,6 +532,7 @@ func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64)
 		"source":                 source,
 		"requester_uid":          uid,
 		"partner_contact_status": PartnerContactStatusPending,
+		"max_greeting_count":     MaxPendingGreetingMessages,
 		"created_at":             at,
 	}))
 	return s.ctx.SendMessage(&config.MsgSendReq{
