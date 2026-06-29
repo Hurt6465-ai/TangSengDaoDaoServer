@@ -185,19 +185,23 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			c.ResponseError(errors.New("查询好友关系错误"))
 			return
 		}
-		if !sendUserIsFriend {
-			c.ResponseError(errors.New("发送者与接受者不是好友"))
-			return
-		}
 		recvUserIsFriend, err := m.userService.IsFriend(req.ReceiveChannelID, uid)
 		if err != nil {
 			m.Error("查询接受者与发送者好友关系错误", zap.Error(err))
 			c.ResponseError(errors.New("查询接受者与发送者好友关系错误"))
 			return
 		}
-		if !recvUserIsFriend {
-			c.ResponseError(errors.New("接受者与发送者不是好友"))
-			return
+		if !sendUserIsFriend || !recvUserIsFriend {
+			allowed, err := m.isPartnerTemporaryMessageAllowed(uid, req.ReceiveChannelID)
+			if err != nil {
+				m.Error("查询语伴临时会话关系错误", zap.Error(err))
+				c.ResponseError(errors.New("查询语伴临时会话关系错误"))
+				return
+			}
+			if !allowed {
+				c.ResponseError(errors.New("发送者与接受者不是好友"))
+				return
+			}
 		}
 	}
 	if req.ReceiveChannelType == common.ChannelTypeGroup.Uint8() {
@@ -235,6 +239,21 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 		return errors.New("发送消息错误")
 	}
 	return nil
+}
+
+func (m *Message) isPartnerTemporaryMessageAllowed(fromUID, toUID string) (bool, error) {
+	if m == nil || m.ctx == nil || fromUID == "" || toUID == "" || fromUID == toUID {
+		return false, nil
+	}
+	var count int
+	err := m.ctx.DB().Select("COUNT(*)").
+		From("partner_contacts").
+		Where("uid=? AND to_uid=? AND (status=? OR (status=? AND requester_uid<>?))", fromUID, toUID, 1, 0, fromUID).
+		LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // 消息编辑
