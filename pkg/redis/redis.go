@@ -273,12 +273,18 @@ score 值可以是整数值或双精度浮点数。
 */
 func (rc *Conn) ZAdd(key string, scoremember ...interface{}) error {
 
-	members := make([]rd.Z, 0)
-	for i := 0; i < len(scoremember); i = i + 2 {
-		score := scoremember[0].(float64)
+	if len(scoremember)%2 != 0 {
+		return errors.New("redis zadd操作失败【scoremember不能为单数】")
+	}
+	members := make([]rd.Z, 0, len(scoremember)/2)
+	for i := 0; i < len(scoremember); i += 2 {
+		score, ok := scoremember[i].(float64)
+		if !ok {
+			return errors.New("redis zadd操作失败【score必须为float64】")
+		}
 		members = append(members, rd.Z{
 			Score:  score,
-			Member: scoremember[1],
+			Member: scoremember[i+1],
 		})
 	}
 	return rc.client.ZAdd(key, members...).Err()
