@@ -19,16 +19,24 @@ CREATE TABLE IF NOT EXISTS partner_contacts (
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_contacts' AND INDEX_NAME = 'uk_partner_contact_pair');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_contacts ADD UNIQUE KEY uk_partner_contact_pair(uid,to_uid)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_contacts' AND INDEX_NAME = 'idx_partner_contact_uid_status');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_contacts ADD INDEX idx_partner_contact_uid_status(uid,status,last_msg_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_contacts' AND INDEX_NAME = 'idx_partner_contact_to_status');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_contacts ADD INDEX idx_partner_contact_to_status(to_uid,status,last_msg_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_contacts' AND INDEX_NAME = 'idx_partner_contact_requester');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_contacts ADD INDEX idx_partner_contact_requester(requester_uid,status)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
