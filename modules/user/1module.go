@@ -113,9 +113,17 @@ func init() {
 					if len(friends) > 0 {
 						for _, friend := range friends {
 							if friend.IsAlone == 0 {
-								firendUIDs = append(firendUIDs, friend.UID)
+								firendUIDs = appendUniqueUID(firendUIDs, friend.UID)
 							}
 						}
+					}
+
+					// 语伴方案 B：非好友临时语伴会话也进入个人频道白名单。
+					// active：双向允许继续聊天。
+					// pending：只允许 receiver 回复 requester；requester 不能在对方回复前继续追发。
+					partnerUIDs, _ := api.partnerContactUIDs(channelID)
+					for _, uid := range partnerUIDs {
+						firendUIDs = appendUniqueUID(firendUIDs, uid)
 					}
 					return firendUIDs, nil
 				},
@@ -196,4 +204,28 @@ func newChannelRespWithUserDetailResp(user *UserDetailResp) *model.ChannelResp {
 	resp.Extra = extraMap
 
 	return resp
+}
+
+func (f *Friend) partnerContactUIDs(uid string) ([]string, error) {
+	if f == nil || f.ctx == nil || uid == "" {
+		return []string{}, nil
+	}
+	var uids []string
+	_, err := f.ctx.DB().Select("to_uid").From("partner_contacts").Where("uid=? AND (status=? OR (status=? AND requester_uid=?))", uid, 1, 0, uid).Load(&uids)
+	if err != nil {
+		return nil, err
+	}
+	return uids, nil
+}
+
+func appendUniqueUID(list []string, uid string) []string {
+	if uid == "" {
+		return list
+	}
+	for _, item := range list {
+		if item == uid {
+			return list
+		}
+	}
+	return append(list, uid)
 }
