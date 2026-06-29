@@ -93,11 +93,19 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 	viewerProfile, _ := s.db.profileMe(loginUID)
 	list = RankPartners(list, loginUID, req.Round(), viewerProfile)
 	list = filterFeedPartners(list)
+
+	// Mark invalid/filtered UIDs from this rank window as served too, otherwise a
+	// cached candidate_pool can keep returning the same deleted/banned/no-photo
+	// UIDs and the App may see empty pages with has_more=1. Do not mark the whole
+	// window, because valid but not-yet-returned candidates should remain for the
+	// next page.
+	s.markServedUIDs(loginUID, invalidWindowUIDs(window, list))
+
 	hasMore := 0
 	if len(list) > limit {
 		hasMore = 1
 		list = list[:limit]
-	} else if len(window) > len(list) || len(pool) > len(window) {
+	} else if len(pool) > len(window) {
 		hasMore = 1
 	}
 	s.markServed(loginUID, list)
@@ -192,14 +200,34 @@ func (s *Service) redisSetMembers(key string) map[string]struct{} {
 }
 
 func (s *Service) markServed(loginUID string, list []*PartnerUser) {
-	if loginUID == "" || len(list) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
+	if len(list) == 0 {
 		return
 	}
-	members := make([]interface{}, 0, len(list))
+	uids := make([]string, 0, len(list))
 	for _, p := range list {
 		if p != nil && p.UID != "" {
-			members = append(members, p.UID)
+			uids = append(uids, p.UID)
 		}
+	}
+	s.markServedUIDs(loginUID, uids)
+}
+
+func (s *Service) markServedUIDs(loginUID string, uids []string) {
+	if loginUID == "" || len(uids) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
+		return
+	}
+	members := make([]interface{}, 0, len(uids))
+	seen := map[string]struct{}{}
+	for _, uid := range uids {
+		uid = strings.TrimSpace(uid)
+		if uid == "" || uid == loginUID {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		members = append(members, uid)
 	}
 	if len(members) == 0 {
 		return
@@ -207,6 +235,29 @@ func (s *Service) markServed(loginUID string, list []*PartnerUser) {
 	key := s.servedKey(loginUID)
 	_ = s.ctx.GetRedisConn().SAdd(key, members...)
 	_ = s.ctx.GetRedisConn().Expire(key, 24*time.Hour)
+}
+
+func invalidWindowUIDs(window []string, valid []*PartnerUser) []string {
+	if len(window) == 0 {
+		return nil
+	}
+	validSet := map[string]struct{}{}
+	for _, p := range valid {
+		if p != nil && p.UID != "" {
+			validSet[p.UID] = struct{}{}
+		}
+	}
+	invalid := make([]string, 0)
+	for _, uid := range window {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := validSet[uid]; !ok {
+			invalid = append(invalid, uid)
+		}
+	}
+	return invalid
 }
 
 func (s *Service) clearServed(loginUID string) {
