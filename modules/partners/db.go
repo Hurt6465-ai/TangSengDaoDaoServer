@@ -241,7 +241,7 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
         ORDER BY IFNULL(onl.online,0) DESC, IFNULL(onl.last_active_at,0) DESC, u.updated_at DESC
         LIMIT ?`
 	var uids []string
-	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&uids)
+	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&uids)
 	return uids, err
 }
 
@@ -427,6 +427,17 @@ func (r listReq) Round() int {
 		return n/clampLimit(r.Limit) + 1
 	}
 	return 1
+}
+
+func (r listReq) RandomSeed() string {
+	seed := strings.TrimSpace(r.SessionID)
+	if seed == "" {
+		seed = strings.TrimSpace(r.Cursor)
+	}
+	if seed == "" {
+		seed = time.Now().Format("2006010215")
+	}
+	return seed + ":" + strconv.Itoa(r.Round())
 }
 
 func (r listReq) RadiusMeters() int {

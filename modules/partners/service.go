@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -55,7 +56,7 @@ func (s *Service) listRealtime(loginUID string, req listReq) ([]*PartnerUser, in
 		return nil, 0, err
 	}
 	viewerProfile, _ := s.db.profileMe(loginUID)
-	list = RankPartners(list, loginUID, req.Round(), viewerProfile)
+	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
 	list = filterFeedPartners(list)
 	limit := clampLimit(req.Limit)
 	hasMore := 0
@@ -93,7 +94,7 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 		return nil, 0, err
 	}
 	viewerProfile, _ := s.db.profileMe(loginUID)
-	list = RankPartners(list, loginUID, req.Round(), viewerProfile)
+	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
 	list = filterFeedPartners(list)
 	hasMore := 0
 	if len(list) > limit {
@@ -124,7 +125,7 @@ func filterFeedPartners(list []*PartnerUser) []*PartnerUser {
 }
 
 func (s *Service) getCandidatePool(loginUID string, req listReq) ([]string, error) {
-	key := s.candidatePoolKey(loginUID)
+	key := s.candidatePoolKey(loginUID, req.SessionID)
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
 			var uids []string
@@ -142,8 +143,9 @@ func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, 
 		return nil, err
 	}
 	uids = compactUIDs(uids, PartnerCandidatePoolSize)
+	uids = shuffleCandidateUIDs(uids, loginUID+":"+req.RandomSeed())
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil && len(uids) > 0 {
-		key := s.candidatePoolKey(loginUID)
+		key := s.candidatePoolKey(loginUID, req.SessionID)
 		_ = s.ctx.GetRedisConn().SetAndExpire(key, util.ToJson(uids), 24*time.Hour)
 	}
 	return uids, nil
@@ -225,8 +227,40 @@ func (s *Service) clearSeenDay(loginUID string) {
 	_ = s.ctx.GetRedisConn().Del(s.seenDayKey(loginUID))
 }
 
-func (s *Service) candidatePoolKey(uid string) string {
-	return "partner_candidate_pool:" + uid + ":" + time.Now().Format("20060102")
+func (s *Service) candidatePoolKey(uid string, sessionID string) string {
+	seed := normalizePoolSeed(sessionID)
+	if seed == "" {
+		seed = time.Now().Format("2006010215")
+	}
+	return "partner_candidate_pool:" + uid + ":" + time.Now().Format("20060102") + ":" + seed
+}
+
+func normalizePoolSeed(seed string) string {
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		return ""
+	}
+	seed = strings.ReplaceAll(seed, "-", "")
+	if len(seed) > 24 {
+		seed = seed[:24]
+	}
+	return seed
+}
+
+func shuffleCandidateUIDs(uids []string, seed string) []string {
+	if len(uids) <= 1 {
+		return uids
+	}
+	out := append([]string(nil), uids...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a := deterministicRandom(seed+":"+out[i], 1000000)
+		b := deterministicRandom(seed+":"+out[j], 1000000)
+		if a == b {
+			return out[i] < out[j]
+		}
+		return a > b
+	})
+	return out
 }
 
 func (s *Service) servedKey(uid string) string {

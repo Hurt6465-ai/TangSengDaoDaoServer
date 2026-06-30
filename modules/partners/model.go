@@ -217,14 +217,21 @@ func (p *PartnerUser) Normalize() {
 }
 
 func RankPartners(list []*PartnerUser, loginUID string, round int, viewer *ProfileMeResp) []*PartnerUser {
+	return RankPartnersWithSeed(list, loginUID, round, viewer, time.Now().Format("20060102"))
+}
+
+func RankPartnersWithSeed(list []*PartnerUser, loginUID string, round int, viewer *ProfileMeResp, seed string) []*PartnerUser {
 	nowMs := time.Now().UnixMilli()
+	if strings.TrimSpace(seed) == "" {
+		seed = time.Now().Format("20060102")
+	}
 	ranked := make([]*PartnerUser, 0, len(list))
 	for _, p := range list {
 		if p == nil {
 			continue
 		}
 		p.Normalize()
-		p.Score = partnerScore(p, loginUID, round, nowMs, viewer)
+		p.Score = partnerScore(p, loginUID, round, nowMs, viewer, seed)
 		if p.Score <= -900 {
 			continue
 		}
@@ -236,12 +243,12 @@ func RankPartners(list []*PartnerUser, loginUID string, round int, viewer *Profi
 	return ranked
 }
 
-func partnerScore(p *PartnerUser, loginUID string, round int, nowMs int64, viewer *ProfileMeResp) float64 {
+func partnerScore(p *PartnerUser, loginUID string, round int, nowMs int64, viewer *ProfileMeResp, seed string) float64 {
 	score := 0.0
 	score += activeScore(p, nowMs)
 	score += languageScore(viewer, p)
 	score += profileScore(p)
-	score += deterministicRandom(loginUID+":"+p.UID+":"+strconv.Itoa(round)+":"+time.Now().Format("20060102"), 8)
+	score += deterministicRandom(loginUID+":"+p.UID+":"+strconv.Itoa(round)+":"+seed, 18)
 	// 距离不参与推荐分：不加分、不扣分，只用于候选混入和 App 展示。
 	if p.SeenCount > 0 {
 		score -= float64(minInt(p.SeenCount*3, 18))
