@@ -10,7 +10,10 @@ import (
 const (
 	DefaultFeedLimit = 16
 	MaxFeedLimit     = 50
+	FeedVideoTTLDays = 28
 )
+
+var FeedVideoTTL = time.Duration(FeedVideoTTLDays) * 24 * time.Hour
 
 type ListResp struct {
 	List       []*FeedPost `json:"list"`
@@ -38,6 +41,24 @@ type PublishReq struct {
 type CommentReq struct {
 	Content          string `json:"content"`
 	ReplyToCommentID string `json:"reply_to_comment_id"`
+}
+
+type FollowReq struct {
+	UID          string `json:"uid"`
+	FollowingUID string `json:"following_uid"`
+}
+
+type ReportReq struct {
+	Reason string `json:"reason"`
+}
+
+type EventReq struct {
+	EventType  string `json:"event_type"`
+	WatchMS    int64  `json:"watch_ms"`
+	DurationMS int64  `json:"duration_ms"`
+	Percent    int    `json:"percent"`
+	MediaType  string `json:"media_type"`
+	Extra      string `json:"extra"`
 }
 
 type FeedPost struct {
@@ -68,6 +89,7 @@ type FeedUser struct {
 	AvatarCacheKey    string   `json:"avatar_cache_key" db:"-"`
 	CountryCode       string   `json:"country_code" db:"country_code"`
 	Country           string   `json:"country" db:"country"`
+	Sex               int      `json:"sex" db:"sex"`
 	Age               int      `json:"age" db:"-"`
 	Birthday          string   `json:"birthday" db:"birthday"`
 	NativeLanguages   []string `json:"native_languages" db:"-"`
