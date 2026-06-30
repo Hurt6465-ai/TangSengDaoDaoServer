@@ -1902,9 +1902,13 @@ func (u *User) blacklists(c *wkhttp.Context) {
 	blacklists := []*blacklistResp{}
 	for _, result := range list {
 		blacklists = append(blacklists, &blacklistResp{
-			UID:      result.UID,
-			Name:     result.Name,
-			Username: result.Username,
+			UID:            result.UID,
+			Name:           result.Name,
+			Username:       result.Username,
+			UseName:        result.Username,
+			CountryCode:    result.CountryCode,
+			Country:        result.Country,
+			IsUploadAvatar: result.IsUploadAvatar,
 		})
 	}
 	c.Response(blacklists)
@@ -3075,9 +3079,13 @@ type setting struct {
 }
 
 type blacklistResp struct {
-	UID      string `json:"uid"`
-	Name     string `json:"name"`
-	Username string `json:"usename"`
+	UID            string `json:"uid"`
+	Name           string `json:"name"`
+	Username       string `json:"username"`
+	UseName        string `json:"usename"` // 兼容老客户端拼写
+	CountryCode    string `json:"country_code"`
+	Country        string `json:"country"`
+	IsUploadAvatar int    `json:"is_upload_avatar"`
 }
 
 func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginUserDetailResp {
