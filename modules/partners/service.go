@@ -218,6 +218,13 @@ func (s *Service) clearServed(loginUID string) {
 	_ = s.ctx.GetRedisConn().Del(s.servedKey(loginUID))
 }
 
+func (s *Service) clearSeenDay(loginUID string) {
+	if loginUID == "" || s.ctx == nil || s.ctx.GetRedisConn() == nil {
+		return
+	}
+	_ = s.ctx.GetRedisConn().Del(s.seenDayKey(loginUID))
+}
+
 func (s *Service) candidatePoolKey(uid string) string {
 	return "partner_candidate_pool:" + uid + ":" + time.Now().Format("20060102")
 }
