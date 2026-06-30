@@ -123,10 +123,30 @@ type FeedComment struct {
 	CommentID        string    `json:"comment_id" db:"comment_id"`
 	FeedID           string    `json:"feed_id" db:"feed_id"`
 	UID              string    `json:"uid" db:"uid"`
+	Name             string    `json:"name" db:"-"`
+	Avatar           string    `json:"avatar" db:"-"`
+	AvatarCacheKey   string    `json:"avatar_cache_key" db:"-"`
+	CountryCode      string    `json:"country_code" db:"-"`
 	Content          string    `json:"content" db:"content"`
 	ReplyToCommentID string    `json:"reply_to_comment_id" db:"reply_to_comment_id"`
+	ParentID         string    `json:"parent_id" db:"-"`
 	CreatedAt        int64     `json:"created_at" db:"created_at_ms"`
 	User             *FeedUser `json:"user" db:"-"`
+}
+
+func (c *FeedComment) FillUser(u *FeedUser) {
+	if c == nil {
+		return
+	}
+	c.ParentID = c.ReplyToCommentID
+	if u == nil {
+		return
+	}
+	c.User = u
+	c.Name = u.Name
+	c.Avatar = u.Avatar
+	c.AvatarCacheKey = u.AvatarCacheKey
+	c.CountryCode = u.CountryCode
 }
 
 func (u *FeedUser) Normalize() {

@@ -79,7 +79,20 @@ func (d *db) listRecommend(loginUID string, page, limit int, cursor string) ([]*
         ) DESC, p.last_active_at DESC, p.created_at DESC
         LIMIT ? OFFSET ?`, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, poolLimit+1, offset).Load(&raw)
 	if err != nil {
+		// 兼容旧库：如果新推荐统计表/关注表迁移暂未执行，严格推荐 SQL 会失败。
+		// 用基础表兜底，避免前端直接显示“暂无作品”。
+		if offset == 0 {
+			if posts, hasMore, fbErr := d.listRecommendFallback(loginUID, limit); fbErr == nil {
+				return posts, hasMore, nil
+			}
+		}
 		return nil, 0, err
+	}
+	if len(raw) == 0 && offset == 0 {
+		// 推荐池过滤比较严格：最近 7 天、排除自己、已曝光过多降权等。
+		// 新站、测试服或内容少的时候，严格池可能为空，前端就会显示“暂无作品”。
+		// 这里做一个兜底召回：放宽时间和曝光限制，并允许召回自己的公开作品，保证有内容时不会空屏。
+		return d.listRecommendFallback(loginUID, limit)
 	}
 
 	hasMore := 0
@@ -91,6 +104,37 @@ func (d *db) listRecommend(loginUID string, page, limit int, cursor string) ([]*
 	if len(raw) > limit || hasMore == 1 {
 		hasMore = 1
 	}
+	if err := d.fillPosts(loginUID, posts); err != nil {
+		return nil, 0, err
+	}
+	return posts, hasMore, nil
+}
+
+func (d *db) listRecommendFallback(loginUID string, limit int) ([]*FeedPost, int, error) {
+	limit = clampLimit(limit)
+	var raw []*FeedPost
+	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
+        IFNULL(l.uid<>'',0) AS liked,
+        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
+        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
+        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
+        FROM feed_posts p
+        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
+        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
+        WHERE p.status=1
+          AND p.visibility='public'
+          AND self_report.id IS NULL
+        ORDER BY p.created_at DESC, p.last_active_at DESC, p.score DESC
+        LIMIT ?`, loginUID, loginUID, limit+1).Load(&raw)
+	if err != nil {
+		return nil, 0, err
+	}
+	hasMore := 0
+	if len(raw) > limit {
+		hasMore = 1
+		raw = raw[:limit]
+	}
+	posts := d.limitOneBySameAuthor(raw, limit)
 	if err := d.fillPosts(loginUID, posts); err != nil {
 		return nil, 0, err
 	}
@@ -367,8 +411,13 @@ func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error
 	if content == "" {
 		return nil, nil
 	}
-	if len([]rune(content)) > 500 {
-		content = string([]rune(content)[:500])
+	maxLen := 500
+	if strings.HasPrefix(content, "voice:") || strings.HasPrefix(content, "voice_local:") {
+		// 语音评论会把 音频地址|时长|waveformBase64 放在 content 内，500 字容易截断导致无法播放。
+		maxLen = 4096
+	}
+	if len([]rune(content)) > maxLen {
+		content = string([]rune(content)[:maxLen])
 	}
 	commentID := fmt.Sprintf("cmt_%d", time.Now().UnixNano())
 	nowMs := time.Now().UnixMilli()
@@ -391,7 +440,7 @@ func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error
 	}
 	comment := &FeedComment{CommentID: commentID, FeedID: feedID, UID: uid, Content: content, ReplyToCommentID: req.ReplyToCommentID, CreatedAt: nowMs}
 	users, _ := d.users(uid, []string{uid})
-	comment.User = users[uid]
+	comment.FillUser(users[uid])
 	return comment, nil
 }
 
@@ -421,7 +470,7 @@ func (d *db) comments(loginUID, feedID string, page, limit int, cursor string) (
 	}
 	for _, c := range list {
 		if c != nil {
-			c.User = users[c.UID]
+			c.FillUser(users[c.UID])
 		}
 	}
 	return list, hasMore, nil
