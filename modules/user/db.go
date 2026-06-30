@@ -201,7 +201,7 @@ func (d *DB) AddOrRemoveBlacklistTx(uid string, touid string, blacklist int, ver
 // Blacklists  黑名单列表
 func (d *DB) Blacklists(uid string) ([]*BlacklistModel, error) {
 	var models []*BlacklistModel
-	_, err := d.session.Select("user.name,user.username,user.uid").From("user").LeftJoin("user_setting", "user.uid=user_setting.to_uid and user_setting.blacklist=1").Where("user_setting.uid=?", uid).Load(&models)
+	_, err := d.session.Select("user.name,user.username,user.uid,user.country_code,user.country,user.is_upload_avatar").From("user").LeftJoin("user_setting", "user.uid=user_setting.to_uid and user_setting.blacklist=1").Where("user_setting.uid=? and user.is_destroy=0", uid).Load(&models)
 	return models, err
 }
 
@@ -259,9 +259,21 @@ func (d *DB) updatePassword(password string, uid string) error {
 // 注销账户
 func (d *DB) destroyAccount(uid, username, phone string) error {
 	_, err := d.session.Update("user").SetMap(map[string]interface{}{
-		"phone":      phone,
-		"username":   username,
-		"is_destroy": 1,
+		"phone":              phone,
+		"username":           username,
+		"name":               "已注销用户",
+		"intro":              "",
+		"country_code":       "",
+		"country":            "",
+		"native_languages":   "",
+		"learning_languages": "",
+		"birthday":           "",
+		"tags":               "",
+		"profile_cover":      "",
+		"profile_images":     "",
+		"is_upload_avatar":   0,
+		"is_destroy":         1,
+		"updated_at":         dbr.Expr("Now()"),
 	}).Where("uid=?", uid).Exec()
 	return err
 }
@@ -332,9 +344,12 @@ func (d *DB) updateUserRedDotTx(m *userRedDotModel, tx *dbr.Tx) error {
 
 // BlacklistModel 黑名单用户
 type BlacklistModel struct {
-	UID      string // 用户唯一id
-	Name     string // 用户名称
-	Username string // 用户名
+	UID            string // 用户唯一id
+	Name           string // 用户名称
+	Username       string // 用户名
+	CountryCode    string // 国籍/地区ISO代码
+	Country        string // 国籍/地区显示名
+	IsUploadAvatar int    // 是否上传过头像
 	db.BaseModel
 }
 
