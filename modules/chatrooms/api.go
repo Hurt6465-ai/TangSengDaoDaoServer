@@ -3,6 +3,7 @@ package chatrooms
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
@@ -36,13 +37,14 @@ func (cr *Chatrooms) Route(r *wkhttp.WKHttp) {
 }
 
 func (cr *Chatrooms) list(c *wkhttp.Context) {
-	rooms, err := cr.service.List(c.GetLoginUID())
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", strconv.Itoa(DefaultRoomListLimit)))
+	rooms, cursor, hasMore, err := cr.service.List(c.GetLoginUID(), RoomListReq{Limit: limit, Cursor: c.Query("cursor")})
 	if err != nil {
 		cr.Error("查询话题聊天室列表失败", zap.Error(err))
 		c.ResponseError(errors.New("查询话题聊天室列表失败"))
 		return
 	}
-	c.JSON(http.StatusOK, ListResp{Rooms: rooms, ServerTime: time.Now().UnixMilli()})
+	c.JSON(http.StatusOK, ListResp{Rooms: rooms, List: rooms, Cursor: cursor, HasMore: hasMore, ServerTime: time.Now().UnixMilli()})
 }
 
 func (cr *Chatrooms) create(c *wkhttp.Context) {

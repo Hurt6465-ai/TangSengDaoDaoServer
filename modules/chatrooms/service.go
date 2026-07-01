@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
@@ -13,20 +14,29 @@ import (
 )
 
 type Service struct {
-	ctx *config.Context
-	db  *db
-	TTL time.Duration
+	ctx               *config.Context
+	db                *db
+	TTL               time.Duration
+	topicChannelMu    sync.RWMutex
+	topicChannelCache map[string]topicChannelCacheItem
 }
 
+type topicChannelCacheItem struct {
+	OK        bool
+	ExpiresAt int64
+}
+
+const topicChannelCacheTTL = 5 * time.Minute
+
 func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL}
+	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL, topicChannelCache: map[string]topicChannelCacheItem{}}
 	// 事件驱动更新：避免话题有回复但 expire_at 不续期，导致“正在聊的话题 3 小时后消失”。
 	ctx.AddMessagesListener(svc.listenerMessages)
 	return svc
 }
 
-func (s *Service) List(uid string) ([]*TopicRoom, error) {
-	return s.db.list(uid)
+func (s *Service) List(uid string, req RoomListReq) ([]*TopicRoom, string, int, error) {
+	return s.db.list(uid, req)
 }
 
 func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
@@ -73,6 +83,7 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 	if err := s.db.create(room); err != nil {
 		return nil, err
 	}
+	s.setTopicChannelCache(room.ChannelID, true)
 	if err := s.syncIMChannel(room, []string{room.CreatorUID}); err != nil {
 		_ = s.db.softDelete(room.RoomID)
 		return nil, err
@@ -90,22 +101,19 @@ func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.setTopicChannelCache(room.ChannelID, true)
 	if uid != "" {
 		user, _ := s.db.queryUserMeta(uid)
-		if err := s.db.addMember(room.RoomID, room.ChannelID, uid, user.Name, user.Avatar); err != nil {
+		if err := s.db.addMemberToRoom(room, uid, user.Name, user.Avatar); err != nil {
 			return nil, err
 		}
-		uids, _ := s.db.memberUIDs(room.ChannelID)
-		if len(uids) == 0 {
-			uids = []string{uid}
-		}
-		if err := s.syncIMChannel(room, uids); err != nil {
-			return nil, err
-		}
+
+		// 进公开话题房只增量添加当前用户。不要每次拉全量成员再 syncIMChannel，
+		// 否则房间人数上来后，每进一人都会变成一次大查询 + 大订阅同步。
 		if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
 			return nil, err
 		}
-		_ = s.refreshGroupAvatar(room.ChannelID, uids)
+		_ = s.refreshGroupAvatar(room.ChannelID, topicRoomAvatarSeedUIDs(room, uid))
 	}
 	return room, nil
 }
@@ -129,6 +137,7 @@ func (s *Service) Delete(req RoomReq) error {
 		return err
 	}
 	if room != nil {
+		s.setTopicChannelCache(room.ChannelID, false)
 		s.notifyTopicRoomDeleted(room.ChannelID, uids, "deleted")
 		_ = s.deleteIMChannel(room.ChannelID)
 	}
@@ -161,6 +170,7 @@ func (s *Service) CleanupExpired(limit uint64) (int, error) {
 		}
 		uids := s.topicRoomMemberUIDs(room)
 		if err := s.db.softDelete(room.RoomID); err == nil {
+			s.setTopicChannelCache(room.ChannelID, false)
 			s.notifyTopicRoomDeleted(room.ChannelID, uids, "expired")
 			_ = s.deleteIMChannel(room.ChannelID)
 			count++
@@ -170,7 +180,20 @@ func (s *Service) CleanupExpired(limit uint64) (int, error) {
 }
 
 func (s *Service) IsTopicChannel(channelID string) bool {
-	return s.db.isTopicChannel(channelID)
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return false
+	}
+	now := time.Now().UnixMilli()
+	s.topicChannelMu.RLock()
+	item, ok := s.topicChannelCache[channelID]
+	s.topicChannelMu.RUnlock()
+	if ok && item.ExpiresAt > now {
+		return item.OK
+	}
+	ok = s.db.isTopicChannel(channelID)
+	s.setTopicChannelCache(channelID, ok)
+	return ok
 }
 
 func (s *Service) Subscribers(channelID string) ([]string, error) {
@@ -196,7 +219,7 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if msg == nil || msg.ChannelType != common.ChannelTypeGroup.Uint8() || msg.ChannelID == "" {
 			continue
 		}
-		if !s.db.isTopicChannel(msg.ChannelID) {
+		if !s.IsTopicChannel(msg.ChannelID) {
 			continue
 		}
 		user, _ := s.db.queryUserMeta(msg.FromUID)
@@ -209,13 +232,15 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 			createdAt = time.Now().UnixMilli()
 		}
 		_, _ = s.db.updateLastReply(msg.ChannelID, &MessageWebhookReq{
-			ChannelID:   msg.ChannelID,
-			FromUID:     user.UID,
-			FromName:    user.Name,
-			FromAvatar:  user.Avatar,
-			Text:        text,
-			MessageType: msgType,
-			CreatedAt:   createdAt,
+			ChannelID:       msg.ChannelID,
+			FromUID:         user.UID,
+			FromName:        user.Name,
+			FromAvatar:      user.Avatar,
+			FromCountryCode: user.CountryCode,
+			FromCountry:     user.Country,
+			Text:            text,
+			MessageType:     msgType,
+			CreatedAt:       createdAt,
 		})
 	}
 }
@@ -238,6 +263,41 @@ func messagePreview(msg *config.MessageResp) (string, string) {
 		}
 	}
 	return previewText(msgType), msgType
+}
+
+func (s *Service) setTopicChannelCache(channelID string, ok bool) {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return
+	}
+	s.topicChannelMu.Lock()
+	if s.topicChannelCache == nil {
+		s.topicChannelCache = map[string]topicChannelCacheItem{}
+	}
+	s.topicChannelCache[channelID] = topicChannelCacheItem{OK: ok, ExpiresAt: time.Now().Add(topicChannelCacheTTL).UnixMilli()}
+	s.topicChannelMu.Unlock()
+}
+
+func topicRoomAvatarSeedUIDs(room *TopicRoom, enteringUID string) []string {
+	if room == nil {
+		return compactUIDs([]string{enteringUID})
+	}
+	uids := make([]string, 0, DefaultMaxReplyAvatars+3)
+	if enteringUID != "" {
+		uids = append(uids, enteringUID)
+	}
+	if room.CreatorUID != "" {
+		uids = append(uids, room.CreatorUID)
+	}
+	if room.LastReplyUID != "" {
+		uids = append(uids, room.LastReplyUID)
+	}
+	for _, u := range room.ReplyUsers {
+		if u.UID != "" {
+			uids = append(uids, u.UID)
+		}
+	}
+	return compactUIDs(uids)
 }
 
 func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {

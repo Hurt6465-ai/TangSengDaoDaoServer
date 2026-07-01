@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
@@ -14,8 +16,10 @@ import (
 var ErrNotFound = errors.New("chatroom not found")
 
 type db struct {
-	session *dbr.Session
-	ctx     *config.Context
+	session            *dbr.Session
+	ctx                *config.Context
+	userCountryOnce    sync.Once
+	userCountryColumns bool
 }
 
 func newDB(ctx *config.Context) *db {
@@ -59,6 +63,13 @@ func (d *db) addMember(roomID, channelID, uid, name, avatar string) error {
 	room, err := d.get(roomID)
 	if err != nil {
 		return err
+	}
+	return d.addMemberToRoom(room, uid, name, avatar)
+}
+
+func (d *db) addMemberToRoom(room *TopicRoom, uid, name, avatar string) error {
+	if room == nil || room.RoomID == "" || room.ChannelID == "" || uid == "" {
+		return nil
 	}
 	tx, err := d.session.Begin()
 	if err != nil {
@@ -122,30 +133,59 @@ func (d *db) memberUIDs(channelID string) ([]string, error) {
 	return uids, err
 }
 
-func (d *db) list(loginUID string) ([]*TopicRoom, error) {
+func (d *db) list(loginUID string, req RoomListReq) ([]*TopicRoom, string, int, error) {
 	rooms := make([]*TopicRoom, 0)
+	limit := normalizeRoomLimit(req.Limit)
+	fetchLimit := uint64(limit + 1)
+	now := time.Now().UnixMilli()
+
 	// 不再按 loginUID 隐藏已加入话题。之前隐藏会导致用户发完/进完话题后，聊天室广场立刻“消失”。
-	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+	q := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").
-		Where("status=1").
+		Where("status=1")
+
+	if cursor, ok := parseRoomListCursor(req.Cursor); ok {
+		q = q.Where(`(pinned < ?
+			OR (pinned = ? AND IF(hot_until > ?,1,0) < ?)
+			OR (pinned = ? AND IF(hot_until > ?,1,0) = ? AND COALESCE(NULLIF(last_reply_at,0),created_at) < ?)
+			OR (pinned = ? AND IF(hot_until > ?,1,0) = ? AND COALESCE(NULLIF(last_reply_at,0),created_at) = ? AND room_id < ?))`,
+			cursor.Pinned,
+			cursor.Pinned, now, cursor.Hot,
+			cursor.Pinned, now, cursor.Hot, cursor.SortAt,
+			cursor.Pinned, now, cursor.Hot, cursor.SortAt, cursor.RoomID)
+	}
+
+	_, err := q.
 		OrderBy("pinned DESC").
-		OrderBy("(hot_until > UNIX_TIMESTAMP()*1000) DESC").
+		OrderBy(fmt.Sprintf("IF(hot_until > %d,1,0) DESC", now)).
 		OrderBy("COALESCE(NULLIF(last_reply_at,0),created_at) DESC").
-		Limit(200).
+		OrderBy("room_id DESC").
+		Limit(fetchLimit).
 		Load(&rooms)
 	if err != nil {
-		return nil, err
+		return nil, "", 0, err
+	}
+
+	hasMore := 0
+	if len(rooms) > limit {
+		hasMore = 1
+		rooms = rooms[:limit]
 	}
 	for _, r := range rooms {
 		decodeReplyUsers(r)
-		d.enrichRoomUserCountries(r)
-		if loginUID != "" {
-			_ = d.loadUnread(r, loginUID)
-		}
 	}
-	return rooms, nil
+	d.enrichRoomsUserCountries(rooms)
+	if loginUID != "" {
+		_ = d.loadUnreadBatch(rooms, loginUID)
+	}
+
+	nextCursor := ""
+	if hasMore == 1 && len(rooms) > 0 {
+		nextCursor = encodeRoomListCursor(rooms[len(rooms)-1], now)
+	}
+	return rooms, nextCursor, hasMore, nil
 }
 
 func (d *db) get(roomID string) (*TopicRoom, error) {
@@ -224,22 +264,26 @@ func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRo
 	if text == "" {
 		text = previewText(update.MessageType)
 	}
+	fromCountryCode := strings.TrimSpace(update.FromCountryCode)
+	fromCountry := strings.TrimSpace(update.FromCountry)
 	if update.FromUID != "" {
-		_ = d.addMember(room.RoomID, room.ChannelID, update.FromUID, update.FromName, update.FromAvatar)
-	}
-	fromCountryCode := ""
-	fromCountry := ""
-	if update.FromUID != "" {
-		if userMeta, err := d.queryUserMeta(update.FromUID); err == nil {
-			if update.FromName == "" {
-				update.FromName = userMeta.Name
+		if update.FromName == "" || update.FromAvatar == "" || fromCountryCode == "" || fromCountry == "" {
+			if userMeta, err := d.queryUserMeta(update.FromUID); err == nil {
+				if update.FromName == "" {
+					update.FromName = userMeta.Name
+				}
+				if update.FromAvatar == "" {
+					update.FromAvatar = userMeta.Avatar
+				}
+				if fromCountryCode == "" {
+					fromCountryCode = userMeta.CountryCode
+				}
+				if fromCountry == "" {
+					fromCountry = userMeta.Country
+				}
 			}
-			if update.FromAvatar == "" {
-				update.FromAvatar = userMeta.Avatar
-			}
-			fromCountryCode = userMeta.CountryCode
-			fromCountry = userMeta.Country
 		}
+		_ = d.addMemberToRoom(room, update.FromUID, update.FromName, update.FromAvatar)
 	}
 	users := dedupReplyUsers("", append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar, CountryCode: fromCountryCode, Country: fromCountry}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
 	usersJSON, _ := json.Marshal(users)
@@ -275,9 +319,25 @@ func (d *db) queryUserMeta(uid string) (UserMeta, error) {
 	if uid == "" {
 		return UserMeta{}, nil
 	}
-	var user struct {
-		UID  string `db:"uid"`
-		Name string `db:"name"`
+	meta := UserMeta{UID: uid, Avatar: fmt.Sprintf("users/%s/avatar", uid)}
+	if d.hasUserCountryColumns() {
+		rows := make([]*struct {
+			UID         string `db:"uid"`
+			Name        string `db:"name"`
+			CountryCode string `db:"country_code"`
+			Country     string `db:"country"`
+		}, 0)
+		_, err := d.session.Select("uid", "name", "country_code", "country").From("user").Where("uid=?", uid).Limit(1).Load(&rows)
+		if err != nil {
+			return UserMeta{}, err
+		}
+		if len(rows) > 0 {
+			meta.UID = rows[0].UID
+			meta.Name = rows[0].Name
+			meta.CountryCode = rows[0].CountryCode
+			meta.Country = rows[0].Country
+		}
+		return meta, nil
 	}
 	rows := make([]*struct {
 		UID  string `db:"uid"`
@@ -288,40 +348,32 @@ func (d *db) queryUserMeta(uid string) (UserMeta, error) {
 		return UserMeta{}, err
 	}
 	if len(rows) > 0 {
-		user.UID = rows[0].UID
-		user.Name = rows[0].Name
-	}
-	meta := UserMeta{UID: uid, Name: user.Name, Avatar: fmt.Sprintf("users/%s/avatar", uid)}
-	if !d.hasUserCountryColumns() {
-		return meta, nil
-	}
-	countryRows := make([]*struct {
-		UID         string `db:"uid"`
-		CountryCode string `db:"country_code"`
-		Country     string `db:"country"`
-	}, 0)
-	_, err = d.session.Select("uid", "country_code", "country").From("user").Where("uid=?", uid).Limit(1).Load(&countryRows)
-	if err != nil {
-		return meta, nil
-	}
-	if len(countryRows) > 0 {
-		meta.CountryCode = countryRows[0].CountryCode
-		meta.Country = countryRows[0].Country
+		meta.UID = rows[0].UID
+		meta.Name = rows[0].Name
 	}
 	return meta, nil
 }
 
 func (d *db) enrichRoomUserCountries(r *TopicRoom) {
-	if r == nil || !d.hasUserCountryColumns() {
+	d.enrichRoomsUserCountries([]*TopicRoom{r})
+}
+
+func (d *db) enrichRoomsUserCountries(rooms []*TopicRoom) {
+	if len(rooms) == 0 || !d.hasUserCountryColumns() {
 		return
 	}
-	uids := make([]string, 0, len(r.ReplyUsers)+1)
-	if r.CreatorUID != "" {
-		uids = append(uids, r.CreatorUID)
-	}
-	for _, u := range r.ReplyUsers {
-		if u.UID != "" {
-			uids = append(uids, u.UID)
+	uids := make([]string, 0, len(rooms)*(DefaultMaxReplyAvatars+1))
+	for _, r := range rooms {
+		if r == nil {
+			continue
+		}
+		if r.CreatorUID != "" {
+			uids = append(uids, r.CreatorUID)
+		}
+		for _, u := range r.ReplyUsers {
+			if u.UID != "" {
+				uids = append(uids, u.UID)
+			}
 		}
 	}
 	uids = compactUIDsForDB(uids)
@@ -345,25 +397,33 @@ func (d *db) enrichRoomUserCountries(r *TopicRoom) {
 	for _, row := range rows {
 		meta[row.UID] = row
 	}
-	if row := meta[r.CreatorUID]; row != nil {
-		r.CreatorCountryCode = row.CountryCode
-		r.CreatorCountry = row.Country
-	}
-	for i := range r.ReplyUsers {
-		if row := meta[r.ReplyUsers[i].UID]; row != nil {
-			r.ReplyUsers[i].CountryCode = row.CountryCode
-			r.ReplyUsers[i].Country = row.Country
+	for _, r := range rooms {
+		if r == nil {
+			continue
+		}
+		if row := meta[r.CreatorUID]; row != nil {
+			r.CreatorCountryCode = row.CountryCode
+			r.CreatorCountry = row.Country
+		}
+		for i := range r.ReplyUsers {
+			if row := meta[r.ReplyUsers[i].UID]; row != nil {
+				r.ReplyUsers[i].CountryCode = row.CountryCode
+				r.ReplyUsers[i].Country = row.Country
+			}
 		}
 	}
 }
 
 func (d *db) hasUserCountryColumns() bool {
-	var count int
-	err := d.session.Select("COUNT(*)").
-		From("information_schema.COLUMNS").
-		Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME in ?", "user", []string{"country_code", "country"}).
-		LoadOne(&count)
-	return err == nil && count >= 2
+	d.userCountryOnce.Do(func() {
+		var count int
+		err := d.session.Select("COUNT(*)").
+			From("information_schema.COLUMNS").
+			Where("TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME in ?", "user", []string{"country_code", "country"}).
+			LoadOne(&count)
+		d.userCountryColumns = err == nil && count >= 2
+	})
+	return d.userCountryColumns
 }
 
 func compactUIDsForDB(in []string) []string {
@@ -384,18 +444,132 @@ func compactUIDsForDB(in []string) []string {
 }
 
 func (d *db) loadUnread(r *TopicRoom, uid string) error {
-	var lastReadAt int64
-	err := d.session.Select("IFNULL(last_read_at,0)").From("topic_room_members").Where("room_id=? AND uid=?", r.RoomID, uid).LoadOne(&lastReadAt)
+	if r == nil {
+		return nil
+	}
+	return d.loadUnreadBatch([]*TopicRoom{r}, uid)
+}
+
+func (d *db) loadUnreadBatch(rooms []*TopicRoom, uid string) error {
+	if len(rooms) == 0 || uid == "" {
+		return nil
+	}
+	roomIDs := make([]string, 0, len(rooms))
+	roomByID := map[string]*TopicRoom{}
+	for _, r := range rooms {
+		if r == nil || r.RoomID == "" {
+			continue
+		}
+		roomIDs = append(roomIDs, r.RoomID)
+		roomByID[r.RoomID] = r
+	}
+	roomIDs = compactUIDsForDB(roomIDs)
+	if len(roomIDs) == 0 {
+		return nil
+	}
+	rows := make([]*struct {
+		RoomID     string `db:"room_id"`
+		LastReadAt int64  `db:"last_read_at"`
+	}, 0)
+	_, err := d.session.Select("room_id", "IFNULL(last_read_at,0) AS last_read_at").
+		From("topic_room_members").
+		Where("uid=? AND room_id in ?", uid, roomIDs).
+		Load(&rows)
 	if err != nil {
 		return nil
 	}
-	if lastReadAt <= 0 {
-		lastReadAt = r.CreatedAt
-	}
-	if r.LastReplyAt > lastReadAt {
-		r.UnreadCount = 1
+	for _, row := range rows {
+		r := roomByID[row.RoomID]
+		if r == nil {
+			continue
+		}
+		lastReadAt := row.LastReadAt
+		if lastReadAt <= 0 {
+			lastReadAt = r.CreatedAt
+		}
+		if r.LastReplyAt > lastReadAt {
+			r.UnreadCount = 1
+		}
 	}
 	return nil
+}
+
+func normalizeRoomLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultRoomListLimit
+	}
+	if limit > MaxRoomListLimit {
+		return MaxRoomListLimit
+	}
+	return limit
+}
+
+type roomListCursor struct {
+	Pinned int
+	Hot    int
+	SortAt int64
+	RoomID string
+}
+
+func parseRoomListCursor(cursor string) (roomListCursor, bool) {
+	parts := strings.Split(strings.TrimSpace(cursor), ":")
+	if len(parts) != 4 {
+		return roomListCursor{}, false
+	}
+	pinned, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return roomListCursor{}, false
+	}
+	hot, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return roomListCursor{}, false
+	}
+	sortAt, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return roomListCursor{}, false
+	}
+	roomID := strings.TrimSpace(parts[3])
+	if roomID == "" {
+		return roomListCursor{}, false
+	}
+	if pinned != 0 {
+		pinned = 1
+	}
+	if hot != 0 {
+		hot = 1
+	}
+	return roomListCursor{Pinned: pinned, Hot: hot, SortAt: sortAt, RoomID: roomID}, true
+}
+
+func encodeRoomListCursor(room *TopicRoom, now int64) string {
+	if room == nil || room.RoomID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d:%s", normalizePinned(room.Pinned), activeHot(room, now), roomSortAt(room), room.RoomID)
+}
+
+func normalizePinned(pinned int) int {
+	if pinned != 0 {
+		return 1
+	}
+	return 0
+}
+
+func activeHot(room *TopicRoom, now int64) int {
+	if room != nil && room.HotUntil > now {
+		return 1
+	}
+	return 0
+}
+
+func roomSortAt(room *TopicRoom) int64 {
+	if room == nil {
+		return 0
+	}
+	if room.LastReplyAt > 0 {
+		return room.LastReplyAt
+	}
+	return room.CreatedAt
 }
 
 func decodeReplyUsers(r *TopicRoom) {

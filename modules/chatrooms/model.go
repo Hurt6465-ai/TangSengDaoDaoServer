@@ -6,6 +6,8 @@ const (
 	DefaultTTL             = 3 * time.Hour
 	ChannelTypeGroup       = 2
 	DefaultMaxReplyAvatars = 6
+	DefaultRoomListLimit   = 30
+	MaxRoomListLimit       = 50
 )
 
 type TopicRoom struct {
@@ -65,22 +67,32 @@ type RoomReq struct {
 	Pinned      int    `json:"pinned"`
 }
 
+type RoomListReq struct {
+	Limit  int
+	Cursor string
+}
+
 type ListResp struct {
 	Rooms      []*TopicRoom `json:"rooms"`
+	List       []*TopicRoom `json:"list,omitempty"`
+	Cursor     string       `json:"cursor"`
+	HasMore    int          `json:"has_more"`
 	ServerTime int64        `json:"server_time"`
 }
 
 type MessageWebhookReq struct {
-	RoomID      string   `json:"room_id"`
-	ChannelID   string   `json:"channel_id"`
-	FromUID     string   `json:"from_uid"`
-	FromName    string   `json:"from_name"`
-	FromAvatar  string   `json:"from_avatar"`
-	Text        string   `json:"text"`
-	Summary     string   `json:"summary"`
-	MessageType string   `json:"message_type"`
-	MentionUIDs []string `json:"mention_uids"`
-	CreatedAt   int64    `json:"created_at"`
+	RoomID          string   `json:"room_id"`
+	ChannelID       string   `json:"channel_id"`
+	FromUID         string   `json:"from_uid"`
+	FromName        string   `json:"from_name"`
+	FromAvatar      string   `json:"from_avatar"`
+	FromCountryCode string   `json:"from_country_code"`
+	FromCountry     string   `json:"from_country"`
+	Text            string   `json:"text"`
+	Summary         string   `json:"summary"`
+	MessageType     string   `json:"message_type"`
+	MentionUIDs     []string `json:"mention_uids"`
+	CreatedAt       int64    `json:"created_at"`
 }
 
 type UserMeta struct {
