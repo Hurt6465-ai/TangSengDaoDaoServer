@@ -36,6 +36,7 @@ const (
 	PartnerCandidateSQLLimit = 200
 	PartnerRankWindowSize    = 80
 	PartnerExposureBatchMax  = 20
+	PartnerCandidatePoolTTL  = 6 * time.Hour
 )
 
 type ListResp struct {

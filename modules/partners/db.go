@@ -1,6 +1,7 @@
 package partners
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -122,57 +123,50 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 	whereDistanceArgs := make([]interface{}, 0)
 	distanceExpr := "0"
 	distanceSelect := "0 AS distance_meters"
-	locationJoin := " LEFT JOIN partner_locations pl ON pl.uid=u.uid AND 1=0 "
 	locationWhere := ""
 	if viewerLoc != nil && validLatLng(viewerLoc.Lat, viewerLoc.Lng) {
-		distanceExpr = `IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(pl.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(pl.lat))*POWER(SIN(RADIANS(pl.lng - ?)/2),2)))) AS UNSIGNED),0)`
+		distanceExpr = `IF(pp.expires_at>? AND pp.lat<>0 AND pp.lng<>0, IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(pp.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(pp.lat))*POWER(SIN(RADIANS(pp.lng - ?)/2),2)))) AS UNSIGNED),0),0)`
 		distanceSelect = distanceExpr + " AS distance_meters"
-		selectDistanceArgs = append(selectDistanceArgs, viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng)
-		locationJoin = " LEFT JOIN partner_locations pl ON pl.uid=u.uid AND pl.expires_at>UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 "
+		selectDistanceArgs = append(selectDistanceArgs, time.Now().UnixMilli(), viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng)
 		if req.NearbyOnly {
-			locationWhere = " AND pl.uid IS NOT NULL AND " + distanceExpr + " <= ? "
-			whereDistanceArgs = append(whereDistanceArgs, viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng, req.RadiusMeters())
+			minLat, maxLat, minLng, maxLng := latLngBounds(viewerLoc.Lat, viewerLoc.Lng, req.RadiusMeters())
+			locationWhere = " AND pp.expires_at>? AND pp.lat BETWEEN ? AND ? AND pp.lng BETWEEN ? AND ? AND " + distanceExpr + " <= ? "
+			whereDistanceArgs = append(whereDistanceArgs, time.Now().UnixMilli(), minLat, maxLat, minLng, maxLng, time.Now().UnixMilli(), viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng, req.RadiusMeters())
 		}
 	}
 
-	sql := `SELECT u.uid,u.name,u.username,'' AS avatar,u.sex,u.intro,u.country_code,u.country,u.native_languages,u.learning_languages,u.birthday,u.tags,u.profile_cover,u.profile_images,u.vercode,
-        IFNULL(fr.follow,0) AS follow,
-        IFNULL(onl.online,0) AS online,
-        IFNULL(onl.last_offline,0) AS last_offline,
-        IFNULL(onl.last_active_at,0) AS last_active_at,
-        IFNULL(pe.seen_count,0) AS seen_count,
-        IFNULL(pe.last_seen_at,0) AS last_seen_at,
-        IFNULL(pg.greet_count,0) AS greet_count,
-        IFNULL(pg.last_greet_at,0) AS last_greet_at,
-        IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
-        IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
-        IFNULL(pc.status,-1) AS contact_status,
-        IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
-        UNIX_TIMESTAMP(u.created_at) AS created_at_unix,
-        UNIX_TIMESTAMP(u.updated_at) AS updated_at_unix,
-        ` + distanceSelect + `
-        FROM user u
-        LEFT JOIN (
-            SELECT uid, MAX(online) AS online, MAX(last_offline) AS last_offline, MAX(GREATEST(last_online,last_offline)) * 1000 AS last_active_at
-            FROM user_online GROUP BY uid
-        ) onl ON onl.uid=u.uid
-        LEFT JOIN (
-            SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
-        ) fr ON fr.to_uid=u.uid
-        LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=u.uid
-        LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
-        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
-        LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
-        LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
-        ` + locationJoin + `
-        WHERE u.uid<>? AND u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' 
-          AND IFNULL(u.category,'') NOT IN ('system','customerService')
-          AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
-          AND IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]'
-          AND IFNULL(u.native_languages,'')<>'' AND IFNULL(u.learning_languages,'')<>''
-        ` + locationWhere + `
-        ORDER BY IFNULL(pe.last_seen_at,0) ASC, IFNULL(onl.online,0) DESC, IFNULL(onl.last_active_at,0) DESC, u.updated_at DESC
-        LIMIT ? OFFSET ?`
+	sql := `SELECT pp.uid,pp.name,pp.username,'' AS avatar,pp.sex,pp.intro,pp.country_code,pp.country,pp.native_languages,pp.learning_languages,pp.birthday,pp.tags,pp.profile_cover,pp.profile_images,pp.vercode,
+		IFNULL(fr.follow,0) AS follow,
+		IFNULL(pp.online,0) AS online,
+		IFNULL(pp.last_offline,0) AS last_offline,
+		IFNULL(pp.last_active_at,0) AS last_active_at,
+		IFNULL(pe.seen_count,0) AS seen_count,
+		IFNULL(pe.last_seen_at,0) AS last_seen_at,
+		IFNULL(pg.greet_count,0) AS greet_count,
+		IFNULL(pg.last_greet_at,0) AS last_greet_at,
+		IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
+		IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
+		IFNULL(pc.status,-1) AS contact_status,
+		IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
+		UNIX_TIMESTAMP(pp.created_at) AS created_at_unix,
+		UNIX_TIMESTAMP(pp.updated_at) AS updated_at_unix,
+		` + distanceSelect + `
+		FROM partner_profiles pp
+		LEFT JOIN (
+			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
+		) fr ON fr.to_uid=pp.uid
+		LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
+		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
+		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
+		WHERE pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
+		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
+		` + locationWhere + `
+		ORDER BY IFNULL(pe.last_seen_at,0) ASC, IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
+		LIMIT ? OFFSET ?`
 
 	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+len(whereDistanceArgs)+9)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
@@ -218,28 +212,23 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
 	if limit <= 0 || limit > PartnerCandidateSQLLimit {
 		limit = PartnerCandidateSQLLimit
 	}
-	sql := `SELECT u.uid
-        FROM user u
-        LEFT JOIN (
-            SELECT uid, MAX(online) AS online, MAX(GREATEST(last_online,last_offline)) * 1000 AS last_active_at
-            FROM user_online GROUP BY uid
-        ) onl ON onl.uid=u.uid
-        LEFT JOIN (
-            SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
-        ) fr ON fr.to_uid=u.uid
-        LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
-        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
-        LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
-        LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
-        WHERE u.uid<>? AND u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')=''
-          AND IFNULL(u.category,'') NOT IN ('system','customerService')
-          AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
-          AND IFNULL(fr.follow,0)=0
-          AND IFNULL(pg.last_greet_at,0)=0
-          AND IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]'
-          AND IFNULL(u.native_languages,'')<>'' AND IFNULL(u.learning_languages,'')<>''
-        ORDER BY IFNULL(onl.online,0) DESC, IFNULL(onl.last_active_at,0) DESC, u.updated_at DESC
-        LIMIT ?`
+	sql := `SELECT pp.uid
+		FROM partner_profiles pp
+		LEFT JOIN (
+			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
+		) fr ON fr.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
+		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
+		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
+		WHERE pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND IFNULL(fr.follow,0)=0
+		  AND IFNULL(pg.last_greet_at,0)=0
+		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
+		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
+		ORDER BY IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
+		LIMIT ?`
 	var uids []string
 	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&uids)
 	return uids, err
@@ -258,49 +247,41 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
 	selectDistanceArgs := make([]interface{}, 0)
 	distanceExpr := "0"
 	distanceSelect := "0 AS distance_meters"
-	locationJoin := " LEFT JOIN partner_locations pl ON pl.uid=u.uid AND 1=0 "
 	if viewerLoc != nil && validLatLng(viewerLoc.Lat, viewerLoc.Lng) {
-		distanceExpr = `IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(pl.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(pl.lat))*POWER(SIN(RADIANS(pl.lng - ?)/2),2)))) AS UNSIGNED),0)`
+		distanceExpr = `IF(pp.expires_at>? AND pp.lat<>0 AND pp.lng<>0, IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(pp.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(pp.lat))*POWER(SIN(RADIANS(pp.lng - ?)/2),2)))) AS UNSIGNED),0),0)`
 		distanceSelect = distanceExpr + " AS distance_meters"
-		selectDistanceArgs = append(selectDistanceArgs, viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng)
-		locationJoin = " LEFT JOIN partner_locations pl ON pl.uid=u.uid AND pl.expires_at>UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 "
+		selectDistanceArgs = append(selectDistanceArgs, time.Now().UnixMilli(), viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng)
 	}
 
-	sql := `SELECT u.uid,u.name,u.username,'' AS avatar,u.sex,u.intro,u.country_code,u.country,u.native_languages,u.learning_languages,u.birthday,u.tags,u.profile_cover,u.profile_images,u.vercode,
-        IFNULL(fr.follow,0) AS follow,
-        IFNULL(onl.online,0) AS online,
-        IFNULL(onl.last_offline,0) AS last_offline,
-        IFNULL(onl.last_active_at,0) AS last_active_at,
-        IFNULL(pe.seen_count,0) AS seen_count,
-        IFNULL(pe.last_seen_at,0) AS last_seen_at,
-        IFNULL(pg.greet_count,0) AS greet_count,
-        IFNULL(pg.last_greet_at,0) AS last_greet_at,
-        IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
-        IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
-        IFNULL(pc.status,-1) AS contact_status,
-        IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
-        UNIX_TIMESTAMP(u.created_at) AS created_at_unix,
-        UNIX_TIMESTAMP(u.updated_at) AS updated_at_unix,
-        ` + distanceSelect + `
-        FROM user u
-        LEFT JOIN (
-            SELECT uid, MAX(online) AS online, MAX(last_offline) AS last_offline, MAX(GREATEST(last_online,last_offline)) * 1000 AS last_active_at
-            FROM user_online GROUP BY uid
-        ) onl ON onl.uid=u.uid
-        LEFT JOIN (
-            SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
-        ) fr ON fr.to_uid=u.uid
-        LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=u.uid
-        LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=u.uid
-        LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=u.uid
-        LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=u.uid
-        LEFT JOIN user_setting bs2 ON bs2.uid=u.uid AND bs2.to_uid=?
-        ` + locationJoin + `
-        WHERE u.uid IN ? AND u.uid<>? AND u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')=''
-          AND IFNULL(u.category,'') NOT IN ('system','customerService')
-          AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
-          AND IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]'
-          AND IFNULL(u.native_languages,'')<>'' AND IFNULL(u.learning_languages,'')<>''`
+	sql := `SELECT pp.uid,pp.name,pp.username,'' AS avatar,pp.sex,pp.intro,pp.country_code,pp.country,pp.native_languages,pp.learning_languages,pp.birthday,pp.tags,pp.profile_cover,pp.profile_images,pp.vercode,
+		IFNULL(fr.follow,0) AS follow,
+		IFNULL(pp.online,0) AS online,
+		IFNULL(pp.last_offline,0) AS last_offline,
+		IFNULL(pp.last_active_at,0) AS last_active_at,
+		IFNULL(pe.seen_count,0) AS seen_count,
+		IFNULL(pe.last_seen_at,0) AS last_seen_at,
+		IFNULL(pg.greet_count,0) AS greet_count,
+		IFNULL(pg.last_greet_at,0) AS last_greet_at,
+		IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS hello_sent,
+		IF(IFNULL(pg.last_greet_at,0)>0,1,0) AS greeting_status,
+		IFNULL(pc.status,-1) AS contact_status,
+		IFNULL(pc.requester_msg_count,0) AS requester_msg_count,
+		UNIX_TIMESTAMP(pp.created_at) AS created_at_unix,
+		UNIX_TIMESTAMP(pp.updated_at) AS updated_at_unix,
+		` + distanceSelect + `
+		FROM partner_profiles pp
+		LEFT JOIN (
+			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
+		) fr ON fr.to_uid=pp.uid
+		LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
+		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
+		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
+		WHERE pp.uid IN ? AND pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
+		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''`
 
 	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+8)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
@@ -463,6 +444,54 @@ func clampLimit(limit int) int {
 func roughGeoHash(lat, lng float64) string {
 	// 轻量粗格子：不引入 geohash 依赖。查询先靠距离表达式，后续可升级 geohash。
 	return strconv.Itoa(int((lat+90)*10)) + ":" + strconv.Itoa(int((lng+180)*10))
+}
+
+func latLngBounds(lat, lng float64, radiusMeters int) (float64, float64, float64, float64) {
+	if radiusMeters <= 0 {
+		radiusMeters = NearbyRadiusMeters
+	}
+	latDelta := float64(radiusMeters) / 111320.0
+	cosLat := math.Cos(lat * math.Pi / 180)
+	if math.Abs(cosLat) < 0.01 {
+		cosLat = 0.01
+	}
+	lngDelta := float64(radiusMeters) / (111320.0 * math.Abs(cosLat))
+	minLat := math.Max(-90, lat-latDelta)
+	maxLat := math.Min(90, lat+latDelta)
+	minLng := lng - lngDelta
+	maxLng := lng + lngDelta
+	if minLng < -180 {
+		minLng = -180
+	}
+	if maxLng > 180 {
+		maxLng = 180
+	}
+	return minLat, maxLat, minLng, maxLng
+}
+
+func (d *db) syncPartnerProfileFromUser(uid string) error {
+	if uid == "" {
+		return nil
+	}
+	_, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
+		SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
+		IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',1,0) AS has_photo,
+		(IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',20,0)+IF(IFNULL(u.native_languages,'')<>'',10,0)+IF(IFNULL(u.learning_languages,'')<>'',10,0)+IF(IFNULL(u.intro,'')<>'',5,0)+IF(IFNULL(u.country_code,'')<>'',5,0)) AS profile_score,
+		IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0) AS status,
+		GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
+		FROM user u WHERE u.uid=?
+		ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),status=VALUES(status),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at)),updated_at=NOW()`, uid).Exec()
+	return err
+}
+
+func (d *db) syncPartnerLocation(uid string, loc *locationModel) error {
+	if uid == "" || loc == nil {
+		return nil
+	}
+	_, err := d.session.UpdateBySql(`UPDATE partner_profiles
+		SET lat=?,lng=?,accuracy=?,radius_meters=?,geohash=?,location_updated_at=?,expires_at=?,last_active_at=GREATEST(IFNULL(last_active_at,0),?),updated_at=NOW()
+		WHERE uid=?`, loc.Lat, loc.Lng, loc.Accuracy, loc.RadiusMeters, loc.Geohash, loc.UpdatedAt, loc.ExpiresAt, loc.UpdatedAt, uid).Exec()
+	return err
 }
 
 func (d *db) getPartnerContact(uid, toUID string) (*partnerContactModel, error) {

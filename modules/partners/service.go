@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +28,8 @@ var (
 type Service struct {
 	ctx *config.Context
 	db  *db
+
+	candidateMu sync.Mutex
 }
 
 func NewService(ctx *config.Context) *Service {
@@ -80,7 +83,7 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 		// 语伴早期用户量少，允许进入下一轮随机循环，不让前端刷到尽头黑住。
 		s.clearServed(loginUID)
 		s.clearSeenDay(loginUID)
-		pool, err = s.rebuildCandidatePool(loginUID, req)
+		pool, err = s.rebuildCandidatePoolLocked(loginUID, req)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -112,11 +115,12 @@ func filterFeedPartners(list []*PartnerUser) []*PartnerUser {
 		return list
 	}
 	out := make([]*PartnerUser, 0, len(list))
+	now := time.Now().UnixMilli()
 	for _, p := range list {
 		if p == nil || p.UID == "" {
 			continue
 		}
-		if p.Follow == 1 || p.LastGreetAt > 0 || len(p.ProfileImages) == 0 {
+		if shouldHidePartnerFromFeed(p, now) {
 			continue
 		}
 		out = append(out, p)
@@ -124,7 +128,42 @@ func filterFeedPartners(list []*PartnerUser) []*PartnerUser {
 	return out
 }
 
+func shouldHidePartnerFromFeed(p *PartnerUser, now int64) bool {
+	if p == nil {
+		return true
+	}
+	if p.Follow == 1 || len(p.ProfileImages) == 0 {
+		return true
+	}
+	// 打过招呼或已经进入待回复/已激活会话的人，不继续出现在沉浸式语伴流里。
+	// 这样语伴页只负责第一条随机招呼，后续两条在聊天窗口完成。
+	if p.ContactStatus == PartnerContactStatusPending || p.ContactStatus == PartnerContactStatusActive {
+		return true
+	}
+	lastGreetAt := normalizeMillis(p.LastGreetAt)
+	if lastGreetAt > 0 && now-lastGreetAt < int64(GreetingSameTargetCooldown/time.Millisecond) {
+		return true
+	}
+	return false
+}
+
 func (s *Service) getCandidatePool(loginUID string, req listReq) ([]string, error) {
+	key := s.candidatePoolKey(loginUID, req.SessionID)
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
+			var uids []string
+			if json.Unmarshal([]byte(raw), &uids) == nil && len(uids) > 0 {
+				return compactUIDs(uids, PartnerCandidatePoolSize), nil
+			}
+		}
+	}
+	return s.rebuildCandidatePoolLocked(loginUID, req)
+}
+
+func (s *Service) rebuildCandidatePoolLocked(loginUID string, req listReq) ([]string, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+
 	key := s.candidatePoolKey(loginUID, req.SessionID)
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
@@ -146,7 +185,7 @@ func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, 
 	uids = shuffleCandidateUIDs(uids, loginUID+":"+req.RandomSeed())
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil && len(uids) > 0 {
 		key := s.candidatePoolKey(loginUID, req.SessionID)
-		_ = s.ctx.GetRedisConn().SetAndExpire(key, util.ToJson(uids), 24*time.Hour)
+		_ = s.ctx.GetRedisConn().SetAndExpire(key, util.ToJson(uids), PartnerCandidatePoolTTL)
 	}
 	return uids, nil
 }
@@ -347,7 +386,17 @@ func (s *Service) ProfileMe(uid string) (*ProfileMeResp, error) {
 }
 
 func (s *Service) SaveLocation(uid string, req LocationReq) (*locationModel, error) {
-	return s.db.upsertLocation(uid, req)
+	loc, err := s.db.upsertLocation(uid, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.db.syncPartnerProfileFromUser(uid); err != nil {
+		return nil, err
+	}
+	if err := s.db.syncPartnerLocation(uid, loc); err != nil {
+		return nil, err
+	}
+	return loc, nil
 }
 
 func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error) {
@@ -415,8 +464,11 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if err := s.addPartnerWhitelist(uid, toUID); err != nil {
 				return nil, err
 			}
-			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt); err != nil {
+			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
 				return nil, err
+			}
+			if count >= MaxPendingGreetingMessages {
+				_ = s.removePartnerSenderWhitelist(uid, toUID)
 			}
 			return resp, nil
 		}
@@ -451,7 +503,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	if err := s.addPartnerWhitelist(uid, toUID); err != nil {
 		return nil, err
 	}
-	if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt); err != nil {
+	if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
 		return nil, err
 	}
 	return resp, nil
@@ -469,28 +521,10 @@ func normalizeGreetingSource(source string) string {
 }
 
 func canSendPendingGreeting(count int, lastMsgAt int64, now int64) (bool, int64, string) {
+	// 产品规则：对方未回复前，发起人最多可以连续打 3 条招呼。
+	// 这里不再用 30 分钟/24 小时冷却卡第 2、3 条，否则实际体验会像“只能发 1 条”。
 	if count >= MaxPendingGreetingMessages {
 		return false, 0, "对方还没回复，最多只能打招呼3次"
-	}
-	if count <= 0 {
-		return true, 0, ""
-	}
-	lastMsgAt = normalizeMillis(lastMsgAt)
-	if lastMsgAt <= 0 {
-		return true, 0, ""
-	}
-	var cooldown time.Duration
-	if count == 1 {
-		cooldown = SecondGreetingCooldown
-	} else {
-		cooldown = ThirdGreetingCooldown
-	}
-	nextAt := lastMsgAt + int64(cooldown/time.Millisecond)
-	if now < nextAt {
-		if count == 1 {
-			return false, nextAt, "稍后再试，对方还没回复"
-		}
-		return false, nextAt, "明天再试，对方还没回复"
 	}
 	return true, 0, ""
 }
@@ -537,12 +571,20 @@ func (s *Service) addPartnerWhitelist(uid, toUID string) error {
 	if uid == "" || toUID == "" || uid == toUID {
 		return nil
 	}
-	// pending 阶段只允许 receiver 给 requester 回复。
-	// A 打招呼 B 后，只把 B 加到 A 的个人频道白名单；不要把 A 加到 B 的频道白名单，
-	// 否则 A 在 B 未回复前还能继续追发，方案 B 就会变成陌生人骚扰。
-	return s.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
-		ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
-		UIDs:       []string{toUID},
+	// 待回复阶段需要两种能力：
+	// 1. 对方可以直接回复这条招呼。
+	// 2. 发起人从消息列表进入聊天页后，最多还能补发 2 条普通私信。
+	// 超过 3 条后，listenerMessages 会移除发起人继续发送到对方个人频道的白名单。
+	return s.addBidirectionalPartnerWhitelist(uid, toUID)
+}
+
+func (s *Service) removePartnerSenderWhitelist(uid, toUID string) error {
+	if uid == "" || toUID == "" || uid == toUID {
+		return nil
+	}
+	return s.ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+		UIDs:       []string{uid},
 	})
 }
 
@@ -562,7 +604,7 @@ func (s *Service) addBidirectionalPartnerWhitelist(uid, toUID string) error {
 	})
 }
 
-func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64) error {
+func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64, requesterMsgCount int) error {
 	if uid == "" || toUID == "" || text == "" {
 		return nil
 	}
@@ -573,6 +615,7 @@ func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64)
 		"source":                 source,
 		"requester_uid":          uid,
 		"partner_contact_status": PartnerContactStatusPending,
+		"requester_msg_count":    requesterMsgCount,
 		"max_greeting_count":     MaxPendingGreetingMessages,
 		"created_at":             at,
 	}))
@@ -602,6 +645,18 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
+
+		contact, _ := s.db.getPartnerContact(msg.FromUID, msg.ChannelID)
+		if contact != nil && contact.Status == PartnerContactStatusPending && contact.RequesterUID == msg.FromUID {
+			count, err := s.db.incrementPendingRequesterMsgCount(msg.FromUID, msg.ChannelID, createdAt)
+			if err == nil && count >= MaxPendingGreetingMessages {
+				// 第 1 条来自语伴页随机招呼，第 2/3 条允许在聊天窗口补发。
+				// 达到 3 条后，保留对方回复能力，但移除发起人继续追发的白名单。
+				_ = s.removePartnerSenderWhitelist(msg.FromUID, msg.ChannelID)
+			}
+			continue
+		}
+
 		activated, _ := s.db.activateContactOnReply(msg.FromUID, msg.ChannelID, createdAt)
 		if activated {
 			_ = s.addBidirectionalPartnerWhitelist(msg.FromUID, msg.ChannelID)
