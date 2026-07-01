@@ -30,8 +30,18 @@ func (o *onlineDB) insertOrUpdateUserOnlineTx(m *onlineStatusModel, tx *dbr.Tx) 
 	} else {
 		_, err = tx.UpdateBySql("insert into user_online (uid,device_flag,last_offline,online,version) values(?,?,?,0,?) ON DUPLICATE KEY UPDATE last_offline=VALUES(last_offline),online=VALUES(online),updated_at=NOW(),version=VALUES(version)", m.UID, m.DeviceFlag, m.LastOffline, m.Version).Exec()
 	}
-
-	return err
+	if err != nil {
+		return err
+	}
+	// 同步语伴推荐聚合表。这里按 user_online 当前所有设备重新聚合，避免单设备离线误把多端在线用户置为离线。
+	_, _ = tx.UpdateBySql(`UPDATE partner_profiles pp
+		LEFT JOIN (
+			SELECT uid,MAX(online) AS online,MAX(last_offline) AS last_offline,MAX(GREATEST(last_online,last_offline))*1000 AS last_active_at
+			FROM user_online WHERE uid=? GROUP BY uid
+		) onl ON onl.uid=pp.uid
+		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0)),pp.updated_at=NOW()
+		WHERE pp.uid=?`, m.UID, m.UID).Exec()
+	return nil
 }
 
 // queryUserOnlineRecets 查询最近在线的用户(最近是指一小时内在线的,最多查询到1000条)
