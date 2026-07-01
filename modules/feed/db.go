@@ -385,15 +385,25 @@ func (d *db) toggleLike(uid, feedID string) (int, int, error) {
 	liked := 1
 	if exists > 0 {
 		liked = 0
-		if _, err = tx.DeleteFrom("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Exec(); err != nil {
+		res, err := tx.DeleteFrom("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Exec()
+		if err != nil {
 			return 0, 0, err
 		}
-		_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("GREATEST(like_count-1,0)")).Set("score", dbr.Expr("GREATEST(score-2,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
+		affected, _ := res.RowsAffected()
+		if affected > 0 {
+			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("GREATEST(like_count-1,0)")).Set("score", dbr.Expr("GREATEST(score-2,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
+		}
 	} else {
-		if _, err = tx.InsertBySql("INSERT IGNORE INTO feed_likes(feed_id,uid,created_at) VALUES(?,?,NOW())", feedID, uid).Exec(); err != nil {
+		res, err := tx.InsertBySql("INSERT IGNORE INTO feed_likes(feed_id,uid,created_at) VALUES(?,?,NOW())", feedID, uid).Exec()
+		if err != nil {
 			return 0, 0, err
 		}
-		_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("like_count+1")).Set("score", dbr.Expr("score+2")).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
+		affected, _ := res.RowsAffected()
+		if affected > 0 {
+			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("like_count+1")).Set("score", dbr.Expr("score+2")).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
+		} else {
+			liked = 1
+		}
 	}
 	if err != nil {
 		return 0, 0, err
@@ -532,13 +542,16 @@ func (d *db) share(uid, feedID string) (int, error) {
 		return 0, err
 	}
 	defer tx.RollbackUnlessCommitted()
-	_, err = tx.InsertBySql(`INSERT INTO feed_shares(feed_id,uid,created_at) VALUES(?,?,NOW())`, feedID, uid).Exec()
+	res, err := tx.InsertBySql(`INSERT IGNORE INTO feed_shares(feed_id,uid,created_at) VALUES(?,?,NOW())`, feedID, uid).Exec()
 	if err != nil {
 		return 0, err
 	}
-	_, err = tx.Update("feed_posts").Set("share_count", dbr.Expr("share_count+1")).Set("last_active_at", nowMs).Set("score", dbr.Expr("score+3")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-	if err != nil {
-		return 0, err
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		_, err = tx.Update("feed_posts").Set("share_count", dbr.Expr("share_count+1")).Set("last_active_at", nowMs).Set("score", dbr.Expr("score+3")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
+		if err != nil {
+			return 0, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err
@@ -566,8 +579,13 @@ func (d *db) report(uid, feedID string, req ReportReq) error {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
-	if _, err = tx.InsertBySql(`INSERT INTO feed_reports(feed_id,uid,reason,status,created_at,updated_at) VALUES(?,?,?,0,NOW(),NOW())`, feedID, uid, reason).Exec(); err != nil {
+	res, err := tx.InsertBySql(`INSERT IGNORE INTO feed_reports(feed_id,uid,reason,status,created_at,updated_at) VALUES(?,?,?,0,NOW(),NOW())`, feedID, uid, reason).Exec()
+	if err != nil {
 		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return tx.Commit()
 	}
 	if _, err = tx.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score-8,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec(); err != nil {
 		return err
@@ -581,9 +599,9 @@ func (d *db) report(uid, feedID string, req ReportReq) error {
 }
 
 func (d *db) event(uid, feedID string, req EventReq) error {
-	eventType := strings.TrimSpace(req.EventType)
-	if eventType == "" {
-		eventType = "watch"
+	eventType := req.NormalizedEventType()
+	if d.isRecentDuplicateEvent(uid, feedID, eventType) {
+		return nil
 	}
 	if len([]rune(req.Extra)) > 1000 {
 		req.Extra = string([]rune(req.Extra)[:1000])
@@ -593,13 +611,44 @@ func (d *db) event(uid, feedID string, req EventReq) error {
 	if err != nil {
 		return err
 	}
-	if d.shouldScoreEvent(uid, feedID, eventType) {
-		delta := d.eventScoreDelta(req)
-		if delta != 0 {
-			_, _ = d.session.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score+?,0)", delta)).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-		}
+	delta := d.eventScoreDelta(req)
+	if delta != 0 {
+		_, _ = d.session.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score+?,0)", delta)).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
 	}
 	return nil
+}
+
+func (d *db) isRecentDuplicateEvent(uid, feedID, eventType string) bool {
+	if uid == "" || feedID == "" {
+		return true
+	}
+	window := eventDedupeWindow(eventType)
+	if window <= 0 {
+		return false
+	}
+	var recent int
+	_, err := d.session.SelectBySql(`SELECT COUNT(*) FROM feed_events WHERE uid=? AND feed_id=? AND event_type=? AND created_at>=?`, uid, feedID, eventType, time.Now().Add(-window)).Load(&recent)
+	if err != nil {
+		return false
+	}
+	return recent > 0
+}
+
+func eventDedupeWindow(eventType string) time.Duration {
+	switch eventType {
+	case "watch":
+		return 30 * time.Second
+	case "complete":
+		return 10 * time.Minute
+	case "skip":
+		return 45 * time.Second
+	case "dislike":
+		return 6 * time.Hour
+	case "expose":
+		return 60 * time.Second
+	default:
+		return 60 * time.Second
+	}
 }
 
 func (d *db) shouldScoreEvent(uid, feedID, eventType string) bool {
@@ -616,7 +665,7 @@ func (d *db) shouldScoreEvent(uid, feedID, eventType string) bool {
 }
 
 func (d *db) eventScoreDelta(req EventReq) float64 {
-	eventType := strings.TrimSpace(req.EventType)
+	eventType := req.NormalizedEventType()
 	switch eventType {
 	case "complete":
 		return 1.2
@@ -739,6 +788,18 @@ func (d *db) expiredVideoPosts(cutoffMs int64, limit int) ([]*expiredFeedItem, e
         WHERE p.status=1 AND UNIX_TIMESTAMP(p.created_at)*1000 < ?
         ORDER BY p.created_at ASC LIMIT ?`, cutoffMs, limit).Load(&list)
 	return list, err
+}
+
+func (d *db) deleteOldEvents(cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	res, err := d.session.UpdateBySql(`DELETE FROM feed_events WHERE created_at<? LIMIT ?`, cutoff, limit).Exec()
+	if err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected, nil
 }
 
 func (d *db) rebuildRecommendStats() error {

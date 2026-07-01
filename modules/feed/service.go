@@ -53,6 +53,7 @@ func (s *Service) RunDailyMaintenance() {
 		s.Warn("重建发现推荐分失败", zap.Error(err))
 	}
 	s.CleanupExpiredVideos()
+	s.CleanupOldEvents()
 }
 
 func (s *Service) RebuildRecommendScores() error {
@@ -162,6 +163,20 @@ func (s *Service) CleanupExpiredVideos() {
 				continue
 			}
 			s.deleteFilesBestEffort(paths)
+		}
+	}
+}
+
+func (s *Service) CleanupOldEvents() {
+	cutoff := time.Now().Add(-FeedEventTTL)
+	for i := 0; i < 20; i++ {
+		affected, err := s.db.deleteOldEvents(cutoff, 1000)
+		if err != nil {
+			s.Warn("清理发现行为事件失败", zap.Error(err))
+			return
+		}
+		if affected <= 0 {
+			return
 		}
 	}
 }

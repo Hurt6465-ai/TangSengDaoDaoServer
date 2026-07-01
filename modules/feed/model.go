@@ -11,9 +11,11 @@ const (
 	DefaultFeedLimit = 16
 	MaxFeedLimit     = 50
 	FeedVideoTTLDays = 28
+	FeedEventTTLDays = 30
 )
 
 var FeedVideoTTL = time.Duration(FeedVideoTTLDays) * 24 * time.Hour
+var FeedEventTTL = time.Duration(FeedEventTTLDays) * 24 * time.Hour
 
 type ListResp struct {
 	List       []*FeedPost `json:"list"`
@@ -54,11 +56,23 @@ type ReportReq struct {
 
 type EventReq struct {
 	EventType  string `json:"event_type"`
+	Type       string `json:"type"`
 	WatchMS    int64  `json:"watch_ms"`
 	DurationMS int64  `json:"duration_ms"`
 	Percent    int    `json:"percent"`
 	MediaType  string `json:"media_type"`
 	Extra      string `json:"extra"`
+}
+
+func (r EventReq) NormalizedEventType() string {
+	eventType := strings.TrimSpace(r.EventType)
+	if eventType == "" {
+		eventType = strings.TrimSpace(r.Type)
+	}
+	if eventType == "" {
+		eventType = "watch"
+	}
+	return strings.ToLower(eventType)
 }
 
 type FeedPost struct {
