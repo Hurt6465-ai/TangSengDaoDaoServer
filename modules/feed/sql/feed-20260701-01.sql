@@ -17,7 +17,9 @@ SET @sql := IF(@idx_exists=0,
   'ALTER TABLE feed_shares ADD UNIQUE KEY uk_feed_share(feed_id,uid)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @idx_exists := (
   SELECT COUNT(1) FROM information_schema.STATISTICS
@@ -27,7 +29,9 @@ SET @sql := IF(@idx_exists=0,
   'ALTER TABLE feed_reports ADD UNIQUE KEY uk_feed_report(feed_id,uid)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @idx_exists := (
   SELECT COUNT(1) FROM information_schema.STATISTICS
@@ -37,7 +41,9 @@ SET @sql := IF(@idx_exists=0,
   'ALTER TABLE feed_posts ADD KEY idx_feed_posts_cursor(status,visibility,last_active_at,created_at,feed_id)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @idx_exists := (
   SELECT COUNT(1) FROM information_schema.STATISTICS
@@ -47,4 +53,6 @@ SET @sql := IF(@idx_exists=0,
   'ALTER TABLE feed_posts ADD KEY idx_feed_posts_user_cursor(uid,status,visibility,created_at,feed_id)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

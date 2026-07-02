@@ -27,7 +27,9 @@ SET @sql := IF(@idx_exists=0,
   'CREATE INDEX idx_feed_posts_recent_pool ON feed_posts(status,visibility,created_at,score,last_active_at)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @idx_exists := (
   SELECT COUNT(1) FROM information_schema.STATISTICS
@@ -37,7 +39,9 @@ SET @sql := IF(@idx_exists=0,
   'CREATE INDEX idx_feed_reports_user_feed ON feed_reports(uid,feed_id,status)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @idx_exists := (
   SELECT COUNT(1) FROM information_schema.STATISTICS
@@ -47,4 +51,6 @@ SET @sql := IF(@idx_exists=0,
   'CREATE INDEX idx_feed_events_user_feed_type_time ON feed_events(uid,feed_id,event_type,created_at)',
   'SELECT 1'
 );
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
