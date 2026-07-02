@@ -51,7 +51,7 @@ func (p *Partners) list(c *wkhttp.Context) {
 	if hasMore == 1 {
 		cursor = cursorToken()
 	}
-	c.JSON(http.StatusOK, ListResp{List: list, Users: list, Partners: list, Cursor: cursor, HasMore: hasMore, ServerTime: time.Now().UnixMilli(), SessionID: c.Query("session_id")})
+	c.JSON(http.StatusOK, ListResp{List: list, Users: list, Partners: list, Cursor: cursor, HasMore: hasMore, ServerTime: time.Now().UnixMilli(), SessionID: c.Query("session_id"), GreetingQuotaResp: p.service.GreetingQuota(c.GetLoginUID())})
 }
 
 func (p *Partners) nearby(c *wkhttp.Context) {
@@ -75,7 +75,7 @@ func (p *Partners) nearby(c *wkhttp.Context) {
 	if hasMore == 1 {
 		cursor = cursorToken()
 	}
-	c.JSON(http.StatusOK, ListResp{List: list, Users: list, Partners: list, Cursor: cursor, HasMore: hasMore, ServerTime: time.Now().UnixMilli(), SessionID: c.Query("session_id")})
+	c.JSON(http.StatusOK, ListResp{List: list, Users: list, Partners: list, Cursor: cursor, HasMore: hasMore, ServerTime: time.Now().UnixMilli(), SessionID: c.Query("session_id"), GreetingQuotaResp: p.service.GreetingQuota(c.GetLoginUID())})
 }
 
 func (p *Partners) profileMe(c *wkhttp.Context) {
@@ -85,6 +85,7 @@ func (p *Partners) profileMe(c *wkhttp.Context) {
 		c.ResponseError(errors.New("查询语伴资料完整性失败"))
 		return
 	}
+	resp.GreetingQuotaResp = p.service.GreetingQuota(c.GetLoginUID())
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -136,6 +137,10 @@ func (p *Partners) greeting(c *wkhttp.Context) {
 		p.Warn("语伴打招呼失败", zap.Error(err), zap.String("to_uid", req.Target()))
 		if errors.Is(err, ErrGreetingDuplicate) && resp != nil {
 			c.JSON(http.StatusOK, resp)
+			return
+		}
+		if errors.Is(err, ErrGreetingDayLimit) {
+			c.JSON(http.StatusOK, GreetingResp{Status: 429, ToUID: req.Target(), TargetUID: req.Target(), Msg: ErrGreetingDayLimit.Error(), GreetingQuotaResp: p.service.GreetingQuota(c.GetLoginUID())})
 			return
 		}
 		c.ResponseError(err)

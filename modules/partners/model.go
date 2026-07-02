@@ -18,8 +18,8 @@ const (
 	// 定位有效期给 App 静默推荐使用。App 端负责 30km 移动覆盖，服务端保存 30 天兜底。
 	LocationTTLMillis = int64(30 * 24 * time.Hour / time.Millisecond)
 
-	GreetingHourLimit          = 5
-	GreetingDayLimit           = 20
+	GreetingHourLimit          = 0 // 0 表示不限制每小时次数，仅保留返回字段兼容旧前端
+	GreetingDayLimit           = 8
 	GreetingSameTargetCooldown = 7 * 24 * time.Hour
 	GreetingMaxTextLen         = 80
 
@@ -49,6 +49,15 @@ const (
 	PartnerExposureMinDurationMS   = int64(700)
 )
 
+type GreetingQuotaResp struct {
+	GreetingDayLimit      int `json:"greeting_day_limit"`
+	GreetingDayUsed       int `json:"greeting_day_used"`
+	GreetingDayRemaining  int `json:"greeting_day_remaining"`
+	GreetingHourLimit     int `json:"greeting_hour_limit"`
+	GreetingHourUsed      int `json:"greeting_hour_used"`
+	GreetingHourRemaining int `json:"greeting_hour_remaining"`
+}
+
 type ListResp struct {
 	List       []*PartnerUser `json:"list"`
 	Users      []*PartnerUser `json:"users"`
@@ -57,6 +66,7 @@ type ListResp struct {
 	HasMore    int            `json:"has_more"`
 	ServerTime int64          `json:"server_time"`
 	SessionID  string         `json:"session_id,omitempty"`
+	GreetingQuotaResp
 }
 
 type LocationReq struct {
@@ -119,6 +129,7 @@ type GreetingResp struct {
 	MaxGreetingCount  int    `json:"max_greeting_count"`
 	Text              string `json:"text,omitempty"`
 	Msg               string `json:"msg,omitempty"`
+	GreetingQuotaResp
 }
 
 type ExposureReq struct {
@@ -147,6 +158,7 @@ type ProfileMeResp struct {
 	LearningLanguages []string `json:"learning_languages"`
 	Tags              []string `json:"tags"`
 	ProfileCover      string   `json:"profile_cover"`
+	GreetingQuotaResp
 }
 
 type PartnerUser struct {

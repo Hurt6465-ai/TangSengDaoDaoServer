@@ -528,6 +528,40 @@ func (s *Service) SaveLocation(uid string, req LocationReq) (*locationModel, err
 	return loc, nil
 }
 
+func (s *Service) GreetingQuota(uid string) GreetingQuotaResp {
+	stats, err := s.db.greetingStats(uid, "", time.Now().UnixMilli())
+	if err != nil || stats == nil {
+		return GreetingQuotaResp{GreetingDayLimit: GreetingDayLimit, GreetingDayRemaining: GreetingDayLimit, GreetingHourLimit: GreetingHourLimit, GreetingHourRemaining: GreetingDayLimit}
+	}
+	dayUsed := stats.DayCount
+	if dayUsed < 0 {
+		dayUsed = 0
+	}
+	dayRemaining := GreetingDayLimit - dayUsed
+	if dayRemaining < 0 {
+		dayRemaining = 0
+	}
+	// 每小时限额已关闭，保留 hour 字段只是兼容旧前端；剩余值跟随当天剩余，不参与服务端限制。
+	hourUsed := 0
+	hourRemaining := dayRemaining
+	return GreetingQuotaResp{
+		GreetingDayLimit:      GreetingDayLimit,
+		GreetingDayUsed:       dayUsed,
+		GreetingDayRemaining:  dayRemaining,
+		GreetingHourLimit:     GreetingHourLimit,
+		GreetingHourUsed:      hourUsed,
+		GreetingHourRemaining: hourRemaining,
+	}
+}
+
+func (s *Service) fillGreetingQuota(uid string, resp *GreetingResp) *GreetingResp {
+	if resp == nil {
+		return nil
+	}
+	resp.GreetingQuotaResp = s.GreetingQuota(uid)
+	return resp
+}
+
 func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error) {
 	toUID := req.Target()
 	if uid == "" || toUID == "" || uid == toUID {
@@ -555,25 +589,22 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	}
 	if contact != nil {
 		if contact.Status == PartnerContactStatusActive {
-			return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusActive, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已经可以聊天"}, nil
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusActive, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已经可以聊天"}), nil
 		}
 		if contact.Status == PartnerContactStatusBlocked || contact.Status == PartnerContactStatusIgnored {
 			return nil, ErrGreetingBlacklisted
 		}
 		if contact.Status == PartnerContactStatusPending {
 			if contact.RequesterUID != uid {
-				return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}, nil
+				return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}), nil
 			}
 			allowed, nextAt, msg := canSendPendingGreeting(contact.RequesterMsgCount, contact.LastMsgAt, now)
 			if !allowed {
-				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}, ErrGreetingDuplicate
+				return s.fillGreetingQuota(uid, &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), ErrGreetingDuplicate
 			}
 			stats, err := s.db.greetingStats(uid, toUID, now)
 			if err != nil {
 				return nil, err
-			}
-			if stats.HourCount >= GreetingHourLimit {
-				return nil, ErrGreetingHourLimit
 			}
 			if stats.DayCount >= GreetingDayLimit {
 				return nil, ErrGreetingDayLimit
@@ -603,7 +634,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if count >= MaxPendingGreetingMessages {
 				_ = s.removePartnerSenderWhitelist(uid, toUID)
 			}
-			return resp, nil
+			return s.fillGreetingQuota(uid, resp), nil
 		}
 	}
 
@@ -611,16 +642,13 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	if err != nil {
 		return nil, err
 	}
-	if stats.HourCount >= GreetingHourLimit {
-		return nil, ErrGreetingHourLimit
-	}
 	if stats.DayCount >= GreetingDayLimit {
 		return nil, ErrGreetingDayLimit
 	}
 	cooldownMs := int64(GreetingSameTargetCooldown / time.Millisecond)
 	if stats.LastTargetGreetAt > 0 && now-stats.LastTargetGreetAt < cooldownMs {
 		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
-		return resp, ErrGreetingDuplicate
+		return s.fillGreetingQuota(uid, resp), ErrGreetingDuplicate
 	}
 	text := normalizeGreetingText(req.Text)
 	source := normalizeGreetingSource(req.Source)
@@ -643,7 +671,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		return nil, err
 	}
 	_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 1, "")
-	return resp, nil
+	return s.fillGreetingQuota(uid, resp), nil
 }
 
 func normalizeGreetingSource(source string) string {
