@@ -10,6 +10,9 @@ import (
 const (
 	DefaultFeedLimit = 16
 	MaxFeedLimit     = 50
+	// FeedImageOnly keeps the first launch focused on image posts.
+	// Frontend should hide video upload, backend rejects video payloads as a safety net.
+	FeedImageOnly    = true
 	FeedVideoTTLDays = 28
 	FeedEventTTLDays = 30
 )
@@ -50,6 +53,37 @@ type FollowReq struct {
 	FollowingUID string `json:"following_uid"`
 }
 
+// LikeReq supports idempotent like from Android.
+// Android wkfeed currently sends like as 1/0, while future clients may send true/false.
+// If omitted or invalid, backend keeps old toggle behavior for compatibility.
+type LikeReq struct {
+	Like *FlexibleBool `json:"like"`
+}
+
+func (r LikeReq) Desired() *bool {
+	if r.Like == nil {
+		return nil
+	}
+	value := bool(*r.Like)
+	return &value
+}
+
+type FlexibleBool bool
+
+func (b *FlexibleBool) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(strings.ToLower(string(data)))
+	value = strings.Trim(value, `"`)
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		*b = FlexibleBool(true)
+	case "0", "false", "no", "n", "off":
+		*b = FlexibleBool(false)
+	default:
+		return nil
+	}
+	return nil
+}
+
 type ReportReq struct {
 	Reason string `json:"reason"`
 }
@@ -72,7 +106,17 @@ func (r EventReq) NormalizedEventType() string {
 	if eventType == "" {
 		eventType = "watch"
 	}
-	return strings.ToLower(eventType)
+	eventType = strings.ToLower(eventType)
+	switch eventType {
+	case "exposed", "exposure", "show", "impression":
+		return "expose"
+	case "stay", "stay_ms", "view":
+		return "watch"
+	case "not_interested", "not-interest", "notinterest":
+		return "dislike"
+	default:
+		return eventType
+	}
 }
 
 type FeedPost struct {

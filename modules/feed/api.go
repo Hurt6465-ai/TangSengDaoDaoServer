@@ -53,6 +53,7 @@ func (f *Feed) recommend(c *wkhttp.Context) {
 	if mode == "following" {
 		list, hasMore, err = f.service.Following(c.GetLoginUID(), page, limit, c.Query("cursor"))
 	} else {
+		// hot is intentionally not enabled for the first image-only launch; unknown modes fall back to discover.
 		list, hasMore, err = f.service.Recommend(c.GetLoginUID(), page, limit, c.Query("cursor"))
 	}
 	if err != nil {
@@ -110,10 +111,11 @@ func (f *Feed) publish(c *wkhttp.Context) {
 	post, err := f.service.Publish(c.GetLoginUID(), req)
 	if err != nil {
 		f.Error("发布发现失败", zap.Error(err))
-		c.ResponseError(errors.New("发布发现失败"))
+		c.ResponseError(err)
 		return
 	}
-	c.JSON(http.StatusOK, post)
+	// Android wkfeed publish uses CommonResponse; keep status while returning the created feed for reconciliation.
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "feed_id": post.FeedID, "feed": post})
 }
 
 func (f *Feed) deleteFeed(c *wkhttp.Context) {
@@ -136,10 +138,17 @@ func (f *Feed) like(c *wkhttp.Context) {
 		c.ResponseError(errors.New("动态ID不能为空"))
 		return
 	}
-	liked, count, err := f.service.ToggleLike(c.GetLoginUID(), feedID)
+	var req LikeReq
+	var desired *bool
+	if c.Request != nil && c.Request.ContentLength != 0 {
+		if err := c.BindJSON(&req); err == nil {
+			desired = req.Desired()
+		}
+	}
+	liked, count, err := f.service.SetLike(c.GetLoginUID(), feedID, desired)
 	if err != nil {
 		f.Error("点赞失败", zap.Error(err))
-		c.ResponseError(errors.New("点赞失败"))
+		c.ResponseError(err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "liked": liked, "like_count": count})
@@ -258,14 +267,15 @@ func (f *Feed) addComment(c *wkhttp.Context) {
 	comment, err := f.service.AddComment(c.GetLoginUID(), feedID, req)
 	if err != nil {
 		f.Error("评论失败", zap.Error(err))
-		c.ResponseError(errors.New("评论失败"))
+		c.ResponseError(err)
 		return
 	}
 	if comment == nil {
 		c.ResponseError(errors.New("评论内容不能为空"))
 		return
 	}
-	c.JSON(http.StatusOK, comment)
+	// Android wkfeed comment send uses CommonResponse; also return comment for ID reconciliation.
+	c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "comment_id": comment.CommentID, "comment": comment})
 }
 
 func (f *Feed) comments(c *wkhttp.Context) {

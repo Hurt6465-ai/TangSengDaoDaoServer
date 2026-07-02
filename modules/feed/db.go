@@ -45,6 +45,8 @@ func (d *db) listRecommend(loginUID string, page, limit int, cursor string) ([]*
         LEFT JOIN user viewer ON viewer.uid=?
         WHERE p.status=1
           AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
           AND p.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
           AND (?='' OR p.uid<>?)
           AND self_report.id IS NULL
@@ -123,6 +125,8 @@ func (d *db) listRecommendFallback(loginUID string, limit int) ([]*FeedPost, int
         LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
         WHERE p.status=1
           AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
           AND self_report.id IS NULL
         ORDER BY p.created_at DESC, p.last_active_at DESC, p.score DESC
         LIMIT ?`, loginUID, loginUID, limit+1).Load(&raw)
@@ -139,6 +143,136 @@ func (d *db) listRecommendFallback(loginUID string, limit int) ([]*FeedPost, int
 		return nil, 0, err
 	}
 	return posts, hasMore, nil
+}
+
+func (d *db) listRecommendCandidateIDs(loginUID string, limit int) ([]string, error) {
+	limit = clampLimit(limit)
+	if limit < feedCandidateLimit {
+		limit = feedCandidateLimit
+	}
+	var ids []string
+	_, err := d.session.SelectBySql(`SELECT p.feed_id
+        FROM feed_posts p
+        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
+        LEFT JOIN feed_exposures ex ON ex.feed_id=p.feed_id AND ex.uid=?
+        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
+        LEFT JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
+        LEFT JOIN feed_recommend_stats rs ON rs.feed_id=p.feed_id
+        LEFT JOIN user author ON author.uid=p.uid
+        LEFT JOIN user viewer ON viewer.uid=?
+        WHERE p.status=1
+          AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
+          AND p.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)
+          AND (?='' OR p.uid<>?)
+          AND self_report.id IS NULL
+          AND IFNULL(ex.seen_count,0) < 3
+          AND IFNULL(rs.report_count,0) < 5
+        ORDER BY (
+            p.score
+            + CASE
+                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN 10
+                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 7
+                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 72 HOUR) THEN 4
+                ELSE 1
+              END
+            + CASE
+                WHEN viewer.sex=1 AND author.sex=0 THEN 8
+                WHEN viewer.sex=0 AND author.sex=1 THEN 8
+                WHEN viewer.sex=author.sex THEN -2
+                ELSE 0
+              END
+            + IF(ff.following_uid IS NULL,0,6)
+            + (p.like_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 30
+            + (p.comment_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 45
+            + (p.share_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 55
+            + IFNULL(rs.avg_percent,0) / 12
+            + (IFNULL(rs.complete_count,0) / GREATEST(IFNULL(rs.watch_count,0),5)) * 18
+            - IFNULL(ex.seen_count,0) * 3
+            - CASE WHEN IFNULL(ex.seen_count,0) >= 2 AND l.uid IS NULL THEN 6 ELSE 0 END
+            - IFNULL(rs.report_count,0) * 10
+            - IFNULL(rs.skip_count,0) * 2
+            - IFNULL(rs.dislike_count,0) * 6
+            - CASE WHEN IFNULL(rs.exposure_count,0) >= 10 AND (p.like_count+p.comment_count+p.share_count)=0 THEN LEAST(12,IFNULL(rs.exposure_count,0)*0.4) ELSE 0 END
+        ) DESC, p.last_active_at DESC, p.created_at DESC, p.feed_id DESC
+        LIMIT ?`, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&ids)
+	if err != nil || len(ids) == 0 {
+		return d.listRecommendFallbackCandidateIDs(loginUID, limit)
+	}
+	return ids, nil
+}
+
+func (d *db) listRecommendFallbackCandidateIDs(loginUID string, limit int) ([]string, error) {
+	var ids []string
+	_, err := d.session.SelectBySql(`SELECT p.feed_id
+        FROM feed_posts p
+        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
+        WHERE p.status=1
+          AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
+          AND self_report.id IS NULL
+        ORDER BY p.created_at DESC, p.last_active_at DESC, p.score DESC, p.feed_id DESC
+        LIMIT ?`, loginUID, limit).Load(&ids)
+	return ids, err
+}
+
+func (d *db) listFollowingCandidateIDs(loginUID string, limit int) ([]string, error) {
+	limit = clampLimit(limit)
+	if limit < feedCandidateLimit {
+		limit = feedCandidateLimit
+	}
+	if strings.TrimSpace(loginUID) == "" {
+		return []string{}, nil
+	}
+	var ids []string
+	_, err := d.session.SelectBySql(`SELECT p.feed_id
+        FROM feed_posts p
+        INNER JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
+        WHERE p.status=1 AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
+        ORDER BY p.last_active_at DESC,p.created_at DESC,p.feed_id DESC
+        LIMIT ?`, loginUID, limit).Load(&ids)
+	return ids, err
+}
+
+func (d *db) listByFeedIDs(loginUID string, feedIDs []string) ([]*FeedPost, error) {
+	feedIDs = compactStrings(feedIDs)
+	if len(feedIDs) == 0 {
+		return []*FeedPost{}, nil
+	}
+	var posts []*FeedPost
+	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
+        IFNULL(l.uid<>'',0) AS liked,
+        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
+        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
+        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
+        FROM feed_posts p
+        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
+        WHERE p.status=1 AND p.visibility='public' AND p.feed_id IN ?
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')`, loginUID, feedIDs).Load(&posts)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.fillPosts(loginUID, posts); err != nil {
+		return nil, err
+	}
+	byID := map[string]*FeedPost{}
+	for _, post := range posts {
+		if post != nil {
+			byID[post.FeedID] = post
+		}
+	}
+	ordered := make([]*FeedPost, 0, len(posts))
+	for _, id := range feedIDs {
+		if post := byID[id]; post != nil {
+			ordered = append(ordered, post)
+		}
+	}
+	return ordered, nil
 }
 
 func (d *db) limitOneBySameAuthor(raw []*FeedPost, limit int) []*FeedPost {
@@ -194,6 +328,8 @@ func (d *db) listByUser(loginUID, uid string, page, limit int, cursor string) ([
         FROM feed_posts p
         LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
         WHERE p.status=1 AND p.visibility='public' AND p.uid=?
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
         ORDER BY p.created_at DESC
         LIMIT ? OFFSET ?`, loginUID, uid, limit+1, offset).Load(&posts)
 	if err != nil {
@@ -226,6 +362,8 @@ func (d *db) listFollowing(loginUID string, page, limit int, cursor string) ([]*
         INNER JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
         LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
         WHERE p.status=1 AND p.visibility='public'
+          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
         ORDER BY p.last_active_at DESC,p.created_at DESC
         LIMIT ? OFFSET ?`, loginUID, loginUID, limit+1, offset).Load(&posts)
 	if err != nil {
@@ -248,8 +386,31 @@ func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
 	if len([]rune(text)) > 280 {
 		text = string([]rune(text)[:280])
 	}
-	if len(req.Media) == 0 {
-		return nil, fmt.Errorf("请选择图片或视频")
+	validMedia := make([]*FeedMedia, 0, len(req.Media))
+	for _, m := range req.Media {
+		if m == nil {
+			continue
+		}
+		m.Type = strings.ToLower(strings.TrimSpace(m.Type))
+		if m.Type == "" {
+			m.Type = "image"
+		}
+		if FeedImageOnly && m.Type == "video" {
+			return nil, fmt.Errorf("当前暂未开放视频发布")
+		}
+		if m.Type != "image" {
+			return nil, fmt.Errorf("当前仅支持图片发布")
+		}
+		if strings.TrimSpace(m.DisplayURL) == "" && strings.TrimSpace(m.ThumbURL) == "" && strings.TrimSpace(m.OriginURL) == "" {
+			continue
+		}
+		validMedia = append(validMedia, m)
+	}
+	if len(validMedia) == 0 {
+		return nil, fmt.Errorf("请选择图片")
+	}
+	if len(validMedia) > 9 {
+		return nil, fmt.Errorf("一次最多发布9张图片")
 	}
 	title := strings.TrimSpace(req.Title)
 	visibility := strings.TrimSpace(req.Visibility)
@@ -267,18 +428,9 @@ func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i, m := range req.Media {
-		if m == nil {
-			continue
-		}
+	for i, m := range validMedia {
 		if m.Sort == 0 {
 			m.Sort = i
-		}
-		if m.Type == "" {
-			m.Type = "image"
-		}
-		if m.Type != "image" && m.Type != "video" {
-			m.Type = "image"
 		}
 		_, err = tx.InsertBySql(`INSERT INTO feed_media(feed_id,type,thumb_url,display_url,origin_url,cover_url,play_url_480p,play_url_540p,play_url_720p,width,height,duration_ms,size,sort,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`, feedID, m.Type, m.ThumbURL, m.DisplayURL, m.OriginURL, m.CoverURL, m.PlayURL480P, m.PlayURL540P, m.PlayURL720P, m.Width, m.Height, m.DurationMS, m.Size, m.Sort).Exec()
@@ -371,48 +523,73 @@ func compactStrings(values []string) []string {
 	return out
 }
 
-func (d *db) toggleLike(uid, feedID string) (int, int, error) {
-	var exists int
-	_, err := d.session.Select("count(*)").From("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Load(&exists)
+func (d *db) setLike(uid, feedID string, desired *bool) (int, int, error) {
+	if strings.TrimSpace(uid) == "" || strings.TrimSpace(feedID) == "" {
+		return 0, 0, fmt.Errorf("点赞参数无效")
+	}
+	var postExists int
+	_, err := d.session.Select("count(*)").From("feed_posts").Where("feed_id=? AND status=1", feedID).Load(&postExists)
 	if err != nil {
 		return 0, 0, err
+	}
+	if postExists == 0 {
+		return 0, 0, fmt.Errorf("动态不存在")
+	}
+	var exists int
+	_, err = d.session.Select("count(*)").From("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Load(&exists)
+	if err != nil {
+		return 0, 0, err
+	}
+	wantLike := exists == 0
+	if desired != nil {
+		wantLike = *desired
+	}
+	if (exists > 0 && wantLike) || (exists == 0 && !wantLike) {
+		var count int
+		_, _ = d.session.Select("like_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
+		if wantLike {
+			return 1, count, nil
+		}
+		return 0, count, nil
 	}
 	tx, err := d.session.Begin()
 	if err != nil {
 		return 0, 0, err
 	}
 	defer tx.RollbackUnlessCommitted()
-	liked := 1
-	if exists > 0 {
-		liked = 0
-		res, err := tx.DeleteFrom("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Exec()
-		if err != nil {
-			return 0, 0, err
-		}
-		affected, _ := res.RowsAffected()
-		if affected > 0 {
-			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("GREATEST(like_count-1,0)")).Set("score", dbr.Expr("GREATEST(score-2,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
-		}
-	} else {
+	liked := 0
+	if wantLike {
 		res, err := tx.InsertBySql("INSERT IGNORE INTO feed_likes(feed_id,uid,created_at) VALUES(?,?,NOW())", feedID, uid).Exec()
 		if err != nil {
 			return 0, 0, err
 		}
 		affected, _ := res.RowsAffected()
 		if affected > 0 {
-			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("like_count+1")).Set("score", dbr.Expr("score+2")).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
-		} else {
-			liked = 1
+			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("like_count+1")).Set("score", dbr.Expr("score+2")).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
+			if err != nil {
+				return 0, 0, err
+			}
 		}
-	}
-	if err != nil {
-		return 0, 0, err
+		liked = 1
+	} else {
+		res, err := tx.DeleteFrom("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Exec()
+		if err != nil {
+			return 0, 0, err
+		}
+		affected, _ := res.RowsAffected()
+		if affected > 0 {
+			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("GREATEST(like_count-1,0)")).Set("score", dbr.Expr("GREATEST(score-2,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
+			if err != nil {
+				return 0, 0, err
+			}
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, 0, err
 	}
 	var count int
 	_, _ = d.session.Select("like_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
+	d.syncRecommendCounters(feedID)
 	return liked, count, nil
 }
 
@@ -449,6 +626,7 @@ func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error
 		return nil, err
 	}
 	comment := &FeedComment{CommentID: commentID, FeedID: feedID, UID: uid, Content: content, ReplyToCommentID: req.ReplyToCommentID, CreatedAt: nowMs}
+	d.syncRecommendCounters(feedID)
 	users, _ := d.users(uid, []string{uid})
 	comment.FillUser(users[uid])
 	return comment, nil
@@ -558,6 +736,7 @@ func (d *db) share(uid, feedID string) (int, error) {
 	}
 	var count int
 	_, _ = d.session.Select("share_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
+	d.syncRecommendCounters(feedID)
 	return count, nil
 }
 
@@ -595,7 +774,11 @@ func (d *db) report(uid, feedID string, req ReportReq) error {
 	if reportCount >= 10 {
 		_, _ = tx.Update("feed_posts").Set("status", 3).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	d.syncRecommendCounters(feedID)
+	return nil
 }
 
 func (d *db) event(uid, feedID string, req EventReq) error {
@@ -611,6 +794,10 @@ func (d *db) event(uid, feedID string, req EventReq) error {
 	if err != nil {
 		return err
 	}
+	if eventType == "expose" {
+		d.recordExposure(uid, []*FeedPost{{FeedID: feedID}})
+	}
+	d.bumpRecommendStats(feedID, eventType, req)
 	delta := d.eventScoreDelta(req)
 	if delta != 0 {
 		_, _ = d.session.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score+?,0)", delta)).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
@@ -682,6 +869,74 @@ func (d *db) eventScoreDelta(req EventReq) float64 {
 		return -3
 	}
 	return 0
+}
+
+func (d *db) syncRecommendCounters(feedID string) {
+	if strings.TrimSpace(feedID) == "" {
+		return
+	}
+	_, _ = d.session.InsertBySql(`INSERT INTO feed_recommend_stats(feed_id,like_count,comment_count,share_count,report_count,updated_at)
+        SELECT p.feed_id,p.like_count,p.comment_count,p.share_count,IFNULL(r.report_count,0),NOW()
+        FROM feed_posts p
+        LEFT JOIN (SELECT feed_id,COUNT(*) report_count FROM feed_reports WHERE feed_id=? AND status=0 GROUP BY feed_id) r ON r.feed_id=p.feed_id
+        WHERE p.feed_id=?
+        ON DUPLICATE KEY UPDATE
+          like_count=VALUES(like_count),
+          comment_count=VALUES(comment_count),
+          share_count=VALUES(share_count),
+          report_count=VALUES(report_count),
+          updated_at=NOW()`, feedID, feedID).Exec()
+}
+
+func (d *db) bumpRecommendStats(feedID string, eventType string, req EventReq) {
+	if strings.TrimSpace(feedID) == "" || strings.TrimSpace(eventType) == "" {
+		return
+	}
+	watchInc := 0
+	completeInc := 0
+	skipInc := 0
+	dislikeInc := 0
+	exposureInc := 0
+	switch eventType {
+	case "expose":
+		exposureInc = 1
+	case "watch":
+		watchInc = 1
+	case "complete":
+		completeInc = 1
+		watchInc = 1
+	case "skip":
+		skipInc = 1
+	case "dislike":
+		dislikeInc = 1
+	}
+	if exposureInc == 0 && watchInc == 0 && completeInc == 0 && skipInc == 0 && dislikeInc == 0 {
+		return
+	}
+	watchMS := req.WatchMS
+	if watchMS < 0 {
+		watchMS = 0
+	}
+	percent := req.Percent
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	_, _ = d.session.InsertBySql(`INSERT INTO feed_recommend_stats(
+        feed_id,exposure_count,exposed_users,watch_count,complete_count,skip_count,dislike_count,avg_watch_ms,avg_percent,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,NOW())
+        ON DUPLICATE KEY UPDATE
+          exposure_count=exposure_count+VALUES(exposure_count),
+          exposed_users=GREATEST(exposed_users, VALUES(exposed_users)),
+          watch_count=watch_count+VALUES(watch_count),
+          complete_count=complete_count+VALUES(complete_count),
+          skip_count=skip_count+VALUES(skip_count),
+          dislike_count=dislike_count+VALUES(dislike_count),
+          avg_watch_ms=CASE WHEN VALUES(avg_watch_ms)>0 THEN IF(avg_watch_ms=0,VALUES(avg_watch_ms),(avg_watch_ms+VALUES(avg_watch_ms))/2) ELSE avg_watch_ms END,
+          avg_percent=CASE WHEN VALUES(avg_percent)>0 THEN IF(avg_percent=0,VALUES(avg_percent),(avg_percent+VALUES(avg_percent))/2) ELSE avg_percent END,
+          updated_at=NOW()`, feedID, exposureInc, exposureInc, watchInc, completeInc, skipInc, dislikeInc, watchMS, percent).Exec()
 }
 
 func (d *db) deletePost(uid, feedID string) ([]string, error) {

@@ -61,21 +61,22 @@ func (s *Service) RebuildRecommendScores() error {
 }
 
 func (s *Service) Recommend(uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
-	list, hasMore, err := s.db.listRecommend(uid, page, limit, cursor)
-	if err != nil {
-		return nil, 0, err
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		return s.listCachedCandidates(uid, "discover", page, limit, cursor, feedCandidateTTL, func(candidateLimit int) ([]string, error) {
+			return s.db.listRecommendCandidateIDs(uid, candidateLimit)
+		})
 	}
-	s.db.recordExposure(uid, list)
-	return list, hasMore, nil
+	// Redis disabled fallback: still do not mark returned items as exposed; Android reports real expose events.
+	return s.db.listRecommend(uid, page, limit, cursor)
 }
 
 func (s *Service) Following(uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
-	list, hasMore, err := s.db.listFollowing(uid, page, limit, cursor)
-	if err != nil {
-		return nil, 0, err
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		return s.listCachedCandidates(uid, "following", page, limit, cursor, feedFollowingTTL, func(candidateLimit int) ([]string, error) {
+			return s.db.listFollowingCandidateIDs(uid, candidateLimit)
+		})
 	}
-	s.db.recordExposure(uid, list)
-	return list, hasMore, nil
+	return s.db.listFollowing(uid, page, limit, cursor)
 }
 
 func (s *Service) UserFeeds(loginUID, uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
@@ -83,7 +84,11 @@ func (s *Service) UserFeeds(loginUID, uid string, page, limit int, cursor string
 }
 
 func (s *Service) Publish(uid string, req PublishReq) (*FeedPost, error) {
-	return s.db.createPost(uid, req)
+	post, err := s.db.createPost(uid, req)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return post, err
 }
 
 func (s *Service) Delete(uid, feedID string) error {
@@ -98,20 +103,39 @@ func (s *Service) Delete(uid, feedID string) error {
 	return nil
 }
 
-func (s *Service) ToggleLike(uid, feedID string) (int, int, error) {
-	return s.db.toggleLike(uid, feedID)
+func (s *Service) SetLike(uid, feedID string, desired *bool) (int, int, error) {
+	if strings.TrimSpace(uid) == "" {
+		return 0, 0, errors.New("未登录")
+	}
+	liked, count, err := s.db.setLike(uid, feedID, desired)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return liked, count, err
 }
 
 func (s *Service) Share(uid, feedID string) (int, error) {
-	return s.db.share(uid, feedID)
+	count, err := s.db.share(uid, feedID)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return count, err
 }
 
 func (s *Service) Report(uid, feedID string, req ReportReq) error {
-	return s.db.report(uid, feedID, req)
+	err := s.db.report(uid, feedID, req)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return err
 }
 
 func (s *Service) Event(uid, feedID string, req EventReq) error {
-	return s.db.event(uid, feedID, req)
+	err := s.db.event(uid, feedID, req)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return err
 }
 
 func (s *Service) Follow(uid, targetUID string) error {
@@ -121,7 +145,11 @@ func (s *Service) Follow(uid, targetUID string) error {
 	if targetUID == "" || uid == targetUID {
 		return errors.New("关注用户无效")
 	}
-	return s.db.follow(uid, targetUID)
+	err := s.db.follow(uid, targetUID)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return err
 }
 
 func (s *Service) Unfollow(uid, targetUID string) error {
@@ -131,11 +159,19 @@ func (s *Service) Unfollow(uid, targetUID string) error {
 	if targetUID == "" || uid == targetUID {
 		return errors.New("关注用户无效")
 	}
-	return s.db.unfollow(uid, targetUID)
+	err := s.db.unfollow(uid, targetUID)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return err
 }
 
 func (s *Service) AddComment(uid, feedID string, req CommentReq) (*FeedComment, error) {
-	return s.db.addComment(uid, feedID, req)
+	comment, err := s.db.addComment(uid, feedID, req)
+	if err == nil {
+		s.invalidateCandidateCache(uid)
+	}
+	return comment, err
 }
 
 func (s *Service) Comments(loginUID, feedID string, page, limit int, cursor string) ([]*FeedComment, int, error) {
