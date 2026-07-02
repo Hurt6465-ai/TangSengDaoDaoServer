@@ -40,19 +40,27 @@ CREATE TABLE IF NOT EXISTS partner_profiles (
 -- 幂等补索引，避免旧库已有表但缺索引。
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_profiles' AND INDEX_NAME = 'idx_partner_profile_feed');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_profiles ADD INDEX idx_partner_profile_feed(status,has_photo,online,last_active_at,updated_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_profiles' AND INDEX_NAME = 'idx_partner_profile_geo');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_profiles ADD INDEX idx_partner_profile_geo(status,has_photo,expires_at,lat,lng,last_active_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_profiles' AND INDEX_NAME = 'idx_partner_profile_country');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_profiles ADD INDEX idx_partner_profile_country(status,country_code,last_active_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_profiles' AND INDEX_NAME = 'idx_partner_profile_active');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_profiles ADD INDEX idx_partner_profile_active(status,last_active_at)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- 首次回填 user 基础资料。
 INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
@@ -83,4 +91,6 @@ SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.la
 -- 附近查询辅助索引，重复执行安全。
 SET @exist := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'partner_locations' AND INDEX_NAME = 'idx_partner_location_exp_geo');
 SET @sql := IF(@exist = 0, 'ALTER TABLE partner_locations ADD INDEX idx_partner_location_exp_geo(expires_at,lat,lng,uid)', 'SELECT 1');
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
