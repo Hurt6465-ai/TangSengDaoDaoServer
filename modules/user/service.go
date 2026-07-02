@@ -138,14 +138,7 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 		s.Error("查询用户在线状态失败", zap.Error(err))
 		return nil, err
 	}
-	var online int
-	var lastOffline int
-	var deviceFlag config.DeviceFlag
-	if onlineM != nil {
-		online = onlineM.Online
-		lastOffline = onlineM.LastOffline
-		deviceFlag = config.DeviceFlag(onlineM.DeviceFlag)
-	}
+	online, lastOffline, deviceFlag := s.getFreshProfileOnlineStatus(uid, onlineM)
 	//查询用户设置
 	blacklist := 1
 	userSettings, err := s.settingDB.QueryTwoUserSettingModel(uid, loginUID)
@@ -223,6 +216,34 @@ func (s *Service) GetUserDetail(uid string, loginUID string) (*UserDetailResp, e
 		beBlacklist = toUserSetting.Blacklist
 	}
 	return NewUserDetailResp(model, remark, loginUID, sourceFrom, online, lastOffline, deviceFlag, follow, blacklist, beDeleted, beBlacklist, userSetting, vercode), nil
+}
+
+func (s *Service) getFreshProfileOnlineStatus(uid string, onlineM *onlineStatusModel) (int, int, config.DeviceFlag) {
+	if onlineM == nil {
+		return 0, 0, config.DeviceFlag(0)
+	}
+
+	online := onlineM.Online
+	lastOffline := onlineM.LastOffline
+	deviceFlag := config.DeviceFlag(onlineM.DeviceFlag)
+	if online != 1 {
+		return online, lastOffline, deviceFlag
+	}
+
+	// 个人主页必须尽量避免“假在线”。数据库里的 user_online 可能因为断网、杀进程、后台切换
+	// 短时间残留 online=1，所以这里在返回资料页前再向 IM 查询一次实时在线状态。
+	// IM 确认在线才显示在线；IM 明确查不到在线设备时，资料页按离线返回。
+	statusList, err := s.ctx.IMSOnlineStatus([]string{uid})
+	if err != nil {
+		s.Warn("实时确认用户在线状态失败，使用数据库在线状态", zap.Error(err), zap.String("uid", uid))
+		return online, lastOffline, deviceFlag
+	}
+	for _, status := range statusList {
+		if status.UID == uid {
+			return 1, 0, config.DeviceFlag(status.DeviceFlag)
+		}
+	}
+	return 0, int(time.Now().Unix()), deviceFlag
 }
 
 func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailResp, error) {
