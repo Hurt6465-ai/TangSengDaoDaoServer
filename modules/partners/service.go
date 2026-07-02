@@ -81,36 +81,53 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 	if err != nil {
 		return nil, 0, err
 	}
-	window := s.pickCandidateWindow(loginUID, pool, PartnerRankWindowSize)
-	if len(window) == 0 {
-		// served 只是短期“已返回”去重，不代表用户真的看过。
-		// 池子耗尽时只清 served，不清真实 exposure/seen，避免刚刷过的人当天反复出现。
-		s.clearServed(loginUID)
-		pool, err = s.rebuildCandidatePoolLocked(loginUID, req)
-		if err != nil {
-			return nil, 0, err
-		}
-		window = s.pickCandidateWindow(loginUID, pool, PartnerRankWindowSize)
-	}
-	if len(window) == 0 {
-		return []*PartnerUser{}, 0, nil
-	}
-	list, err := s.db.listByUIDs(loginUID, req, window)
+
+	// 第一层：正常推荐。只返回本小时没 served、当天没真实曝光过的人。
+	list, hasMore, err := s.listFromPoolWindow(loginUID, req, pool, limit, false, false)
 	if err != nil {
 		return nil, 0, err
 	}
-	viewerProfile, _ := s.db.profileMe(loginUID)
-	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
-	list = filterFeedPartners(list)
-	hasMore := 0
-	if len(list) > limit {
-		hasMore = 1
-		list = list[:limit]
-	} else if len(pool) > 0 {
-		hasMore = 1
+	if len(list) > 0 {
+		return list, hasMore, nil
 	}
-	s.markServed(loginUID, list)
-	return list, hasMore, nil
+
+	// 第二层：池子被 served 消耗完时，只清短期 served，强制重建个人池。
+	// 注意这里不能再读旧 Redis 个人池，否则测试期人少时会一直拿旧池，最终前端看到“暂无语伴”。
+	s.clearServed(loginUID)
+	pool, err = s.forceRebuildCandidatePoolLocked(loginUID, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	list, hasMore, err = s.listFromPoolWindow(loginUID, req, pool, limit, false, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(list) > 0 {
+		return list, hasMore, nil
+	}
+
+	// 第三层：测试期/小用户量兜底。允许“已经看过的人”低频回流，但仍然不返回：自己、已关注、已打招呼、已建立会话、拉黑/被拉黑、无照片/无语言的人。
+	// 语伴不是短视频，宁愿换一批重复旧人，也不要直接让用户看到空页。
+	pool = shuffleCandidateUIDs(pool, loginUID+":recycle:"+time.Now().Format("20060102150405"))
+	list, hasMore, err = s.listFromPoolWindow(loginUID, req, pool, limit, true, true)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(list) > 0 {
+		return list, 1, nil
+	}
+
+	// 第四层：Redis 池为空或全是失效 UID 时，退回实时查询。实时查询不按 seen_day 绝对过滤，可以把旧语伴重新洗出来。
+	list, hasMore, err = s.listRealtime(loginUID, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(list) > 0 {
+		return list, 1, nil
+	}
+
+	// 只有全站确实没有可展示语伴，或候选都已关注/打招呼/拉黑/资料不完整时，才会真正为空。
+	return []*PartnerUser{}, 0, nil
 }
 
 func filterFeedPartners(list []*PartnerUser) []*PartnerUser {
@@ -175,6 +192,16 @@ func (s *Service) rebuildCandidatePoolLocked(loginUID string, req listReq) ([]st
 				return compactUIDs(uids, PartnerCandidatePoolSize), nil
 			}
 		}
+	}
+	return s.rebuildCandidatePool(loginUID, req)
+}
+
+func (s *Service) forceRebuildCandidatePoolLocked(loginUID string, req listReq) ([]string, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		_ = s.ctx.GetRedisConn().Del(s.candidatePoolKey(loginUID, req.SessionID))
 	}
 	return s.rebuildCandidatePool(loginUID, req)
 }
@@ -249,12 +276,45 @@ func mergeCandidateBuckets(primary []string, secondary []string, max int) []stri
 	return out
 }
 
+func (s *Service) listFromPoolWindow(loginUID string, req listReq, pool []string, limit int, allowSeen bool, ignoreServed bool) ([]*PartnerUser, int, error) {
+	window := s.pickCandidateWindowWithOptions(loginUID, pool, PartnerRankWindowSize, allowSeen, ignoreServed)
+	if len(window) == 0 {
+		return []*PartnerUser{}, 0, nil
+	}
+	list, err := s.db.listByUIDs(loginUID, req, window)
+	if err != nil {
+		return nil, 0, err
+	}
+	viewerProfile, _ := s.db.profileMe(loginUID)
+	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
+	list = filterFeedPartners(list)
+	hasMore := 0
+	if len(list) > limit {
+		hasMore = 1
+		list = list[:limit]
+	} else if len(pool) > len(window) || allowSeen {
+		hasMore = 1
+	}
+	s.markServed(loginUID, list)
+	return list, hasMore, nil
+}
+
 func (s *Service) pickCandidateWindow(loginUID string, pool []string, max int) []string {
+	return s.pickCandidateWindowWithOptions(loginUID, pool, max, false, false)
+}
+
+func (s *Service) pickCandidateWindowWithOptions(loginUID string, pool []string, max int, allowSeen bool, ignoreServed bool) []string {
 	if max <= 0 {
 		max = PartnerRankWindowSize
 	}
-	served := s.redisSetMembers(s.servedKey(loginUID))
-	seen := s.redisSetMembers(s.seenDayKey(loginUID))
+	served := map[string]struct{}{}
+	if !ignoreServed {
+		served = s.redisSetMembers(s.servedKey(loginUID))
+	}
+	seen := map[string]struct{}{}
+	if !allowSeen {
+		seen = s.redisSetMembers(s.seenDayKey(loginUID))
+	}
 	out := make([]string, 0, max)
 	for _, uid := range pool {
 		uid = strings.TrimSpace(uid)
