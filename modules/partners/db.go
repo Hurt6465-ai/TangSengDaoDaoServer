@@ -156,12 +156,15 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
 		) fr ON fr.to_uid=pp.uid
 		LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=pp.uid
-		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid AND IFNULL(pg.send_status,1)<>2
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
 		WHERE pp.uid<>? AND pp.status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND IFNULL(fr.follow,0)=0
+		  AND IFNULL(pg.last_greet_at,0)=0
+		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
 		` + locationWhere + `
@@ -212,12 +215,115 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
 	if limit <= 0 || limit > PartnerCandidateSQLLimit {
 		limit = PartnerCandidateSQLLimit
 	}
+	viewer, _ := d.profileMe(loginUID)
+	out := make([]string, 0, limit)
+	appendBucket := func(values []string, max int) {
+		if max <= 0 {
+			max = len(values)
+		}
+		added := 0
+		for _, uid := range values {
+			uid = strings.TrimSpace(uid)
+			if uid == "" || uid == loginUID {
+				continue
+			}
+			out = append(out, uid)
+			added++
+			if added >= max {
+				break
+			}
+		}
+	}
+
+	// 多路召回：语言互补优先，活跃/附近/新用户/探索混入，避免在线用户永远霸榜。
+	if values, err := d.candidateUIDsByLanguages(loginUID, viewer, limit/2+80); err == nil {
+		appendBucket(values, limit/2+40)
+	}
+	if values, err := d.candidateUIDsNearby(loginUID, req, limit/5+50); err == nil {
+		appendBucket(values, limit/5+30)
+	}
+	if values, err := d.candidateUIDsActive(loginUID, limit/3+80); err == nil {
+		appendBucket(values, limit/3+50)
+	}
+	if values, err := d.candidateUIDsNewest(loginUID, limit/5+50); err == nil {
+		appendBucket(values, limit/5+30)
+	}
+	if len(out) < limit {
+		if values, err := d.candidateUIDsExplore(loginUID, limit); err == nil {
+			appendBucket(values, limit-len(out)+30)
+		}
+	}
+	return compactUIDs(out, limit), nil
+}
+
+func (d *db) candidateUIDsByLanguages(loginUID string, viewer *ProfileMeResp, limit int) ([]string, error) {
+	if viewer == nil || (len(viewer.NativeLanguages) == 0 && len(viewer.LearningLanguages) == 0) {
+		return []string{}, nil
+	}
+	likes := make([]string, 0)
+	args := make([]interface{}, 0)
+	for _, lang := range viewer.LearningLanguages {
+		lang = strings.ToLower(strings.TrimSpace(lang))
+		if lang == "" {
+			continue
+		}
+		likes = append(likes, "LOWER(pp.native_languages) LIKE ?")
+		args = append(args, "%"+lang+"%")
+	}
+	for _, lang := range viewer.NativeLanguages {
+		lang = strings.ToLower(strings.TrimSpace(lang))
+		if lang == "" {
+			continue
+		}
+		likes = append(likes, "LOWER(pp.learning_languages) LIKE ?")
+		args = append(args, "%"+lang+"%")
+	}
+	if len(likes) == 0 {
+		return []string{}, nil
+	}
+	return d.candidateUIDsForUser(loginUID, " AND ("+strings.Join(likes, " OR ")+") ", args, "IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.profile_score DESC", limit)
+}
+
+func (d *db) candidateUIDsNearby(loginUID string, req listReq, limit int) ([]string, error) {
+	viewerLoc := req.Location
+	if viewerLoc == nil && req.UseLoginLocation {
+		viewerLoc, _ = d.getLocation(loginUID)
+	}
+	if viewerLoc == nil || !validLatLng(viewerLoc.Lat, viewerLoc.Lng) {
+		return []string{}, nil
+	}
+	minLat, maxLat, minLng, maxLng := latLngBounds(viewerLoc.Lat, viewerLoc.Lng, req.RadiusMeters())
+	distanceExpr := `IF(pp.expires_at>? AND pp.lat<>0 AND pp.lng<>0, IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(pp.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(pp.lat))*POWER(SIN(RADIANS(pp.lng - ?)/2),2)))) AS UNSIGNED),0),0)`
+	args := []interface{}{time.Now().UnixMilli(), minLat, maxLat, minLng, maxLng, time.Now().UnixMilli(), viewerLoc.Lat, viewerLoc.Lat, viewerLoc.Lng, req.RadiusMeters()}
+	where := " AND pp.expires_at>? AND pp.lat BETWEEN ? AND ? AND pp.lng BETWEEN ? AND ? AND " + distanceExpr + " <= ? "
+	return d.candidateUIDsForUser(loginUID, where, args, "IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC", limit)
+}
+
+func (d *db) candidateUIDsActive(loginUID string, limit int) ([]string, error) {
+	return d.candidateUIDsForUser(loginUID, "", nil, "IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC", limit)
+}
+
+func (d *db) candidateUIDsNewest(loginUID string, limit int) ([]string, error) {
+	return d.candidateUIDsForUser(loginUID, "", nil, "pp.created_at DESC, IFNULL(pp.last_active_at,0) DESC", limit)
+}
+
+func (d *db) candidateUIDsExplore(loginUID string, limit int) ([]string, error) {
+	return d.candidateUIDsForUser(loginUID, "", nil, "pp.updated_at DESC, pp.uid DESC", limit)
+}
+
+func (d *db) candidateUIDsForUser(loginUID, extraWhere string, extraArgs []interface{}, orderBy string, limit int) ([]string, error) {
+	if limit <= 0 || limit > PartnerCandidateSQLLimit {
+		limit = PartnerCandidateSQLLimit
+	}
+	if strings.TrimSpace(orderBy) == "" {
+		orderBy = "IFNULL(pp.last_active_at,0) DESC"
+	}
 	sql := `SELECT pp.uid
 		FROM partner_profiles pp
 		LEFT JOIN (
 			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
 		) fr ON fr.to_uid=pp.uid
-		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid AND IFNULL(pg.send_status,1)<>2
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
@@ -225,13 +331,33 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
-		  AND IFNULL(pc.status,-1) NOT IN (?,?)
+		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
+		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
+		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''` + extraWhere + `
+		ORDER BY ` + orderBy + `
+		LIMIT ?`
+	args := make([]interface{}, 0, 6+len(extraArgs)+1)
+	args = append(args, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
+	args = append(args, extraArgs...)
+	args = append(args, limit)
+	var uids []string
+	_, err := d.session.SelectBySql(sql, args...).Load(&uids)
+	return uids, err
+}
+
+func (d *db) globalCandidateUIDs(limit int) ([]string, error) {
+	if limit <= 0 || limit > PartnerGlobalCandidateSQLLimit {
+		limit = PartnerGlobalCandidateSQLLimit
+	}
+	sql := `SELECT pp.uid
+		FROM partner_profiles pp
+		WHERE pp.status=1 AND pp.has_photo=1
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
 		ORDER BY IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
 		LIMIT ?`
 	var uids []string
-	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, PartnerContactStatusPending, PartnerContactStatusActive, limit).Load(&uids)
+	_, err := d.session.SelectBySql(sql, limit).Load(&uids)
 	return uids, err
 }
 
@@ -275,12 +401,15 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
 			SELECT to_uid, 1 AS follow FROM friend WHERE uid=? AND is_deleted=0
 		) fr ON fr.to_uid=pp.uid
 		LEFT JOIN partner_exposures pe ON pe.uid=? AND pe.to_uid=pp.uid
-		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid
+		LEFT JOIN partner_greetings pg ON pg.uid=? AND pg.to_uid=pp.uid AND IFNULL(pg.send_status,1)<>2
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
 		WHERE pp.uid IN ? AND pp.uid<>? AND pp.status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND IFNULL(fr.follow,0)=0
+		  AND IFNULL(pg.last_greet_at,0)=0
+		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''`
 
@@ -313,14 +442,64 @@ func (d *db) recordExposureItems(loginUID string, items []ExposureItem) error {
 		if seenAt <= 0 {
 			seenAt = time.Now().UnixMilli()
 		}
-		_, err = tx.InsertBySql(`INSERT INTO partner_exposures(uid,to_uid,seen_count,last_seen_at,created_at,updated_at)
-            VALUES(?,?,1,?,NOW(),NOW())
-            ON DUPLICATE KEY UPDATE seen_count=seen_count+1,last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),updated_at=NOW()`, loginUID, toUID, seenAt).Exec()
+		eventType := normalizeExposureEventType(item.EventType, item.DurationMS)
+		source := normalizeExposureSource(item.Source)
+		if item.PhotoIndex < 0 {
+			item.PhotoIndex = 0
+		}
+		_, err = tx.InsertBySql(`INSERT INTO partner_exposure_events(uid,to_uid,event_type,source,duration_ms,photo_index,event_at,created_at)
+			VALUES(?,?,?,?,?,?,?,NOW())`, loginUID, toUID, eventType, source, item.DurationMS, item.PhotoIndex, seenAt).Exec()
 		if err != nil {
 			return err
 		}
+		if shouldCountExposureEvent(eventType, item.DurationMS) {
+			_, err = tx.InsertBySql(`INSERT INTO partner_exposures(uid,to_uid,seen_count,last_seen_at,last_duration_ms,created_at,updated_at)
+				VALUES(?,?,1,?,?,NOW(),NOW())
+				ON DUPLICATE KEY UPDATE seen_count=seen_count+1,last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),last_duration_ms=VALUES(last_duration_ms),updated_at=NOW()`, loginUID, toUID, seenAt, item.DurationMS).Exec()
+			if err != nil {
+				return err
+			}
+		}
 	}
 	return tx.Commit()
+}
+
+func normalizeExposureEventType(eventType string, durationMS int64) string {
+	eventType = strings.TrimSpace(strings.ToLower(eventType))
+	switch eventType {
+	case "expose", "exposure", "stay", "skip", "profile_open", "photo_swipe", "hello":
+		if eventType == "exposure" {
+			return "expose"
+		}
+		return eventType
+	default:
+		if durationMS > 0 && durationMS < PartnerExposureMinDurationMS {
+			return "skip"
+		}
+		return "expose"
+	}
+}
+
+func normalizeExposureSource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "partner_browse"
+	}
+	if len(source) > 32 {
+		source = source[:32]
+	}
+	return source
+}
+
+func shouldCountExposureEvent(eventType string, durationMS int64) bool {
+	switch eventType {
+	case "skip":
+		return false
+	case "hello", "profile_open":
+		return true
+	default:
+		return durationMS >= PartnerExposureMinDurationMS
+	}
 }
 
 func (d *db) userExists(uid string) (bool, error) {
@@ -342,16 +521,16 @@ func (d *db) greetingStats(uid, toUID string, now int64) (*greetingStats, error)
 	stats := &greetingStats{}
 	dayStart := now - int64(24*time.Hour/time.Millisecond)
 	hourStart := now - int64(time.Hour/time.Millisecond)
-	err := d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=?", uid, hourStart).LoadOne(&stats.HourCount)
+	err := d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=? AND IFNULL(send_status,1)<>2", uid, hourStart).LoadOne(&stats.HourCount)
 	if err != nil {
 		return nil, err
 	}
-	err = d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=?", uid, dayStart).LoadOne(&stats.DayCount)
+	err = d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=? AND IFNULL(send_status,1)<>2", uid, dayStart).LoadOne(&stats.DayCount)
 	if err != nil {
 		return nil, err
 	}
 	var last int64
-	err = d.session.Select("IFNULL(MAX(last_greet_at),0)").From("partner_greetings").Where("uid=? AND to_uid=?", uid, toUID).LoadOne(&last)
+	err = d.session.Select("IFNULL(MAX(last_greet_at),0)").From("partner_greetings").Where("uid=? AND to_uid=? AND IFNULL(send_status,1)<>2", uid, toUID).LoadOne(&last)
 	if err != nil {
 		return nil, err
 	}
@@ -361,9 +540,9 @@ func (d *db) greetingStats(uid, toUID string, now int64) (*greetingStats, error)
 
 func (d *db) recordGreeting(uid, toUID, text, source string) (*GreetingResp, error) {
 	now := time.Now().UnixMilli()
-	_, err := d.session.InsertBySql(`INSERT INTO partner_greetings(uid,to_uid,text,source,greet_count,last_greet_at,created_at,updated_at)
-        VALUES(?,?,?,?,1,?,NOW(),NOW())
-        ON DUPLICATE KEY UPDATE text=VALUES(text),source=VALUES(source),greet_count=greet_count+1,last_greet_at=VALUES(last_greet_at),updated_at=NOW()`, uid, toUID, text, source, now).Exec()
+	_, err := d.session.InsertBySql(`INSERT INTO partner_greetings(uid,to_uid,text,source,greet_count,last_greet_at,send_status,last_send_at,failed_reason,created_at,updated_at)
+        VALUES(?,?,?,?,1,?,0,?, '',NOW(),NOW())
+        ON DUPLICATE KEY UPDATE text=VALUES(text),source=VALUES(source),greet_count=greet_count+1,last_greet_at=VALUES(last_greet_at),send_status=0,last_send_at=VALUES(last_send_at),failed_reason='',updated_at=NOW()`, uid, toUID, text, source, now, now).Exec()
 	if err != nil {
 		return nil, err
 	}
@@ -582,4 +761,84 @@ func (d *db) activateContactOnReply(fromUID, toUID string, at int64) (bool, erro
 	}
 	_, err = d.session.Update("partner_contacts").Set("last_msg_at", at).Set("updated_at", at).Where("(uid=? AND to_uid=?) OR (uid=? AND to_uid=?)", fromUID, toUID, toUID, fromUID).Exec()
 	return false, err
+}
+func (d *db) markGreetingSendStatus(uid, toUID string, at int64, status int, reason string) error {
+	if uid == "" || toUID == "" {
+		return nil
+	}
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	_, err := d.session.Update("partner_greetings").
+		Set("send_status", status).
+		Set("last_send_at", time.Now().UnixMilli()).
+		Set("failed_reason", reason).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("uid=? AND to_uid=? AND last_greet_at=?", uid, toUID, at).
+		Exec()
+	return err
+}
+
+func (d *db) rollbackPendingGreetingSend(uid, toUID string, at int64) error {
+	if uid == "" || toUID == "" {
+		return nil
+	}
+	_, _ = d.session.Update("partner_contacts").
+		Set("requester_msg_count", dbr.Expr("GREATEST(IFNULL(requester_msg_count,1)-1,0)")).
+		Set("updated_at", at).
+		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=?", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
+		Exec()
+	_, err := d.session.DeleteFrom("partner_contacts").
+		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=? AND IFNULL(requester_msg_count,0)<=0", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
+		Exec()
+	return err
+}
+
+func (d *db) touchPartnerActive(uid string, at int64, online int) error {
+	_ = online
+	if uid == "" {
+		return nil
+	}
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	_, err := d.session.UpdateBySql(`UPDATE partner_profiles SET last_active_at=GREATEST(IFNULL(last_active_at,0),?),updated_at=NOW() WHERE uid=?`, at, uid).Exec()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *db) syncOnlineProfiles() error {
+	_, err := d.session.UpdateBySql(`UPDATE partner_profiles pp
+		LEFT JOIN (
+			SELECT uid,MAX(online) AS online,MAX(last_offline) AS last_offline,MAX(GREATEST(last_online,last_offline))*1000 AS last_active_at
+			FROM user_online GROUP BY uid
+		) onl ON onl.uid=pp.uid
+		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0)),pp.updated_at=NOW()`).Exec()
+	return err
+}
+
+func (d *db) syncRecentPartnerProfiles(limit int) (int64, error) {
+	if limit <= 0 || limit > PartnerGlobalCandidateSQLLimit {
+		limit = PartnerGlobalCandidateSQLLimit
+	}
+	res, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
+		SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
+		IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',1,0) AS has_photo,
+		(IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',20,0)+IF(IFNULL(u.native_languages,'')<>'',10,0)+IF(IFNULL(u.learning_languages,'')<>'',10,0)+IF(IFNULL(u.intro,'')<>'',5,0)+IF(IFNULL(u.country_code,'')<>'',5,0)) AS profile_score,
+		IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0) AS status,
+		GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
+		FROM user u
+		WHERE u.updated_at >= DATE_SUB(NOW(), INTERVAL 2 DAY)
+		ORDER BY u.updated_at DESC
+		LIMIT ?
+		ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),status=VALUES(status),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at)),updated_at=NOW()`, limit).Exec()
+	if err != nil {
+		return 0, err
+	}
+	if res == nil {
+		return 0, nil
+	}
+	return res.RowsAffected()
 }

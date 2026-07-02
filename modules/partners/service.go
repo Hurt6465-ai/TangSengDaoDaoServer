@@ -35,10 +35,14 @@ type Service struct {
 func NewService(ctx *config.Context) *Service {
 	svc := &Service{ctx: ctx, db: newDB(ctx)}
 	ctx.AddMessagesListener(svc.listenerMessages)
+	svc.startBackgroundJobs()
 	return svc
 }
 
 func (s *Service) List(loginUID string, req listReq) ([]*PartnerUser, int, error) {
+	s.touchActive(loginUID, time.Now().UnixMilli(), 1)
+	// 用户刚改过资料但还没上传定位时，也要尽快同步到 partner_profiles，避免“不进语伴池”。
+	go func() { _ = s.db.syncPartnerProfileFromUser(loginUID) }()
 	if req.NearbyOnly {
 		return s.listRealtime(loginUID, req)
 	}
@@ -61,7 +65,6 @@ func (s *Service) listRealtime(loginUID string, req listReq) ([]*PartnerUser, in
 	viewerProfile, _ := s.db.profileMe(loginUID)
 	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
 	list = filterFeedPartners(list)
-	list = s.filterUnservedUnseen(loginUID, list)
 	limit := clampLimit(req.Limit)
 	hasMore := 0
 	if len(list) > limit {
@@ -80,10 +83,9 @@ func (s *Service) listFromCandidatePool(loginUID string, req listReq) ([]*Partne
 	}
 	window := s.pickCandidateWindow(loginUID, pool, PartnerRankWindowSize)
 	if len(window) == 0 {
-		// 当天 served/seen 已经把池子消耗完时，刷新候选池再试一次。
-		// 语伴早期用户量少，允许进入下一轮随机循环，不让前端刷到尽头黑住。
+		// served 只是短期“已返回”去重，不代表用户真的看过。
+		// 池子耗尽时只清 served，不清真实 exposure/seen，避免刚刷过的人当天反复出现。
 		s.clearServed(loginUID)
-		s.clearSeenDay(loginUID)
 		pool, err = s.rebuildCandidatePoolLocked(loginUID, req)
 		if err != nil {
 			return nil, 0, err
@@ -178,11 +180,12 @@ func (s *Service) rebuildCandidatePoolLocked(loginUID string, req listReq) ([]st
 }
 
 func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, error) {
-	uids, err := s.db.candidateUIDs(loginUID, req, PartnerCandidateSQLLimit)
+	personal, err := s.db.candidateUIDs(loginUID, req, PartnerCandidateSQLLimit)
 	if err != nil {
 		return nil, err
 	}
-	uids = compactUIDs(uids, PartnerCandidatePoolSize)
+	global, _ := s.getGlobalCandidatePool()
+	uids := mergeCandidateBuckets(personal, global, PartnerCandidatePoolSize)
 	uids = shuffleCandidateUIDs(uids, loginUID+":"+req.RandomSeed())
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil && len(uids) > 0 {
 		key := s.candidatePoolKey(loginUID, req.SessionID)
@@ -191,27 +194,57 @@ func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, 
 	return uids, nil
 }
 
-func (s *Service) filterUnservedUnseen(loginUID string, list []*PartnerUser) []*PartnerUser {
-	if loginUID == "" || len(list) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
-		return list
+func (s *Service) getGlobalCandidatePool() ([]string, error) {
+	key := s.globalCandidatePoolKey()
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
+			var uids []string
+			if json.Unmarshal([]byte(raw), &uids) == nil && len(uids) > 0 {
+				return compactUIDs(uids, PartnerGlobalCandidateSQLLimit), nil
+			}
+		}
 	}
-	served := s.redisSetMembers(s.servedKey(loginUID))
-	seen := s.redisSetMembers(s.seenDayKey(loginUID))
-	if len(served) == 0 && len(seen) == 0 {
-		return list
+	return s.rebuildGlobalCandidatePool()
+}
+
+func (s *Service) rebuildGlobalCandidatePool() ([]string, error) {
+	uids, err := s.db.globalCandidateUIDs(PartnerGlobalCandidateSQLLimit)
+	if err != nil {
+		return nil, err
 	}
-	out := make([]*PartnerUser, 0, len(list))
-	for _, p := range list {
-		if p == nil || p.UID == "" {
-			continue
+	uids = compactUIDs(uids, PartnerGlobalCandidateSQLLimit)
+	uids = shuffleCandidateUIDs(uids, "global:"+time.Now().Format("200601021504"))
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil && len(uids) > 0 {
+		_ = s.ctx.GetRedisConn().SetAndExpire(s.globalCandidatePoolKey(), util.ToJson(uids), PartnerGlobalPoolTTL)
+	}
+	return uids, nil
+}
+
+func mergeCandidateBuckets(primary []string, secondary []string, max int) []string {
+	out := make([]string, 0, max)
+	seen := map[string]struct{}{}
+	appendOne := func(uid string) bool {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			return false
 		}
-		if _, ok := served[p.UID]; ok {
-			continue
+		if _, ok := seen[uid]; ok {
+			return false
 		}
-		if _, ok := seen[p.UID]; ok {
-			continue
+		seen[uid] = struct{}{}
+		out = append(out, uid)
+		return max > 0 && len(out) >= max
+	}
+	// 先放个性多路召回，再用全局 20 分钟批量池补足。
+	for _, uid := range primary {
+		if appendOne(uid) {
+			return out
 		}
-		out = append(out, p)
+	}
+	for _, uid := range secondary {
+		if appendOne(uid) {
+			return out
+		}
 	}
 	return out
 }
@@ -275,7 +308,7 @@ func (s *Service) markServed(loginUID string, list []*PartnerUser) {
 	}
 	key := s.servedKey(loginUID)
 	_ = s.ctx.GetRedisConn().SAdd(key, members...)
-	_ = s.ctx.GetRedisConn().Expire(key, 24*time.Hour)
+	_ = s.ctx.GetRedisConn().Expire(key, PartnerServedTTL)
 }
 
 func (s *Service) clearServed(loginUID string) {
@@ -364,18 +397,15 @@ func (s *Service) RecordExposures(uid string, req ExposureReq) (*ExposureResp, e
 	if uid == "" {
 		return &ExposureResp{Status: 401, Msg: "未登录"}, nil
 	}
+	s.touchActive(uid, time.Now().UnixMilli(), 1)
 	now := time.Now().UnixMilli()
 	items := make([]ExposureItem, 0, len(req.Items))
-	seenUIDs := map[string]struct{}{}
+	seenKeys := map[string]struct{}{}
 	for _, item := range req.Items {
 		toUID := strings.TrimSpace(item.ToUID)
 		if toUID == "" || toUID == uid {
 			continue
 		}
-		if _, ok := seenUIDs[toUID]; ok {
-			continue
-		}
-		seenUIDs[toUID] = struct{}{}
 		seenAt := normalizeMillis(item.SeenAt)
 		if seenAt <= 0 || seenAt > now+int64(time.Hour/time.Millisecond) {
 			seenAt = now
@@ -383,7 +413,13 @@ func (s *Service) RecordExposures(uid string, req ExposureReq) (*ExposureResp, e
 		if item.DurationMS < 0 {
 			item.DurationMS = 0
 		}
-		items = append(items, ExposureItem{ToUID: toUID, SeenAt: seenAt, DurationMS: item.DurationMS})
+		eventType := normalizeExposureEventType(item.EventType, item.DurationMS)
+		key := toUID + ":" + eventType
+		if _, ok := seenKeys[key]; ok {
+			continue
+		}
+		seenKeys[key] = struct{}{}
+		items = append(items, ExposureItem{ToUID: toUID, SeenAt: seenAt, DurationMS: item.DurationMS, EventType: eventType, Source: normalizeExposureSource(item.Source), PhotoIndex: item.PhotoIndex})
 		if len(items) >= PartnerExposureBatchMax {
 			break
 		}
@@ -394,12 +430,17 @@ func (s *Service) RecordExposures(uid string, req ExposureReq) (*ExposureResp, e
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		members := make([]interface{}, 0, len(items))
 		for _, item := range items {
+			if !shouldCountExposureEvent(item.EventType, item.DurationMS) {
+				continue
+			}
 			members = append(members, item.ToUID)
 			_ = s.ctx.GetRedisConn().ZAdd(s.seenZSetKey(uid), float64(item.SeenAt), item.ToUID)
 		}
-		_ = s.ctx.GetRedisConn().SAdd(s.seenDayKey(uid), members...)
-		_ = s.ctx.GetRedisConn().Expire(s.seenDayKey(uid), 24*time.Hour)
-		_ = s.ctx.GetRedisConn().Expire(s.seenZSetKey(uid), 45*24*time.Hour)
+		if len(members) > 0 {
+			_ = s.ctx.GetRedisConn().SAdd(s.seenDayKey(uid), members...)
+			_ = s.ctx.GetRedisConn().Expire(s.seenDayKey(uid), PartnerSeenTTL)
+			_ = s.ctx.GetRedisConn().Expire(s.seenZSetKey(uid), PartnerSeenHistoryTTL)
+		}
 	}
 	go func(items []ExposureItem) {
 		_ = s.db.recordExposureItems(uid, items)
@@ -408,6 +449,8 @@ func (s *Service) RecordExposures(uid string, req ExposureReq) (*ExposureResp, e
 }
 
 func (s *Service) ProfileMe(uid string) (*ProfileMeResp, error) {
+	_ = s.db.syncPartnerProfileFromUser(uid)
+	s.touchActive(uid, time.Now().UnixMilli(), 1)
 	return s.db.profileMe(uid)
 }
 
@@ -461,15 +504,46 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if contact.RequesterUID != uid {
 				return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}, nil
 			}
-			if contact.RequesterMsgCount >= MaxPendingGreetingMessages {
-				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方还没回复，最多只能打招呼3次"}, ErrGreetingDuplicate
+			allowed, nextAt, msg := canSendPendingGreeting(contact.RequesterMsgCount, contact.LastMsgAt, now)
+			if !allowed {
+				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}, ErrGreetingDuplicate
 			}
-			// 语伴页只负责第一条随机招呼。待回复阶段再次点打招呼时，不再自动追加第 2/3 条，
-			// 第 2/3 条应该从消息列表进入聊天窗口后作为普通私信发送，由 listenerMessages 计数。
+			stats, err := s.db.greetingStats(uid, toUID, now)
+			if err != nil {
+				return nil, err
+			}
+			if stats.HourCount >= GreetingHourLimit {
+				return nil, ErrGreetingHourLimit
+			}
+			if stats.DayCount >= GreetingDayLimit {
+				return nil, ErrGreetingDayLimit
+			}
+			text := normalizeGreetingText(req.Text)
+			source := normalizeGreetingSource(req.Source)
+			resp, err := s.db.recordGreeting(uid, toUID, text, source)
+			if err != nil {
+				return nil, err
+			}
+			count, err := s.db.incrementPendingRequesterMsgCount(uid, toUID, resp.LastGreetAt)
+			if err != nil {
+				return nil, err
+			}
+			resp.RequesterMsgCount = count
+			resp.MaxGreetingCount = MaxPendingGreetingMessages
 			if err := s.addPartnerWhitelist(uid, toUID); err != nil {
 				return nil, err
 			}
-			return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已打过招呼，请到聊天窗口继续"}, nil
+			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
+				_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 2, err.Error())
+				_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
+				_ = s.removePartnerSenderWhitelist(uid, toUID)
+				return nil, err
+			}
+			_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 1, "")
+			if count >= MaxPendingGreetingMessages {
+				_ = s.removePartnerSenderWhitelist(uid, toUID)
+			}
+			return resp, nil
 		}
 	}
 
@@ -503,8 +577,12 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		return nil, err
 	}
 	if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
+		_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 2, err.Error())
+		_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
+		_ = s.removePartnerSenderWhitelist(uid, toUID)
 		return nil, err
 	}
+	_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 1, "")
 	return resp, nil
 }
 
@@ -644,6 +722,8 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
+		s.touchActive(msg.FromUID, createdAt, 1)
+		s.touchActive(msg.ChannelID, createdAt, 0)
 
 		contact, _ := s.db.getPartnerContact(msg.FromUID, msg.ChannelID)
 		if contact != nil && contact.Status == PartnerContactStatusPending && contact.RequesterUID == msg.FromUID {
@@ -675,6 +755,42 @@ func isPartnerGreetingPayload(msg *config.MessageResp) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Service) globalCandidatePoolKey() string {
+	// 20 分钟一个全局候选池。正常用户请求只从这个池 + 个性池里切片，不反复扫大表。
+	now := time.Now()
+	minuteBucket := (now.Minute() / 20) * 20
+	return "partner_global_candidate_pool:" + now.Format("2006010215") + fmt.Sprintf("%02d", minuteBucket)
+}
+
+func (s *Service) startBackgroundJobs() {
+	go func() {
+		// 启动后先小延迟，让迁移和主服务初始化完成。
+		time.Sleep(3 * time.Second)
+		s.runCandidateWarmupOnce()
+		ticker := time.NewTicker(PartnerGlobalPoolRefresh)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.runCandidateWarmupOnce()
+		}
+	}()
+}
+
+func (s *Service) runCandidateWarmupOnce() {
+	if s == nil || s.db == nil {
+		return
+	}
+	_, _ = s.db.syncRecentPartnerProfiles(PartnerGlobalCandidateSQLLimit)
+	_ = s.db.syncOnlineProfiles()
+	_, _ = s.rebuildGlobalCandidatePool()
+}
+
+func (s *Service) touchActive(uid string, at int64, online int) {
+	if strings.TrimSpace(uid) == "" || s == nil || s.db == nil {
+		return
+	}
+	go func() { _ = s.db.touchPartnerActive(uid, at, online) }()
 }
 
 func cursorToken() string {

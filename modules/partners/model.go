@@ -32,11 +32,21 @@ const (
 	PartnerContactStatusIgnored = 2
 	PartnerContactStatusBlocked = 3
 
-	PartnerCandidatePoolSize = 100
-	PartnerCandidateSQLLimit = 200
-	PartnerRankWindowSize    = 80
-	PartnerExposureBatchMax  = 20
-	PartnerCandidatePoolTTL  = 6 * time.Hour
+	// Per-user candidate pools are sliced from a global warm pool and then personalized.
+	// The global pool is refreshed in the background every 20 minutes, up to 10k uids,
+	// so normal requests avoid scanning user/partner_profiles repeatedly.
+	PartnerCandidatePoolSize       = 300
+	PartnerCandidateSQLLimit       = 800
+	PartnerGlobalCandidateSQLLimit = 10000
+	PartnerRankWindowSize          = 160
+	PartnerExposureBatchMax        = 30
+	PartnerCandidatePoolTTL        = 2 * time.Hour
+	PartnerGlobalPoolTTL           = 40 * time.Minute
+	PartnerGlobalPoolRefresh       = 20 * time.Minute
+	PartnerServedTTL               = 60 * time.Minute
+	PartnerSeenTTL                 = 24 * time.Hour
+	PartnerSeenHistoryTTL          = 45 * 24 * time.Hour
+	PartnerExposureMinDurationMS   = int64(700)
 )
 
 type ListResp struct {
@@ -119,6 +129,9 @@ type ExposureItem struct {
 	ToUID      string `json:"to_uid"`
 	SeenAt     int64  `json:"seen_at"`
 	DurationMS int64  `json:"duration_ms"`
+	EventType  string `json:"event_type"`
+	Source     string `json:"source"`
+	PhotoIndex int    `json:"photo_index"`
 }
 
 type ExposureResp struct {
@@ -280,7 +293,7 @@ func partnerScore(p *PartnerUser, loginUID string, round int, nowMs int64, viewe
 
 func activeScore(p *PartnerUser, nowMs int64) float64 {
 	if p.Online == 1 {
-		return 35
+		return 22
 	}
 	last := normalizeMillis(p.LastActiveAt)
 	if last <= 0 && p.LastOffline > 0 {
@@ -292,17 +305,17 @@ func activeScore(p *PartnerUser, nowMs int64) float64 {
 	minutes := float64(nowMs-last) / 60000.0
 	switch {
 	case minutes <= 5:
-		return 30
-	case minutes <= 10:
-		return 25
-	case minutes <= 20:
 		return 20
-	case minutes <= 30:
+	case minutes <= 10:
+		return 18
+	case minutes <= 20:
 		return 15
+	case minutes <= 30:
+		return 12
 	case minutes <= 60:
-		return 10
+		return 8
 	case minutes <= 180:
-		return 5
+		return 4
 	case minutes <= 1440:
 		return 1
 	case minutes <= 10080:
