@@ -19,6 +19,32 @@ CREATE TABLE IF NOT EXISTS feed_recommend_stats (
   KEY idx_feed_rec_stats_exposure(exposure_count)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='发现推荐离线统计';
 
-CREATE INDEX idx_feed_posts_recent_pool ON feed_posts(status,visibility,created_at,score,last_active_at);
-CREATE INDEX idx_feed_reports_user_feed ON feed_reports(uid,feed_id,status);
-CREATE INDEX idx_feed_events_user_feed_type_time ON feed_events(uid,feed_id,event_type,created_at);
+SET @idx_exists := (
+  SELECT COUNT(1) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='feed_posts' AND INDEX_NAME='idx_feed_posts_recent_pool'
+);
+SET @sql := IF(@idx_exists=0,
+  'CREATE INDEX idx_feed_posts_recent_pool ON feed_posts(status,visibility,created_at,score,last_active_at)',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @idx_exists := (
+  SELECT COUNT(1) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='feed_reports' AND INDEX_NAME='idx_feed_reports_user_feed'
+);
+SET @sql := IF(@idx_exists=0,
+  'CREATE INDEX idx_feed_reports_user_feed ON feed_reports(uid,feed_id,status)',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @idx_exists := (
+  SELECT COUNT(1) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='feed_events' AND INDEX_NAME='idx_feed_events_user_feed_type_time'
+);
+SET @sql := IF(@idx_exists=0,
+  'CREATE INDEX idx_feed_events_user_feed_type_time ON feed_events(uid,feed_id,event_type,created_at)',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
