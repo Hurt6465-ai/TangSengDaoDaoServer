@@ -225,12 +225,13 @@ func (d *db) candidateUIDs(loginUID string, req listReq, limit int) ([]string, e
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
+		  AND IFNULL(pc.status,-1) NOT IN (?,?)
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
 		ORDER BY IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
 		LIMIT ?`
 	var uids []string
-	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&uids)
+	_, err := d.session.SelectBySql(sql, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, PartnerContactStatusPending, PartnerContactStatusActive, limit).Load(&uids)
 	return uids, err
 }
 

@@ -61,6 +61,7 @@ func (s *Service) listRealtime(loginUID string, req listReq) ([]*PartnerUser, in
 	viewerProfile, _ := s.db.profileMe(loginUID)
 	list = RankPartnersWithSeed(list, loginUID, req.Round(), viewerProfile, req.RandomSeed())
 	list = filterFeedPartners(list)
+	list = s.filterUnservedUnseen(loginUID, list)
 	limit := clampLimit(req.Limit)
 	hasMore := 0
 	if len(list) > limit {
@@ -188,6 +189,31 @@ func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, 
 		_ = s.ctx.GetRedisConn().SetAndExpire(key, util.ToJson(uids), PartnerCandidatePoolTTL)
 	}
 	return uids, nil
+}
+
+func (s *Service) filterUnservedUnseen(loginUID string, list []*PartnerUser) []*PartnerUser {
+	if loginUID == "" || len(list) == 0 || s.ctx == nil || s.ctx.GetRedisConn() == nil {
+		return list
+	}
+	served := s.redisSetMembers(s.servedKey(loginUID))
+	seen := s.redisSetMembers(s.seenDayKey(loginUID))
+	if len(served) == 0 && len(seen) == 0 {
+		return list
+	}
+	out := make([]*PartnerUser, 0, len(list))
+	for _, p := range list {
+		if p == nil || p.UID == "" {
+			continue
+		}
+		if _, ok := served[p.UID]; ok {
+			continue
+		}
+		if _, ok := seen[p.UID]; ok {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func (s *Service) pickCandidateWindow(loginUID string, pool []string, max int) []string {
@@ -435,42 +461,15 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if contact.RequesterUID != uid {
 				return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}, nil
 			}
-			allowed, nextAt, msg := canSendPendingGreeting(contact.RequesterMsgCount, contact.LastMsgAt, now)
-			if !allowed {
-				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}, ErrGreetingDuplicate
+			if contact.RequesterMsgCount >= MaxPendingGreetingMessages {
+				return &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方还没回复，最多只能打招呼3次"}, ErrGreetingDuplicate
 			}
-			stats, err := s.db.greetingStats(uid, toUID, now)
-			if err != nil {
-				return nil, err
-			}
-			if stats.HourCount >= GreetingHourLimit {
-				return nil, ErrGreetingHourLimit
-			}
-			if stats.DayCount >= GreetingDayLimit {
-				return nil, ErrGreetingDayLimit
-			}
-			text := normalizeGreetingText(req.Text)
-			source := normalizeGreetingSource(req.Source)
-			resp, err := s.db.recordGreeting(uid, toUID, text, source)
-			if err != nil {
-				return nil, err
-			}
-			count, err := s.db.incrementPendingRequesterMsgCount(uid, toUID, resp.LastGreetAt)
-			if err != nil {
-				return nil, err
-			}
-			resp.RequesterMsgCount = count
-			resp.MaxGreetingCount = MaxPendingGreetingMessages
+			// 语伴页只负责第一条随机招呼。待回复阶段再次点打招呼时，不再自动追加第 2/3 条，
+			// 第 2/3 条应该从消息列表进入聊天窗口后作为普通私信发送，由 listenerMessages 计数。
 			if err := s.addPartnerWhitelist(uid, toUID); err != nil {
 				return nil, err
 			}
-			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
-				return nil, err
-			}
-			if count >= MaxPendingGreetingMessages {
-				_ = s.removePartnerSenderWhitelist(uid, toUID)
-			}
-			return resp, nil
+			return &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已打过招呼，请到聊天窗口继续"}, nil
 		}
 	}
 
