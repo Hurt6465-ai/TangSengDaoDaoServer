@@ -540,7 +540,9 @@ func (d *db) setLike(uid, feedID string, desired *bool) (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	wantLike := exists == 0
+	// New wkfeed clients always send the desired final state. If an old/empty request
+	// reaches here, prefer idempotent "set liked" over legacy toggle to avoid retry/order races.
+	wantLike := true
 	if desired != nil {
 		wantLike = *desired
 	}
@@ -795,9 +797,13 @@ func (d *db) event(uid, feedID string, req EventReq) error {
 		return err
 	}
 	if eventType == "expose" {
+		// The exact exposure aggregate lives in feed_exposures and is rebuilt into
+		// feed_recommend_stats by the maintenance job. Avoid double/approx realtime
+		// exposure counters here; per-user repeat control works from feed_exposures.
 		d.recordExposure(uid, []*FeedPost{{FeedID: feedID}})
+	} else {
+		d.bumpRecommendStats(feedID, eventType, req)
 	}
-	d.bumpRecommendStats(feedID, eventType, req)
 	delta := d.eventScoreDelta(req)
 	if delta != 0 {
 		_, _ = d.session.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score+?,0)", delta)).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
@@ -836,19 +842,6 @@ func eventDedupeWindow(eventType string) time.Duration {
 	default:
 		return 60 * time.Second
 	}
-}
-
-func (d *db) shouldScoreEvent(uid, feedID, eventType string) bool {
-	if uid == "" || feedID == "" {
-		return false
-	}
-	var recent int
-	_, err := d.session.SelectBySql(`SELECT COUNT(*) FROM feed_events WHERE uid=? AND feed_id=? AND event_type=? AND created_at>=DATE_SUB(NOW(), INTERVAL 60 SECOND)`, uid, feedID, eventType).Load(&recent)
-	if err != nil {
-		return true
-	}
-	// 当前事件已经插入，60 秒内只有 1 条代表不是刷。
-	return recent <= 1
 }
 
 func (d *db) eventScoreDelta(req EventReq) float64 {
@@ -928,14 +921,14 @@ func (d *db) bumpRecommendStats(feedID string, eventType string, req EventReq) {
         feed_id,exposure_count,exposed_users,watch_count,complete_count,skip_count,dislike_count,avg_watch_ms,avg_percent,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,NOW())
         ON DUPLICATE KEY UPDATE
+          avg_watch_ms=CASE WHEN VALUES(watch_count)>0 AND VALUES(avg_watch_ms)>0 THEN ROUND((avg_watch_ms*GREATEST(watch_count,0)+VALUES(avg_watch_ms))/GREATEST(watch_count+VALUES(watch_count),1)) ELSE avg_watch_ms END,
+          avg_percent=CASE WHEN VALUES(watch_count)>0 AND VALUES(avg_percent)>0 THEN ROUND((avg_percent*GREATEST(watch_count,0)+VALUES(avg_percent))/GREATEST(watch_count+VALUES(watch_count),1)) ELSE avg_percent END,
           exposure_count=exposure_count+VALUES(exposure_count),
           exposed_users=GREATEST(exposed_users, VALUES(exposed_users)),
           watch_count=watch_count+VALUES(watch_count),
           complete_count=complete_count+VALUES(complete_count),
           skip_count=skip_count+VALUES(skip_count),
           dislike_count=dislike_count+VALUES(dislike_count),
-          avg_watch_ms=CASE WHEN VALUES(avg_watch_ms)>0 THEN IF(avg_watch_ms=0,VALUES(avg_watch_ms),(avg_watch_ms+VALUES(avg_watch_ms))/2) ELSE avg_watch_ms END,
-          avg_percent=CASE WHEN VALUES(avg_percent)>0 THEN IF(avg_percent=0,VALUES(avg_percent),(avg_percent+VALUES(avg_percent))/2) ELSE avg_percent END,
           updated_at=NOW()`, feedID, exposureInc, exposureInc, watchInc, completeInc, skipInc, dislikeInc, watchMS, percent).Exec()
 }
 
