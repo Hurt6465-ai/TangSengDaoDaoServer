@@ -29,7 +29,10 @@ type Service struct {
 	ctx *config.Context
 	db  *db
 
-	candidateMu sync.Mutex
+	// candidateMu is kept as a fallback for very old callers, but normal candidate rebuilds
+	// use candidateLocks so different users do not block each other.
+	candidateMu    sync.Mutex
+	candidateLocks sync.Map
 }
 
 func NewService(ctx *config.Context) *Service {
@@ -181,29 +184,45 @@ func (s *Service) getCandidatePool(loginUID string, req listReq) ([]string, erro
 }
 
 func (s *Service) rebuildCandidatePoolLocked(loginUID string, req listReq) ([]string, error) {
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
-
-	key := s.candidatePoolKey(loginUID, req.SessionID)
-	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
-			var uids []string
-			if json.Unmarshal([]byte(raw), &uids) == nil && len(uids) > 0 {
-				return compactUIDs(uids, PartnerCandidatePoolSize), nil
+	return s.withCandidatePoolLock(loginUID, req.SessionID, func() ([]string, error) {
+		key := s.candidatePoolKey(loginUID, req.SessionID)
+		if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+			if raw, err := s.ctx.GetRedisConn().GetString(key); err == nil && strings.TrimSpace(raw) != "" {
+				var uids []string
+				if json.Unmarshal([]byte(raw), &uids) == nil && len(uids) > 0 {
+					return compactUIDs(uids, PartnerCandidatePoolSize), nil
+				}
 			}
 		}
-	}
-	return s.rebuildCandidatePool(loginUID, req)
+		return s.rebuildCandidatePool(loginUID, req)
+	})
 }
 
 func (s *Service) forceRebuildCandidatePoolLocked(loginUID string, req listReq) ([]string, error) {
-	s.candidateMu.Lock()
-	defer s.candidateMu.Unlock()
+	return s.withCandidatePoolLock(loginUID, req.SessionID, func() ([]string, error) {
+		if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+			_ = s.ctx.GetRedisConn().Del(s.candidatePoolKey(loginUID, req.SessionID))
+		}
+		return s.rebuildCandidatePool(loginUID, req)
+	})
+}
 
-	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		_ = s.ctx.GetRedisConn().Del(s.candidatePoolKey(loginUID, req.SessionID))
+func (s *Service) withCandidatePoolLock(loginUID, sessionID string, fn func() ([]string, error)) ([]string, error) {
+	_ = sessionID
+	// Lock by user, not globally. This prevents user A rebuilding candidates from
+	// blocking user B/C/D, while still avoiding duplicate rebuilds for the same user.
+	lockKey := "partner_candidate_lock:" + strings.TrimSpace(loginUID)
+	if lockKey == "partner_candidate_lock:" {
+		// Fallback for unexpected empty uid. This path should be rare, but keeps behavior safe.
+		s.candidateMu.Lock()
+		defer s.candidateMu.Unlock()
+		return fn()
 	}
-	return s.rebuildCandidatePool(loginUID, req)
+	value, _ := s.candidateLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
 }
 
 func (s *Service) rebuildCandidatePool(loginUID string, req listReq) ([]string, error) {
@@ -875,8 +894,18 @@ func (s *Service) runCandidateWarmupOnce() {
 }
 
 func (s *Service) touchActive(uid string, at int64, online int) {
-	if strings.TrimSpace(uid) == "" || s == nil || s.db == nil {
+	uid = strings.TrimSpace(uid)
+	if uid == "" || s == nil || s.db == nil {
 		return
+	}
+	// partner_profiles.last_active_at is used for recommendation freshness, not for
+	// message permission. It is safe to write at most once per user per minute.
+	// This keeps high-frequency 1v1 chat from creating one MySQL UPDATE per message.
+	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		allowed, err := s.ctx.GetRedisConn().SetNX("partner:active:touch:"+uid, "1", time.Minute)
+		if err == nil && !allowed {
+			return
+		}
 	}
 	go func() { _ = s.db.touchPartnerActive(uid, at, online) }()
 }
