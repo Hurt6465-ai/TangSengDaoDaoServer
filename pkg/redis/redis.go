@@ -41,6 +41,11 @@ func (rc *Conn) SetAndExpire(key string, value interface{}, expire time.Duration
 	return rc.client.Set(key, value, expire).Err()
 }
 
+// SetNX sets key only when it does not already exist. It returns true when the key is set.
+func (rc *Conn) SetNX(key string, value interface{}, expire time.Duration) (bool, error) {
+	return rc.client.SetNX(key, value, expire).Result()
+}
+
 func (rc *Conn) GetString(key string) (string, error) {
 	val, err := rc.client.Get(key).Result()
 	if err == rd.Nil {
