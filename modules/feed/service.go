@@ -131,11 +131,10 @@ func (s *Service) Report(uid, feedID string, req ReportReq) error {
 }
 
 func (s *Service) Event(uid, feedID string, req EventReq) error {
-	err := s.db.event(uid, feedID, req)
-	if err == nil {
-		s.invalidateCandidateCache(uid)
-	}
-	return err
+	// expose/watch/skip 等高频行为事件只记录行为，不要每次都清推荐候选缓存。
+	// 否则用户每滑动一次就会导致下一次推荐重新查库，Redis 候选池基本失效。
+	// 发布、关注/取关、举报、评论、点赞等低频强事件仍在各自入口里清缓存。
+	return s.db.event(uid, feedID, req)
 }
 
 func (s *Service) Follow(uid, targetUID string) error {
