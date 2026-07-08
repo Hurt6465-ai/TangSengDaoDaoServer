@@ -3,7 +3,9 @@ package db
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,9 +21,20 @@ func NewMySQL(addr string, sqlDir string, migration bool) *dbr.Session {
 	if err != nil {
 		panic(err)
 	}
-	conn.SetMaxOpenConns(2000)
-	conn.SetMaxIdleConns(1000)
-	conn.SetConnMaxLifetime(time.Second * 60 * 60 * 4) //mysql 默认超时时间为 60*60*8=28800 SetConnMaxLifetime设置为小于数据库超时时间即可
+	maxOpenConns := envInt("TS_DD_MYSQL_MAX_OPEN_CONNS", 100)
+	maxIdleConns := envInt("TS_DD_MYSQL_MAX_IDLE_CONNS", 30)
+	if maxOpenConns <= 0 {
+		maxOpenConns = 100
+	}
+	if maxIdleConns < 0 {
+		maxIdleConns = 0
+	}
+	if maxIdleConns > maxOpenConns {
+		maxIdleConns = maxOpenConns
+	}
+	conn.SetMaxOpenConns(maxOpenConns)
+	conn.SetMaxIdleConns(maxIdleConns)
+	conn.SetConnMaxLifetime(time.Second * 60 * 60 * 4) // mysql 默认超时时间为 60*60*8=28800，SetConnMaxLifetime 设置为小于数据库超时时间即可
 	conn.Ping()
 
 	session := conn.NewSession(nil)
@@ -35,6 +48,18 @@ func NewMySQL(addr string, sqlDir string, migration bool) *dbr.Session {
 	}
 
 	return session
+}
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 func Migration(sqlDir string, session *dbr.Session) error {
