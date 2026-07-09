@@ -249,6 +249,13 @@ func (d *db) softDelete(roomID string) error {
 }
 
 func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRoom, error) {
+	return d.updateLastReplyWithCount(roomID, update, 1)
+}
+
+func (d *db) updateLastReplyWithCount(roomID string, update *MessageWebhookReq, increment int) (*TopicRoom, error) {
+	if increment <= 0 {
+		increment = 1
+	}
 	room, err := d.get(roomID)
 	if err != nil {
 		return nil, err
@@ -296,11 +303,11 @@ func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRo
 		Set("last_reply_text", text).
 		Set("last_reply_type", update.MessageType).
 		Set("last_reply_at", ts).
-		Set("reply_count", dbr.Expr("reply_count+1")).
+		Set("reply_count", dbr.Expr("reply_count+?", increment)).
 		Set("reply_users_json", string(usersJSON)).
 		Set("expire_at", expireAt).
-		Set("hot", dbr.Expr("IF(reply_count+1>=10,1,hot)")).
-		Set("hot_until", dbr.Expr("IF(reply_count+1>=10,?,hot_until)", hotUntil)).
+		Set("hot", dbr.Expr("IF(reply_count+?>=10,1,hot)", increment)).
+		Set("hot_until", dbr.Expr("IF(reply_count+?>=10,?,hot_until)", increment, hotUntil)).
 		Set("updated_at", dbr.Expr("NOW()")).
 		Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).Exec()
 	if err != nil {
