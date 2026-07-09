@@ -19,6 +19,13 @@ type Service struct {
 	TTL               time.Duration
 	topicChannelMu    sync.RWMutex
 	topicChannelCache map[string]topicChannelCacheItem
+	lastReplyMu       sync.Mutex
+	lastReplyPending  map[string]*lastReplyFlushItem
+}
+
+type lastReplyFlushItem struct {
+	Req   *MessageWebhookReq
+	Count int
 }
 
 type topicChannelCacheItem struct {
@@ -26,12 +33,18 @@ type topicChannelCacheItem struct {
 	ExpiresAt int64
 }
 
-const topicChannelCacheTTL = 5 * time.Minute
+const (
+	topicChannelCacheTTL             = 5 * time.Minute
+	topicLastReplyFlushInterval      = 3 * time.Second
+	topicRoomDeletedNotifyBatchSize  = 100
+	topicRoomDeletedNotifyBatchSleep = 30 * time.Millisecond
+)
 
 func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL, topicChannelCache: map[string]topicChannelCacheItem{}}
+	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL, topicChannelCache: map[string]topicChannelCacheItem{}, lastReplyPending: map[string]*lastReplyFlushItem{}}
 	// 事件驱动更新：避免话题有回复但 expire_at 不续期，导致“正在聊的话题 3 小时后消失”。
 	ctx.AddMessagesListener(svc.listenerMessages)
+	svc.startLastReplyFlushLoop()
 	return svc
 }
 
@@ -152,7 +165,8 @@ func (s *Service) MessageWebhook(req *MessageWebhookReq) (*TopicRoom, error) {
 	if roomID == "" {
 		return nil, errors.New("缺少 room_id/channel_id")
 	}
-	return s.db.updateLastReply(roomID, req)
+	s.queueLastReply(roomID, req)
+	return s.db.get(roomID)
 }
 
 func (s *Service) CleanupExpired(limit uint64) (int, error) {
@@ -231,7 +245,7 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
-		_, _ = s.db.updateLastReply(msg.ChannelID, &MessageWebhookReq{
+		s.queueLastReply(msg.ChannelID, &MessageWebhookReq{
 			ChannelID:       msg.ChannelID,
 			FromUID:         user.UID,
 			FromName:        user.Name,
@@ -263,6 +277,56 @@ func messagePreview(msg *config.MessageResp) (string, string) {
 		}
 	}
 	return previewText(msgType), msgType
+}
+
+func (s *Service) startLastReplyFlushLoop() {
+	go func() {
+		ticker := time.NewTicker(topicLastReplyFlushInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.flushPendingLastReplies()
+		}
+	}()
+}
+
+func (s *Service) queueLastReply(roomID string, req *MessageWebhookReq) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" || req == nil {
+		return
+	}
+	cloned := *req
+	if cloned.RoomID == "" {
+		cloned.RoomID = roomID
+	}
+	if cloned.ChannelID == "" {
+		cloned.ChannelID = roomID
+	}
+	s.lastReplyMu.Lock()
+	if s.lastReplyPending == nil {
+		s.lastReplyPending = map[string]*lastReplyFlushItem{}
+	}
+	item := s.lastReplyPending[roomID]
+	if item == nil {
+		s.lastReplyPending[roomID] = &lastReplyFlushItem{Req: &cloned, Count: 1}
+	} else {
+		item.Req = &cloned
+		item.Count++
+	}
+	s.lastReplyMu.Unlock()
+}
+
+func (s *Service) flushPendingLastReplies() {
+	s.lastReplyMu.Lock()
+	pending := s.lastReplyPending
+	s.lastReplyPending = map[string]*lastReplyFlushItem{}
+	s.lastReplyMu.Unlock()
+
+	for roomID, item := range pending {
+		if item == nil || item.Req == nil {
+			continue
+		}
+		_, _ = s.db.updateLastReplyWithCount(roomID, item.Req, item.Count)
+	}
 }
 
 func (s *Service) setTopicChannelCache(channelID string, ok bool) {
@@ -338,6 +402,7 @@ func (s *Service) topicRoomMemberUIDs(room *TopicRoom) []string {
 }
 
 func (s *Service) notifyTopicRoomDeleted(channelID string, subscribers []string, reason string) {
+	channelID = strings.TrimSpace(channelID)
 	if channelID == "" {
 		return
 	}
@@ -348,7 +413,12 @@ func (s *Service) notifyTopicRoomDeleted(channelID string, subscribers []string,
 	if reason == "" {
 		reason = "deleted"
 	}
-	for _, uid := range uids {
+	uidCopy := append([]string(nil), uids...)
+	go s.sendTopicRoomDeletedBatches(channelID, uidCopy, reason)
+}
+
+func (s *Service) sendTopicRoomDeletedBatches(channelID string, uids []string, reason string) {
+	for i, uid := range uids {
 		_ = s.ctx.SendCMD(config.MsgCMDReq{
 			ChannelID:   uid,
 			ChannelType: common.ChannelTypePerson.Uint8(),
@@ -360,6 +430,9 @@ func (s *Service) notifyTopicRoomDeleted(channelID string, subscribers []string,
 				"reason":       reason,
 			},
 		})
+		if (i+1)%topicRoomDeletedNotifyBatchSize == 0 {
+			time.Sleep(topicRoomDeletedNotifyBatchSleep)
+		}
 	}
 }
 
