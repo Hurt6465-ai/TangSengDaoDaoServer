@@ -140,6 +140,10 @@ smsCode: "123456" # 测试短信验证码， 如果不为空，则短信验证�
 #  eventPoolSize: 100 # 事件池大小
 
 # #################### 第三方登录 ####################
+# Android 与后端必须填写同一个 Web OAuth Client ID；不是 Android Client ID。
+google:
+  webClientID: "" # 示例：123456789012-xxxxx.apps.googleusercontent.com
+
 #gitee:
 #  oauthURL: "https://gitee.com/oauth/authorize" # gitee oauth地址
 #  clientID: ""  #  gitee client id
