@@ -902,9 +902,20 @@ func (s *Service) touchActive(uid string, at int64, online int) {
 	// message permission. It is safe to write at most once per user per minute.
 	// This keeps high-frequency 1v1 chat from creating one MySQL UPDATE per message.
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		allowed, err := s.ctx.GetRedisConn().SetNX("partner:active:touch:"+uid, "1", time.Minute)
-		if err == nil && !allowed {
-			return
+		// ServerLib 的 Redis Conn 没有 SetNX。使用原子 INCR + EXPIRE
+		// 实现一分钟去重：第一个请求负责更新，后续请求直接返回。
+		// Redis 异常时采用 fail-open，仍允许本次 MySQL 活跃时间更新。
+		conn := s.ctx.GetRedisConn()
+		key := "partner:active:touch:" + uid
+		count, err := conn.Incr(key)
+		if err == nil {
+			if count > 1 {
+				return
+			}
+			if err = conn.Expire(key, time.Minute); err != nil {
+				// 避免 INCR 成功但 EXPIRE 失败后形成永久 key。
+				_ = conn.Del(key)
+			}
 		}
 	}
 	go func() { _ = s.db.touchPartnerActive(uid, at, online) }()
