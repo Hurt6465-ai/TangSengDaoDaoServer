@@ -129,7 +129,11 @@ avatar:
 #  inlineQueryTimeout: 10s # 机器人inline query超时时间
 #  eventPoolSize: 100 # 事件池大小
 
-# #################### 第三方登录 ####################   
+# #################### 第三方登录 ####################
+# Android 与后端必须填写同一个 Web OAuth Client ID；不是 Android Client ID。
+google:
+  webClientID: "" # 示例：123456789012-xxxxx.apps.googleusercontent.com
+   
 #gitee:   
 #  oauthURL: "https://gitee.com/oauth/authorize" # gitee oauth地址
 #  clientID: ""  #  gitee client id
