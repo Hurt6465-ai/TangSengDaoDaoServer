@@ -110,6 +110,9 @@ func New(ctx *config.Context) *User {
 	if err := u.db.ensureProfileColumns(); err != nil {
 		u.Error("自动检查用户资料字段失败", zap.Error(err))
 	}
+	if err := u.db.ensureThirdIdentityTable(); err != nil {
+		u.Error("自动检查第三方登录身份表失败", zap.Error(err))
+	}
 	u.updateSystemUserToken()
 	u.AddSystemUids()
 	source.SetUserProvider(u)
@@ -200,6 +203,8 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// gitee
 		v.GET("/user/gitee", u.gitee)            // gitee认证页面
 		v.GET("/user/oauth/gitee", u.giteeOAuth) // gitee登录
+		// google（Android Credential Manager 获取 ID Token，服务端校验）
+		v.POST("/user/oauth/google", u.googleLogin)
 
 	}
 
@@ -2302,6 +2307,11 @@ func (u *User) destroyAccount(c *wkhttp.Context) {
 		c.ResponseError(errors.New("注销账号错误"))
 		return
 	}
+	if err = u.db.deleteThirdIdentitiesByUID(loginUID); err != nil {
+		u.Error("删除账号第三方登录身份错误", zap.Error(err))
+		c.ResponseError(errors.New("删除第三方登录身份错误"))
+		return
+	}
 	err = u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
 	if err != nil {
 		u.Error("退出登陆设备失败", zap.Error(err))
@@ -2768,12 +2778,10 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 	}()
 	publicIP := util.GetClientPublicIP(c.Request)
 	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, func() error {
-		err := tx.Commit()
-		if err != nil {
-			tx.Rollback()
-			u.Error("数据库事物提交失败", zap.Error(err))
-			c.ResponseError(errors.New("数据库事物提交失败"))
-			return nil
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			u.Error("数据库事务提交失败", zap.Error(err))
+			return err
 		}
 		return nil
 	})
@@ -2821,6 +2829,7 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
 	userModel.Phone = createUser.Phone
 	userModel.Zone = createUser.Zone
+	userModel.Email = strings.TrimSpace(createUser.Email)
 	if createUser.Phone != "" {
 		userModel.Username = fmt.Sprintf("%s%s", createUser.Zone, createUser.Phone)
 	}
@@ -2897,8 +2906,17 @@ func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUs
 		return nil, err
 	}
 
+	if createUser.BeforeCommit != nil {
+		if err = createUser.BeforeCommit(tx); err != nil {
+			u.Error("执行用户创建提交前回调失败", zap.Error(err))
+			return nil, err
+		}
+	}
 	if commitCallback != nil {
-		commitCallback()
+		if err = commitCallback(); err != nil {
+			u.Error("数据库事务提交失败", zap.Error(err))
+			return nil, err
+		}
 	}
 	u.ctx.EventCommit(eventID)
 	token := util.GenerUUID()
@@ -2936,6 +2954,7 @@ type createUserModel struct {
 	Name           string
 	Zone           string
 	Phone          string
+	Email          string
 	Sex            int
 	Password       string
 	WXOpenid       string
@@ -2946,6 +2965,7 @@ type createUserModel struct {
 	Flag           int
 	IsUploadAvatar int
 	Device         *deviceReq
+	BeforeCommit   func(tx *dbr.Tx) error
 }
 
 // 重置登录密码
