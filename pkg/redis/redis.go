@@ -414,3 +414,123 @@ func (rc *Conn) BRPoplpush(source string, destination string, timeout time.Durat
 func (rc *Conn) LPUSH(key string, values ...interface{}) (int64, error) {
 	return rc.client.LPush(key, values...).Result()
 }
+
+// RPUSH appends values to the tail of a Redis list.
+func (rc *Conn) RPUSH(key string, values ...interface{}) (int64, error) {
+	return rc.client.RPush(key, values...).Result()
+}
+
+// CompareAndDelete deletes key only when its current value equals expected.
+// The compare and delete operation is atomic and safe for releasing token-based locks.
+func (rc *Conn) CompareAndDelete(key, expected string) (bool, error) {
+	const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
+	result, err := rc.client.Eval(script, []string{key}, expected).Int64()
+	if err != nil {
+		return false, err
+	}
+	return result > 0, nil
+}
+
+// HIncrByBatch increments multiple hash fields in a single Redis pipeline round trip.
+func (rc *Conn) HIncrByBatch(key string, fields []string, increment int64) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	pipe := rc.client.Pipeline()
+	for _, field := range fields {
+		if field == "" {
+			continue
+		}
+		pipe.HIncrBy(key, field, increment)
+	}
+	_, err := pipe.Exec()
+	return err
+}
+
+// HMGetMap returns only existing hash fields and keeps the request to one Redis round trip.
+func (rc *Conn) HMGetMap(key string, fields []string) (map[string]string, error) {
+	out := make(map[string]string, len(fields))
+	if len(fields) == 0 {
+		return out, nil
+	}
+	values, err := rc.client.HMGet(key, fields...).Result()
+	if err != nil && err != rd.Nil {
+		return nil, err
+	}
+	for i, value := range values {
+		if value == nil || i >= len(fields) {
+			continue
+		}
+		switch v := value.(type) {
+		case string:
+			out[fields[i]] = v
+		case []byte:
+			out[fields[i]] = string(v)
+		}
+	}
+	return out, nil
+}
+
+// ZRevRangeByScore returns sorted-set members ordered from highest score to lowest.
+func (rc *Conn) ZRevRangeByScore(key string, zrangeBy rd.ZRangeBy) ([]string, error) {
+	val, err := rc.client.ZRevRangeByScore(key, zrangeBy).Result()
+	if err == rd.Nil {
+		return nil, nil
+	}
+	return val, err
+}
+
+// EvalInt executes a Lua script and converts its result to int64.
+func (rc *Conn) EvalInt(script string, keys []string, args ...interface{}) (int64, error) {
+	return rc.client.Eval(script, keys, args...).Int64()
+}
+
+// ZRemFromKeys removes one member from multiple sorted sets in one pipeline round trip.
+func (rc *Conn) ZRemFromKeys(keys []string, member string) error {
+	if len(keys) == 0 || member == "" {
+		return nil
+	}
+	pipe := rc.client.Pipeline()
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		pipe.ZRem(key, member)
+	}
+	_, err := pipe.Exec()
+	return err
+}
+
+// ZCard returns the number of members in a sorted set.
+func (rc *Conn) ZCard(key string) (int64, error) {
+	return rc.client.ZCard(key).Result()
+}
+
+// ZScores gets multiple sorted-set scores in one pipeline round trip.
+func (rc *Conn) ZScores(key string, members []string) (map[string]float64, error) {
+	out := make(map[string]float64, len(members))
+	if len(members) == 0 {
+		return out, nil
+	}
+	pipe := rc.client.Pipeline()
+	cmds := make([]*rd.FloatCmd, 0, len(members))
+	validMembers := make([]string, 0, len(members))
+	for _, member := range members {
+		if member == "" {
+			continue
+		}
+		cmds = append(cmds, pipe.ZScore(key, member))
+		validMembers = append(validMembers, member)
+	}
+	_, err := pipe.Exec()
+	if err != nil && err != rd.Nil {
+		return nil, err
+	}
+	for i := range cmds {
+		score, scoreErr := cmds[i].Result()
+		if scoreErr == nil && i < len(validMembers) {
+			out[validMembers[i]] = score
+		}
+	}
+	return out, nil
+}
