@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	appredis "github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/redisx"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
@@ -32,8 +33,9 @@ var (
 )
 
 type Service struct {
-	ctx *config.Context
-	db  *db
+	ctx    *config.Context
+	db     *db
+	redisx *appredis.Client
 
 	// candidateMu is kept as a fallback for very old callers, but normal candidate rebuilds
 	// use candidateLocks so different users do not block each other.
@@ -42,7 +44,7 @@ type Service struct {
 }
 
 func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx)}
+	svc := &Service{ctx: ctx, db: newDB(ctx), redisx: appredis.FromContext(ctx)}
 	ctx.AddMessagesListener(svc.listenerMessages)
 	svc.startBackgroundJobs()
 	return svc
@@ -734,7 +736,10 @@ redis.call('ZADD', key, now, member)
 redis.call('PEXPIRE', key, 120000)
 return 1`
 	key := "partner:greeting:rate:{" + uid + "}"
-	result, err := s.ctx.GetRedisConn().EvalInt(script, []string{key}, nowMS, fmt.Sprintf("%d", time.Now().UnixNano()))
+	if s.redisx == nil {
+		return false
+	}
+	result, err := s.redisx.EvalInt(script, []string{key}, nowMS, fmt.Sprintf("%d", time.Now().UnixNano()))
 	if err != nil {
 		// 新建陌生关系属于安全边界；Redis异常时拒绝本次操作，避免短时限流被绕过。
 		return false
