@@ -19,7 +19,7 @@ const (
 	LocationTTLMillis = int64(30 * 24 * time.Hour / time.Millisecond)
 
 	GreetingHourLimit          = 0 // 0 表示不限制每小时次数，仅保留返回字段兼容旧前端
-	GreetingDayLimit           = 8
+	GreetingDayLimit           = 10
 	GreetingSameTargetCooldown = 7 * 24 * time.Hour
 	GreetingMaxTextLen         = 80
 

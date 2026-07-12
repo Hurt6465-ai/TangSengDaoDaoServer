@@ -1,9 +1,14 @@
 package partners
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +28,7 @@ var (
 	ErrGreetingHourLimit   = errors.New("打招呼太频繁，请稍后再试")
 	ErrGreetingDayLimit    = errors.New("今天打招呼次数已用完")
 	ErrGreetingDuplicate   = errors.New("已经打过招呼，请过几天再试")
+	ErrPendingMessageLimit = errors.New("对方还没回复，最多只能发送3条消息")
 )
 
 type Service struct {
@@ -617,43 +623,28 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if contact.RequesterUID != uid {
 				return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}), nil
 			}
-			allowed, nextAt, msg := canSendPendingGreeting(contact.RequesterMsgCount, contact.LastMsgAt, now)
-			if !allowed {
-				return s.fillGreetingQuota(uid, &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, NextAllowedAt: nextAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), ErrGreetingDuplicate
+			// If the first greeting had an unknown/failed HTTP result, reconcile and
+			// retry it with the same WuKong client_msg_no. This cannot create a second
+			// visible message because both attempts use the same stable identifier.
+			if contact.RequesterMsgCount <= 1 {
+				if delivery, deliveryErr := s.db.greetingDelivery(uid, toUID); deliveryErr != nil {
+					return nil, deliveryErr
+				} else if delivery != nil && delivery.SendStatus != 1 {
+					if retryErr := s.deliverGreetingRow(delivery); retryErr != nil {
+						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "招呼消息投递确认中，请稍后重试"}), retryErr
+					}
+				}
 			}
-			stats, err := s.db.greetingStats(uid, toUID, now)
-			if err != nil {
-				return nil, err
+			// Existing pending relationships must never send the second or third message
+			// through this endpoint. They go exclusively through /v1/message/send so
+			// client_msg_no, payload hash and pre-delivery counting share one state machine.
+			status := 200
+			msg := "请在聊天窗口继续发送，等待对方回复前最多3条消息"
+			if contact.RequesterMsgCount >= MaxPendingGreetingMessages {
+				status = 429
+				msg = ErrPendingMessageLimit.Error()
 			}
-			if stats.DayCount >= GreetingDayLimit {
-				return nil, ErrGreetingDayLimit
-			}
-			text := normalizeGreetingText(req.Text)
-			source := normalizeGreetingSource(req.Source)
-			resp, err := s.db.recordGreeting(uid, toUID, text, source)
-			if err != nil {
-				return nil, err
-			}
-			count, err := s.db.incrementPendingRequesterMsgCount(uid, toUID, resp.LastGreetAt)
-			if err != nil {
-				return nil, err
-			}
-			resp.RequesterMsgCount = count
-			resp.MaxGreetingCount = MaxPendingGreetingMessages
-			if err := s.addPartnerWhitelist(uid, toUID); err != nil {
-				return nil, err
-			}
-			if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
-				_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 2, err.Error())
-				_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
-				_ = s.removePartnerSenderWhitelist(uid, toUID)
-				return nil, err
-			}
-			_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 1, "")
-			if count >= MaxPendingGreetingMessages {
-				_ = s.removePartnerSenderWhitelist(uid, toUID)
-			}
-			return s.fillGreetingQuota(uid, resp), nil
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: status, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), nil
 		}
 	}
 
@@ -669,28 +660,86 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
 		return s.fillGreetingQuota(uid, resp), ErrGreetingDuplicate
 	}
+	if !s.allowNewGreetingRate(uid, now) {
+		return nil, ErrGreetingHourLimit
+	}
+	reservedDaily, _, err := s.db.reserveGreetingDailyTarget(uid, toUID, now, GreetingDayLimit)
+	if err != nil {
+		return nil, err
+	}
+	if !reservedDaily {
+		// The same target was already reserved in this recommendation day. This also
+		// closes the race where two first-greeting requests both observed no contact.
+		// Failed sends remove the daily target, so an existing row must not send again.
+		return nil, ErrGreetingDuplicate
+	}
+	releaseDaily := func() {
+		if reservedDaily {
+			_ = s.db.releaseGreetingDailyTarget(uid, toUID, now)
+		}
+	}
 	text := normalizeGreetingText(req.Text)
 	source := normalizeGreetingSource(req.Source)
 	resp, err := s.db.recordGreeting(uid, toUID, text, source)
 	if err != nil {
+		releaseDaily()
 		return nil, err
 	}
 	if err := s.db.ensurePendingContact(uid, toUID, resp.LastGreetAt); err != nil {
+		_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 2, err.Error())
+		releaseDaily()
 		return nil, err
 	}
 	resp.RequesterMsgCount = 1
 	resp.MaxGreetingCount = MaxPendingGreetingMessages
-	if err := s.addPartnerWhitelist(uid, toUID); err != nil {
+	// Permission changes are committed to partner_im_permission_outbox together with
+	// the pending relationship. Try immediately for low latency; the background worker
+	// retries any transient WuKongIM failure.
+	s.flushPartnerIMPermissionOutbox()
+	delivery := &greetingDeliveryRow{UID: uid, ToUID: toUID, Text: resp.Text, Source: source, LastGreetAt: resp.LastGreetAt, SendStatus: 0}
+	if err := s.deliverGreetingRow(delivery); err != nil {
+		if isUncertainGreetingSendError(err) {
+			// Unknown delivery results keep the relation and daily quota reserved. A
+			// retry/background reconciliation uses the same stable IM client_msg_no.
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼消息投递确认中，请稍后重试"}), err
+		}
+		// Permission setup errors are retryable and must keep the pending relation;
+		// a definite IM 4xx is safe to roll back.
+		if isDefiniteGreetingSendError(err) {
+			_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
+			releaseDaily()
+		}
 		return nil, err
 	}
-	if err := s.sendGreetingMessage(uid, toUID, resp.Text, source, resp.LastGreetAt, resp.RequesterMsgCount); err != nil {
-		_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 2, err.Error())
-		_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
-		_ = s.removePartnerSenderWhitelist(uid, toUID)
-		return nil, err
-	}
-	_ = s.db.markGreetingSendStatus(uid, toUID, resp.LastGreetAt, 1, "")
 	return s.fillGreetingQuota(uid, resp), nil
+}
+
+func (s *Service) allowNewGreetingRate(uid string, nowMS int64) bool {
+	if uid == "" || s == nil || s.ctx == nil || s.ctx.GetRedisConn() == nil {
+		return false
+	}
+	const script = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local member = ARGV[2]
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - 60000)
+local last = redis.call('ZREVRANGE', key, 0, 0, 'WITHSCORES')
+if #last >= 2 and now - tonumber(last[2]) < 10000 then
+  return -1
+end
+if redis.call('ZCARD', key) >= 3 then
+  return -2
+end
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, 120000)
+return 1`
+	key := "partner:greeting:rate:{" + uid + "}"
+	result, err := s.ctx.GetRedisConn().EvalInt(script, []string{key}, nowMS, fmt.Sprintf("%d", time.Now().UnixNano()))
+	if err != nil {
+		// 新建陌生关系属于安全边界；Redis异常时拒绝本次操作，避免短时限流被绕过。
+		return false
+	}
+	return result == 1
 }
 
 func normalizeGreetingSource(source string) string {
@@ -702,15 +751,6 @@ func normalizeGreetingSource(source string) string {
 		source = string([]rune(source)[:32])
 	}
 	return source
-}
-
-func canSendPendingGreeting(count int, lastMsgAt int64, now int64) (bool, int64, string) {
-	// 产品规则：对方未回复前，发起人最多可以连续打 3 条招呼。
-	// 这里不再用 30 分钟/24 小时冷却卡第 2、3 条，否则实际体验会像“只能发 1 条”。
-	if count >= MaxPendingGreetingMessages {
-		return false, 0, "对方还没回复，最多只能打招呼3次"
-	}
-	return true, 0, ""
 }
 
 func normalizeGreetingText(text string) string {
@@ -755,11 +795,12 @@ func (s *Service) addPartnerWhitelist(uid, toUID string) error {
 	if uid == "" || toUID == "" || uid == toUID {
 		return nil
 	}
-	// 待回复阶段需要两种能力：
-	// 1. 对方可以直接回复这条招呼。
-	// 2. 发起人从消息列表进入聊天页后，最多还能补发 2 条普通私信。
-	// 超过 3 条后，listenerMessages 会移除发起人继续发送到对方个人频道的白名单。
-	return s.addBidirectionalPartnerWhitelist(uid, toUID)
+	// pending 阶段只允许接收方直接回复发起方。
+	// 发起方的第 2、3 条消息必须经过 /v1/message/send，在悟空IM投递前原子校验。
+	return s.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+		UIDs:       []string{toUID},
+	})
 }
 
 func (s *Service) removePartnerSenderWhitelist(uid, toUID string) error {
@@ -772,25 +813,122 @@ func (s *Service) removePartnerSenderWhitelist(uid, toUID string) error {
 	})
 }
 
-func (s *Service) addBidirectionalPartnerWhitelist(uid, toUID string) error {
-	if uid == "" || toUID == "" || uid == toUID {
-		return nil
+type stableGreetingSendReq struct {
+	Header      config.MsgHeader `json:"header"`
+	FromUID     string           `json:"from_uid"`
+	ChannelID   string           `json:"channel_id"`
+	ChannelType uint8            `json:"channel_type"`
+	Payload     []byte           `json:"payload"`
+	ClientMsgNo string           `json:"client_msg_no"`
+}
+
+type stableGreetingSendResp struct {
+	MessageID   int64  `json:"message_id"`
+	MessageSeq  uint32 `json:"message_seq"`
+	ClientMsgNo string `json:"client_msg_no"`
+	Data        struct {
+		MessageID   int64  `json:"message_id"`
+		MessageSeq  uint32 `json:"message_seq"`
+		ClientMsgNo string `json:"client_msg_no"`
+	} `json:"data"`
+}
+
+type greetingSendError struct {
+	uncertain bool
+	err       error
+}
+
+func (e *greetingSendError) Error() string {
+	if e == nil || e.err == nil {
+		return "IM发送失败"
 	}
-	if err := s.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
-		ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
-		UIDs:       []string{toUID},
-	}); err != nil {
+	return e.err.Error()
+}
+
+func isUncertainGreetingSendError(err error) bool {
+	var target *greetingSendError
+	return errors.As(err, &target) && target.uncertain
+}
+
+func isDefiniteGreetingSendError(err error) bool {
+	var target *greetingSendError
+	return errors.As(err, &target) && !target.uncertain
+}
+
+func greetingIMClientMsgNo(uid, toUID string, at int64) string {
+	sum := sha256.Sum256([]byte(uid + "\x00" + toUID + "\x00" + strconv.FormatInt(at, 10)))
+	return "partner-greeting:" + hex.EncodeToString(sum[:])[:52]
+}
+
+func (s *Service) greetingAlreadyDelivered(uid, toUID string, at int64) (bool, error) {
+	clientNo := greetingIMClientMsgNo(uid, toUID, at)
+	resp, err := s.ctx.IMSearchMessages(&config.MsgSearchReq{LoginUID: uid, ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8(), ClientMsgNos: []string{clientNo}})
+	if err != nil {
+		return false, err
+	}
+	return resp != nil && len(resp.Messages) > 0, nil
+}
+
+func (s *Service) ensurePendingPermissionsNow(requesterUID, receiverUID string) error {
+	if requesterUID == "" || receiverUID == "" || requesterUID == receiverUID {
+		return errors.New("无效的语伴临时会话")
+	}
+	// The critical direction is removed first: while pending, the requester must
+	// never be able to send directly into the receiver's personal channel.
+	if err := s.removePartnerSenderWhitelist(requesterUID, receiverUID); err != nil {
 		return err
 	}
-	return s.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
-		ChannelReq: config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
-		UIDs:       []string{uid},
-	})
+	// The receiver must be allowed to reply to the requester's channel.
+	if err := s.addPartnerWhitelist(requesterUID, receiverUID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) deliverGreetingRow(row *greetingDeliveryRow) error {
+	if row == nil || row.UID == "" || row.ToUID == "" || row.LastGreetAt <= 0 {
+		return errors.New("无效的招呼投递记录")
+	}
+	if err := s.ensurePendingPermissionsNow(row.UID, row.ToUID); err != nil {
+		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 0, err.Error())
+		return err
+	}
+	delivered, searchErr := s.greetingAlreadyDelivered(row.UID, row.ToUID, row.LastGreetAt)
+	if searchErr != nil {
+		err := &greetingSendError{uncertain: true, err: searchErr}
+		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 0, err.Error())
+		return err
+	}
+	if delivered {
+		return s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 1, "")
+	}
+	if err := s.sendGreetingMessage(row.UID, row.ToUID, row.Text, row.Source, row.LastGreetAt, 1); err != nil {
+		status := 2
+		if isUncertainGreetingSendError(err) {
+			status = 0
+		}
+		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, status, err.Error())
+		return err
+	}
+	return s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 1, "")
+}
+
+func (s *Service) reconcileGreetingDeliveries() {
+	rows, err := s.db.pendingGreetingDeliveries(100)
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		if err := s.deliverGreetingRow(row); err != nil && isDefiniteGreetingSendError(err) {
+			_ = s.db.rollbackPendingGreetingSend(row.UID, row.ToUID, row.LastGreetAt)
+			_ = s.db.releaseGreetingDailyTarget(row.UID, row.ToUID, row.LastGreetAt)
+		}
+	}
 }
 
 func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64, requesterMsgCount int) error {
 	if uid == "" || toUID == "" || text == "" {
-		return nil
+		return errors.New("招呼消息参数不能为空")
 	}
 	payload := []byte(util.ToJson(map[string]interface{}{
 		"content":                text,
@@ -803,15 +941,42 @@ func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64,
 		"max_greeting_count":     MaxPendingGreetingMessages,
 		"created_at":             at,
 	}))
-	return s.ctx.SendMessage(&config.MsgSendReq{
-		FromUID:     uid,
-		ChannelID:   toUID,
-		ChannelType: common.ChannelTypePerson.Uint8(),
-		Payload:     payload,
-		Header: config.MsgHeader{
-			RedDot: 1,
-		},
-	})
+	clientNo := greetingIMClientMsgNo(uid, toUID, at)
+	body, err := json.Marshal(stableGreetingSendReq{Header: config.MsgHeader{RedDot: 1}, FromUID: uid, ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8(), Payload: payload, ClientMsgNo: clientNo})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(s.ctx.GetConfig().WuKongIM.APIURL, "/")+"/message/send", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return &greetingSendError{uncertain: true, err: err}
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return &greetingSendError{uncertain: true, err: readErr}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(string(data))
+		if len(message) > 300 {
+			message = message[:300]
+		}
+		lower := strings.ToLower(message)
+		uncertain := resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooManyRequests || strings.Contains(lower, "duplicate") || strings.Contains(lower, "client_msg_no") || strings.Contains(message, "重复") || strings.Contains(message, "已存在")
+		return &greetingSendError{uncertain: uncertain, err: fmt.Errorf("IM服务返回状态[%d]: %s", resp.StatusCode, message)}
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	var parsed stableGreetingSendResp
+	if err = json.Unmarshal(data, &parsed); err != nil {
+		return &greetingSendError{uncertain: true, err: err}
+	}
+	return nil
 }
 
 func (s *Service) listenerMessages(messages []*config.MessageResp) {
@@ -834,10 +999,14 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 
 		contact, _ := s.db.getPartnerContact(msg.FromUID, msg.ChannelID)
 		if contact != nil && contact.Status == PartnerContactStatusPending && contact.RequesterUID == msg.FromUID {
+			if businessClientMsgNo := partnerPendingGatewayClientMsgNo(msg); businessClientMsgNo != "" {
+				// /v1/message/send 已在投递前完成原子计数。Webhook 只做投递确认，不能再次+1。
+				_ = s.db.markPendingMessageDelivered(msg.FromUID, businessClientMsgNo, msg.ClientMsgNo, msg.MessageID, createdAt)
+				continue
+			}
+			// 旧客户端或异常白名单穿透的兜底。正常新客户端不会走到这里。
 			count, err := s.db.incrementPendingRequesterMsgCount(msg.FromUID, msg.ChannelID, createdAt)
 			if err == nil && count >= MaxPendingGreetingMessages {
-				// 第 1 条来自语伴页随机招呼，第 2/3 条允许在聊天窗口补发。
-				// 达到 3 条后，保留对方回复能力，但移除发起人继续追发的白名单。
 				_ = s.removePartnerSenderWhitelist(msg.FromUID, msg.ChannelID)
 			}
 			continue
@@ -845,9 +1014,24 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 
 		activated, _ := s.db.activateContactOnReply(msg.FromUID, msg.ChannelID, createdAt)
 		if activated {
-			_ = s.addBidirectionalPartnerWhitelist(msg.FromUID, msg.ChannelID)
+			s.flushPartnerIMPermissionOutbox()
 		}
 	}
+}
+
+func partnerPendingGatewayClientMsgNo(msg *config.MessageResp) string {
+	if msg == nil {
+		return ""
+	}
+	payload, err := msg.GetPayloadMap()
+	if err != nil || payload == nil || fmt.Sprint(payload["partner_pending_gateway"]) != "1" {
+		return ""
+	}
+	value := strings.TrimSpace(fmt.Sprint(payload["partner_client_msg_no"]))
+	if value == "" || len(value) > 100 {
+		return ""
+	}
+	return value
 }
 
 func isPartnerGreetingPayload(msg *config.MessageResp) bool {
@@ -873,15 +1057,80 @@ func (s *Service) globalCandidatePoolKey() string {
 
 func (s *Service) startBackgroundJobs() {
 	go func() {
-		// 启动后先小延迟，让迁移和主服务初始化完成。
 		time.Sleep(3 * time.Second)
+		s.reconcilePendingWhitelists()
+		s.flushPartnerIMPermissionOutbox()
 		s.runCandidateWarmupOnce()
-		ticker := time.NewTicker(PartnerGlobalPoolRefresh)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.runCandidateWarmupOnce()
+		warmup := time.NewTicker(PartnerGlobalPoolRefresh)
+		permissions := time.NewTicker(2 * time.Second)
+		greetingDelivery := time.NewTicker(5 * time.Second)
+		defer warmup.Stop()
+		defer permissions.Stop()
+		defer greetingDelivery.Stop()
+		for {
+			select {
+			case <-warmup.C:
+				s.runCandidateWarmupOnce()
+			case <-permissions.C:
+				s.flushPartnerIMPermissionOutbox()
+			case <-greetingDelivery.C:
+				s.reconcileGreetingDeliveries()
+			}
 		}
 	}()
+}
+
+func (s *Service) reconcilePendingWhitelists() {
+	if s == nil || s.db == nil {
+		return
+	}
+	afterRequester, afterReceiver := "", ""
+	for {
+		pairs, err := s.db.pendingContactPairsAfter(afterRequester, afterReceiver, 500)
+		if err != nil || len(pairs) == 0 {
+			return
+		}
+		for _, pair := range pairs {
+			if pair.RequesterUID == "" || pair.ReceiverUID == "" || pair.RequesterUID == pair.ReceiverUID {
+				continue
+			}
+			_ = s.db.enqueuePendingPermissionRepair(pair.RequesterUID, pair.ReceiverUID, time.Now().UnixMilli())
+			afterRequester, afterReceiver = pair.RequesterUID, pair.ReceiverUID
+		}
+		if len(pairs) < 500 {
+			break
+		}
+	}
+	s.flushPartnerIMPermissionOutbox()
+}
+
+func (s *Service) flushPartnerIMPermissionOutbox() {
+	if s == nil || s.db == nil || s.ctx == nil {
+		return
+	}
+	rows, err := s.db.pendingIMPermissionTasks(time.Now().UnixMilli(), 200)
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		var applyErr error
+		desired, desiredErr := s.db.desiredPartnerIMPermission(row.ChannelUID, row.MemberUID)
+		if desiredErr != nil {
+			_ = s.db.markIMPermissionRetry(row.ID, row.Attempts, desiredErr.Error())
+			continue
+		}
+		req := config.ChannelWhitelistReq{ChannelReq: config.ChannelReq{ChannelID: row.ChannelUID, ChannelType: common.ChannelTypePerson.Uint8()}, UIDs: []string{row.MemberUID}}
+		if desired == "remove" {
+			applyErr = s.ctx.IMWhitelistRemove(req)
+		} else {
+			applyErr = s.ctx.IMWhitelistAdd(req)
+		}
+		if applyErr == nil {
+			_ = s.db.markIMPermissionDone(row.ID)
+		} else {
+			_ = s.db.markIMPermissionRetry(row.ID, row.Attempts, applyErr.Error())
+		}
+	}
 }
 
 func (s *Service) runCandidateWarmupOnce() {
@@ -899,11 +1148,11 @@ func (s *Service) touchActive(uid string, at int64, online int) {
 		return
 	}
 	// partner_profiles.last_active_at is used for recommendation freshness, not for
-	// message permission. It is safe to write at most once per user per minute.
+	// message permission. It is safe to write at most once per user per 10 minutes.
 	// This keeps high-frequency 1v1 chat from creating one MySQL UPDATE per message.
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		// ServerLib 的 Redis Conn 没有 SetNX。使用原子 INCR + EXPIRE
-		// 实现一分钟去重：第一个请求负责更新，后续请求直接返回。
+		// 实现十分钟去重：第一个请求负责更新，后续请求直接返回。
 		// Redis 异常时采用 fail-open，仍允许本次 MySQL 活跃时间更新。
 		conn := s.ctx.GetRedisConn()
 		key := "partner:active:touch:" + uid
@@ -912,7 +1161,7 @@ func (s *Service) touchActive(uid string, at int64, online int) {
 			if count > 1 {
 				return
 			}
-			if err = conn.Expire(key, time.Minute); err != nil {
+			if err = conn.Expire(key, 10*time.Minute); err != nil {
 				// 避免 INCR 成功但 EXPIRE 失败后形成永久 key。
 				_ = conn.Del(key)
 			}

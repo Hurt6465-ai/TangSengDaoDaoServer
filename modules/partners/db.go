@@ -1,6 +1,7 @@
 package partners
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -160,7 +161,7 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
-		WHERE pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		WHERE pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
@@ -327,7 +328,7 @@ func (d *db) candidateUIDsForUser(loginUID, extraWhere string, extraArgs []inter
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
-		WHERE pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		WHERE pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
@@ -351,7 +352,7 @@ func (d *db) globalCandidateUIDs(limit int) ([]string, error) {
 	}
 	sql := `SELECT pp.uid
 		FROM partner_profiles pp
-		WHERE pp.status=1 AND pp.has_photo=1
+		WHERE pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''
 		ORDER BY IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
@@ -405,7 +406,7 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
 		LEFT JOIN partner_contacts pc ON pc.uid=? AND pc.to_uid=pp.uid
 		LEFT JOIN user_setting bs1 ON bs1.uid=? AND bs1.to_uid=pp.uid
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
-		WHERE pp.uid IN ? AND pp.uid<>? AND pp.status=1 AND pp.has_photo=1
+		WHERE pp.uid IN ? AND pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
@@ -517,27 +518,168 @@ func (d *db) hasAnyBlacklist(uid, toUID string) (bool, error) {
 	return count > 0, err
 }
 
+func greetingDayStartMillis(nowMS int64) int64 {
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	loc := time.FixedZone("Asia/Shanghai", 8*60*60)
+	now := time.UnixMilli(nowMS).In(loc)
+	day := now.Add(-4 * time.Hour)
+	start := time.Date(day.Year(), day.Month(), day.Day(), 4, 0, 0, 0, loc)
+	return start.UnixMilli()
+}
+
+func greetingDayKey(nowMS int64) string {
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	loc := time.FixedZone("Asia/Shanghai", 8*60*60)
+	return time.UnixMilli(nowMS).In(loc).Add(-4 * time.Hour).Format("2006-01-02")
+}
+
 func (d *db) greetingStats(uid, toUID string, now int64) (*greetingStats, error) {
 	stats := &greetingStats{}
-	dayStart := now - int64(24*time.Hour/time.Millisecond)
 	hourStart := now - int64(time.Hour/time.Millisecond)
 	err := d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=? AND IFNULL(send_status,1)<>2", uid, hourStart).LoadOne(&stats.HourCount)
 	if err != nil {
 		return nil, err
 	}
-	err = d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=? AND IFNULL(send_status,1)<>2", uid, dayStart).LoadOne(&stats.DayCount)
+	err = d.session.Select("IFNULL(MAX(used_count),0)").From("partner_greeting_daily_usage").Where("sender_uid=? AND day_key=?", uid, greetingDayKey(now)).LoadOne(&stats.DayCount)
 	if err != nil {
 		return nil, err
 	}
-	var last int64
-	err = d.session.Select("IFNULL(MAX(last_greet_at),0)").From("partner_greetings").Where("uid=? AND to_uid=? AND IFNULL(send_status,1)<>2", uid, toUID).LoadOne(&last)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(toUID) != "" {
+		var last int64
+		err = d.session.Select("IFNULL(MAX(last_greet_at),0)").From("partner_greetings").Where("uid=? AND to_uid=? AND IFNULL(send_status,1)<>2", uid, toUID).LoadOne(&last)
+		if err != nil {
+			return nil, err
+		}
+		stats.LastTargetGreetAt = last
 	}
-	stats.LastTargetGreetAt = last
 	return stats, nil
 }
 
+func (d *db) reserveGreetingDailyTarget(senderUID, receiverUID string, nowMS int64, limit int) (bool, int, error) {
+	if senderUID == "" || receiverUID == "" || senderUID == receiverUID {
+		return false, 0, ErrGreetingSelf
+	}
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	if limit <= 0 {
+		limit = GreetingDayLimit
+	}
+	dayKey := greetingDayKey(nowMS)
+	tx, err := d.session.Begin()
+	if err != nil {
+		return false, 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	_, err = tx.InsertBySql(`INSERT INTO partner_greeting_daily_usage(sender_uid,day_key,used_count,created_at,updated_at)
+		VALUES(?,?,0,?,?) ON DUPLICATE KEY UPDATE updated_at=updated_at`, senderUID, dayKey, nowMS, nowMS).Exec()
+	if err != nil {
+		return false, 0, err
+	}
+	var usageRows []struct {
+		UsedCount int `db:"used_count"`
+	}
+	_, err = tx.SelectBySql(`SELECT used_count FROM partner_greeting_daily_usage WHERE sender_uid=? AND day_key=? FOR UPDATE`, senderUID, dayKey).Load(&usageRows)
+	if err != nil || len(usageRows) == 0 {
+		if err == nil {
+			err = errors.New("每日打招呼额度记录不存在")
+		}
+		return false, 0, err
+	}
+	used := usageRows[0].UsedCount
+
+	var targetRows []struct {
+		ID int64 `db:"id"`
+	}
+	_, err = tx.SelectBySql(`SELECT id FROM partner_greeting_daily_target WHERE sender_uid=? AND receiver_uid=? AND day_key=? LIMIT 1`, senderUID, receiverUID, dayKey).Load(&targetRows)
+	if err != nil {
+		return false, used, err
+	}
+	if len(targetRows) > 0 {
+		if err = tx.Commit(); err != nil {
+			return false, used, err
+		}
+		return false, used, nil
+	}
+	if used >= limit {
+		return false, used, ErrGreetingDayLimit
+	}
+	_, err = tx.InsertInto("partner_greeting_daily_target").Columns("sender_uid", "receiver_uid", "day_key", "created_at").Values(senderUID, receiverUID, dayKey, nowMS).Exec()
+	if err != nil {
+		return false, used, err
+	}
+	used++
+	_, err = tx.Update("partner_greeting_daily_usage").Set("used_count", used).Set("updated_at", nowMS).Where("sender_uid=? AND day_key=?", senderUID, dayKey).Exec()
+	if err != nil {
+		return false, used - 1, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, used - 1, err
+	}
+	return true, used, nil
+}
+
+func (d *db) releaseGreetingDailyTarget(senderUID, receiverUID string, nowMS int64) error {
+	if senderUID == "" || receiverUID == "" {
+		return nil
+	}
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	dayKey := greetingDayKey(nowMS)
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	result, err := tx.DeleteFrom("partner_greeting_daily_target").Where("sender_uid=? AND receiver_uid=? AND day_key=?", senderUID, receiverUID, dayKey).Exec()
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows > 0 {
+		_, err = tx.Update("partner_greeting_daily_usage").Set("used_count", dbr.Expr("GREATEST(used_count-1,0)")).Set("updated_at", nowMS).Where("sender_uid=? AND day_key=?", senderUID, dayKey).Exec()
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+type greetingDeliveryRow struct {
+	UID          string `db:"uid"`
+	ToUID        string `db:"to_uid"`
+	Text         string `db:"text"`
+	Source       string `db:"source"`
+	LastGreetAt  int64  `db:"last_greet_at"`
+	SendStatus   int    `db:"send_status"`
+	FailedReason string `db:"failed_reason"`
+}
+
+func (d *db) greetingDelivery(uid, toUID string) (*greetingDeliveryRow, error) {
+	if uid == "" || toUID == "" {
+		return nil, nil
+	}
+	var row *greetingDeliveryRow
+	_, err := d.session.Select("uid", "to_uid", "text", "source", "IFNULL(last_greet_at,0) last_greet_at", "IFNULL(send_status,0) send_status", "IFNULL(failed_reason,'') failed_reason").
+		From("partner_greetings").Where("uid=? AND to_uid=?", uid, toUID).Load(&row)
+	return row, err
+}
+
+func (d *db) pendingGreetingDeliveries(limit int) ([]*greetingDeliveryRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []*greetingDeliveryRow
+	_, err := d.session.Select("uid", "to_uid", "text", "source", "IFNULL(last_greet_at,0) last_greet_at", "IFNULL(send_status,0) send_status", "IFNULL(failed_reason,'') failed_reason").
+		From("partner_greetings").Where("send_status=0 AND last_greet_at>0").OrderAsc("last_send_at").Limit(uint64(limit)).Load(&rows)
+	return rows, err
+}
 func (d *db) recordGreeting(uid, toUID, text, source string) (*GreetingResp, error) {
 	now := time.Now().UnixMilli()
 	_, err := d.session.InsertBySql(`INSERT INTO partner_greetings(uid,to_uid,text,source,greet_count,last_greet_at,send_status,last_send_at,failed_reason,created_at,updated_at)
@@ -653,14 +795,21 @@ func (d *db) syncPartnerProfileFromUser(uid string) error {
 	if uid == "" {
 		return nil
 	}
-	_, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
-		SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
-		IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',1,0) AS has_photo,
-		(IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',20,0)+IF(IFNULL(u.native_languages,'')<>'',10,0)+IF(IFNULL(u.learning_languages,'')<>'',10,0)+IF(IFNULL(u.intro,'')<>'',5,0)+IF(IFNULL(u.country_code,'')<>'',5,0)) AS profile_score,
-		IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0) AS status,
-		GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
-		FROM user u WHERE u.uid=?
-		ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),status=VALUES(status),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at)),updated_at=NOW()`, uid).Exec()
+	_, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,account_eligible,partner_enabled,profile_completed,review_status,profile_completed_at,last_active_at,created_at,updated_at)
+SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null'),1,0),
+(IF(IFNULL(u.intro,'')<>'',2,0)+IF(IFNULL(u.tags,'') NOT IN ('','[]','null'),2,0)+IF(IFNULL(u.country_code,'')<>'',1,0)+IF(IFNULL(u.birthday,'')<>'',1,0)),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService') AND IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,0),
+GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
+FROM user u WHERE u.uid=?
+ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),account_eligible=VALUES(account_eligible),profile_completed=VALUES(profile_completed),profile_completed_at=IF(profile_completed_at>0,profile_completed_at,VALUES(profile_completed_at)),status=IF(VALUES(account_eligible)=1 AND partner_enabled=1 AND VALUES(profile_completed)=1 AND review_status=1,1,0),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at))`, uid).Exec()
+	if err == nil && d.ctx != nil && d.ctx.GetRedisConn() != nil {
+		_, _ = d.ctx.GetRedisConn().LPUSH("partnerlist:pool:dirty_queue", uid)
+		_ = d.ctx.GetRedisConn().Expire("partnerlist:pool:dirty_queue", 24*time.Hour)
+	}
 	return err
 }
 
@@ -696,18 +845,25 @@ func (d *db) incrementPendingRequesterMsgCount(uid, toUID string, now int64) (in
 	if now <= 0 {
 		now = time.Now().UnixMilli()
 	}
-	_, err := d.session.Update("partner_contacts").
-		Set("requester_msg_count", dbr.Expr("LEAST(IFNULL(requester_msg_count,0)+1, ?)", MaxPendingGreetingMessages)).
+	result, err := d.session.Update("partner_contacts").
+		Set("requester_msg_count", dbr.Expr("IFNULL(requester_msg_count,0)+1")).
 		Set("last_msg_at", now).
 		Set("updated_at", now).
-		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=?", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
+		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=? AND IFNULL(requester_msg_count,0)<?", uid, toUID, toUID, uid, PartnerContactStatusPending, uid, MaxPendingGreetingMessages).
 		Exec()
 	if err != nil {
 		return 0, err
 	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return MaxPendingGreetingMessages, ErrPendingMessageLimit
+	}
 	contact, err := d.getPartnerContact(uid, toUID)
 	if err != nil || contact == nil {
 		return 0, err
+	}
+	if contact.RequesterMsgCount > MaxPendingGreetingMessages {
+		return MaxPendingGreetingMessages, ErrPendingMessageLimit
 	}
 	return contact.RequesterMsgCount, nil
 }
@@ -716,16 +872,30 @@ func (d *db) ensurePendingContact(uid, toUID string, now int64) error {
 	if uid == "" || toUID == "" || uid == toUID {
 		return nil
 	}
-	rows := [][2]string{{uid, toUID}, {toUID, uid}}
-	for _, row := range rows {
-		_, err := d.session.InsertBySql(`INSERT INTO partner_contacts(uid,to_uid,requester_uid,status,requester_msg_count,last_msg_at,created_at,updated_at)
-            VALUES(?,?,?,?,1,?,?,?)
-            ON DUPLICATE KEY UPDATE requester_uid=IF(status IN (2,3),requester_uid,VALUES(requester_uid)),status=IF(status IN (1,2,3),status,VALUES(status)),requester_msg_count=GREATEST(requester_msg_count,VALUES(requester_msg_count)),last_msg_at=GREATEST(last_msg_at,VALUES(last_msg_at)),updated_at=VALUES(updated_at)`, row[0], row[1], uid, PartnerContactStatusPending, now, now, now).Exec()
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	for _, row := range [][2]string{{uid, toUID}, {toUID, uid}} {
+		_, err = tx.InsertBySql(`INSERT INTO partner_contacts(uid,to_uid,requester_uid,status,requester_msg_count,last_msg_at,created_at,updated_at)
+ VALUES(?,?,?,?,1,?,?,?) ON DUPLICATE KEY UPDATE requester_uid=IF(status IN (2,3),requester_uid,VALUES(requester_uid)),status=IF(status IN (1,2,3),status,VALUES(status)),requester_msg_count=GREATEST(requester_msg_count,VALUES(requester_msg_count)),last_msg_at=GREATEST(last_msg_at,VALUES(last_msg_at)),updated_at=VALUES(updated_at)`, row[0], row[1], uid, PartnerContactStatusPending, now, now, now).Exec()
 		if err != nil {
 			return err
 		}
 	}
-	return nil
+	// Receiver may reply to requester's personal channel; requester must not be able
+	// to bypass the pending gateway in the opposite direction.
+	if err = enqueuePartnerIMPermissionTx(tx, "pending:add:"+uid+":"+toUID, uid, toUID, "add", now); err != nil {
+		return err
+	}
+	if err = enqueuePartnerIMPermissionTx(tx, "pending:remove:"+toUID+":"+uid, toUID, uid, "remove", now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *db) partnerContactUIDs(uid string) ([]string, error) {
@@ -747,20 +917,39 @@ func (d *db) activateContactOnReply(fromUID, toUID string, at int64) (bool, erro
 	if at <= 0 {
 		at = time.Now().UnixMilli()
 	}
-	var requester string
-	err := d.session.Select("requester_uid").From("partner_contacts").Where("uid=? AND to_uid=? AND status=?", fromUID, toUID, PartnerContactStatusPending).LoadOne(&requester)
+	tx, err := d.session.Begin()
 	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	var requester string
+	if err = tx.Select("requester_uid").From("partner_contacts").Where("uid=? AND to_uid=? AND status=?", fromUID, toUID, PartnerContactStatusPending).LoadOne(&requester); err != nil {
 		return false, nil
 	}
 	if requester == "" {
 		return false, nil
 	}
-	if requester != fromUID {
-		_, err = d.session.Update("partner_contacts").Set("status", PartnerContactStatusActive).Set("last_msg_at", at).Set("updated_at", at).Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=?", fromUID, toUID, toUID, fromUID, PartnerContactStatusPending).Exec()
-		return err == nil, err
+	if requester == fromUID {
+		_, err = tx.Update("partner_contacts").Set("last_msg_at", at).Set("updated_at", at).Where("(uid=? AND to_uid=?) OR (uid=? AND to_uid=?)", fromUID, toUID, toUID, fromUID).Exec()
+		if err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
 	}
-	_, err = d.session.Update("partner_contacts").Set("last_msg_at", at).Set("updated_at", at).Where("(uid=? AND to_uid=?) OR (uid=? AND to_uid=?)", fromUID, toUID, toUID, fromUID).Exec()
-	return false, err
+	result, err := tx.Update("partner_contacts").Set("status", PartnerContactStatusActive).Set("last_msg_at", at).Set("updated_at", at).Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=?", fromUID, toUID, toUID, fromUID, PartnerContactStatusPending).Exec()
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return false, tx.Commit()
+	}
+	for _, pair := range [][2]string{{fromUID, toUID}, {toUID, fromUID}} {
+		if err = enqueuePartnerIMPermissionTx(tx, "active:add:"+pair[0]+":"+pair[1], pair[0], pair[1], "add", at); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
 }
 func (d *db) markGreetingSendStatus(uid, toUID string, at int64, status int, reason string) error {
 	if uid == "" || toUID == "" {
@@ -802,7 +991,7 @@ func (d *db) touchPartnerActive(uid string, at int64, online int) error {
 	if at <= 0 {
 		at = time.Now().UnixMilli()
 	}
-	_, err := d.session.UpdateBySql(`UPDATE partner_profiles SET last_active_at=GREATEST(IFNULL(last_active_at,0),?),updated_at=NOW() WHERE uid=?`, at, uid).Exec()
+	_, err := d.session.UpdateBySql(`UPDATE partner_profiles SET last_active_at=GREATEST(IFNULL(last_active_at,0),?) WHERE uid=?`, at, uid).Exec()
 	if err != nil {
 		return err
 	}
@@ -815,7 +1004,7 @@ func (d *db) syncOnlineProfiles() error {
 			SELECT uid,MAX(online) AS online,MAX(last_offline) AS last_offline,MAX(GREATEST(last_online,last_offline))*1000 AS last_active_at
 			FROM user_online GROUP BY uid
 		) onl ON onl.uid=pp.uid
-		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0)),pp.updated_at=NOW()`).Exec()
+		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0))`).Exec()
 	return err
 }
 
@@ -823,17 +1012,17 @@ func (d *db) syncRecentPartnerProfiles(limit int) (int64, error) {
 	if limit <= 0 || limit > PartnerGlobalCandidateSQLLimit {
 		limit = PartnerGlobalCandidateSQLLimit
 	}
-	res, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
-		SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
-		IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',1,0) AS has_photo,
-		(IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',20,0)+IF(IFNULL(u.native_languages,'')<>'',10,0)+IF(IFNULL(u.learning_languages,'')<>'',10,0)+IF(IFNULL(u.intro,'')<>'',5,0)+IF(IFNULL(u.country_code,'')<>'',5,0)) AS profile_score,
-		IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0) AS status,
-		GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
-		FROM user u
-		WHERE u.updated_at >= DATE_SUB(NOW(), INTERVAL 2 DAY)
-		ORDER BY u.updated_at DESC
-		LIMIT ?
-		ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),status=VALUES(status),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at)),updated_at=NOW()`, limit).Exec()
+	res, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,account_eligible,partner_enabled,profile_completed,review_status,profile_completed_at,last_active_at,created_at,updated_at)
+SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null'),1,0),
+(IF(IFNULL(u.intro,'')<>'',2,0)+IF(IFNULL(u.tags,'') NOT IN ('','[]','null'),2,0)+IF(IFNULL(u.country_code,'')<>'',1,0)+IF(IFNULL(u.birthday,'')<>'',1,0)),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService') AND IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,0),
+GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
+FROM user u WHERE u.updated_at >= DATE_SUB(NOW(), INTERVAL 2 DAY) ORDER BY u.updated_at DESC LIMIT ?
+ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),account_eligible=VALUES(account_eligible),profile_completed=VALUES(profile_completed),profile_completed_at=IF(profile_completed_at>0,profile_completed_at,VALUES(profile_completed_at)),status=IF(VALUES(account_eligible)=1 AND partner_enabled=1 AND VALUES(profile_completed)=1 AND review_status=1,1,0),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at))`, limit).Exec()
 	if err != nil {
 		return 0, err
 	}
@@ -841,4 +1030,131 @@ func (d *db) syncRecentPartnerProfiles(limit int) (int64, error) {
 		return 0, nil
 	}
 	return res.RowsAffected()
+}
+
+func (d *db) markPendingMessageDelivered(senderUID, businessClientMsgNo, imClientMsgNo string, imMessageID int64, at int64) error {
+	if senderUID == "" || businessClientMsgNo == "" {
+		return nil
+	}
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	_, err := d.session.Update("partner_pending_message").
+		Set("status", 1).
+		Set("im_client_msg_no", imClientMsgNo).
+		Set("im_message_id", strconv.FormatInt(imMessageID, 10)).
+		Set("failed_reason", "").
+		Set("updated_at", at).
+		Where("sender_uid=? AND client_msg_no=? AND status IN ?", senderUID, businessClientMsgNo, []int{0, 3}).
+		Exec()
+	return err
+}
+
+type pendingContactPair struct {
+	RequesterUID string `db:"requester_uid"`
+	ReceiverUID  string `db:"receiver_uid"`
+}
+
+func (d *db) pendingContactPairsAfter(afterRequester, afterReceiver string, limit int) ([]pendingContactPair, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 500
+	}
+	var rows []pendingContactPair
+	_, err := d.session.SelectBySql(`SELECT requester_uid,CASE WHEN uid=requester_uid THEN to_uid ELSE uid END receiver_uid
+ FROM partner_contacts WHERE status=? AND requester_uid<>'' AND uid=requester_uid
+ AND (requester_uid>? OR (requester_uid=? AND (CASE WHEN uid=requester_uid THEN to_uid ELSE uid END)>?))
+ ORDER BY requester_uid ASC,receiver_uid ASC LIMIT ?`, PartnerContactStatusPending, afterRequester, afterRequester, afterReceiver, limit).Load(&rows)
+	return rows, err
+}
+
+func (d *db) desiredPartnerIMPermission(channelUID, memberUID string) (string, error) {
+	if channelUID == "" || memberUID == "" || channelUID == memberUID {
+		return "remove", nil
+	}
+	// A normal friendship always wins over a stale partner outbox task.
+	var friendCount int
+	if err := d.session.Select("COUNT(*)").From("friend").Where("uid=? AND to_uid=? AND is_deleted=0", channelUID, memberUID).LoadOne(&friendCount); err != nil {
+		return "", err
+	}
+	if friendCount > 0 {
+		return "add", nil
+	}
+	var rows []partnerContactModel
+	_, err := d.session.Select("uid", "to_uid", "requester_uid", "status", "IFNULL(requester_msg_count,0) requester_msg_count", "IFNULL(last_msg_at,0) last_msg_at").
+		From("partner_contacts").Where("uid=? AND to_uid=?", channelUID, memberUID).Limit(1).Load(&rows)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "remove", nil
+	}
+	row := rows[0]
+	switch row.Status {
+	case PartnerContactStatusActive:
+		return "add", nil
+	case PartnerContactStatusPending:
+		// Whitelist(channelUID) contains users that may send into channelUID.
+		// Only the receiver may send into the requester's channel before reply.
+		if row.RequesterUID == channelUID {
+			return "add", nil
+		}
+		return "remove", nil
+	default:
+		return "remove", nil
+	}
+}
+
+type partnerIMPermissionTask struct {
+	ID         int64  `db:"id"`
+	ChannelUID string `db:"channel_uid"`
+	MemberUID  string `db:"member_uid"`
+	Action     string `db:"action"`
+	Attempts   int    `db:"attempts"`
+}
+
+func enqueuePartnerIMPermissionTx(tx *dbr.Tx, key, channelUID, memberUID, action string, now int64) error {
+	_, err := tx.InsertBySql(`INSERT INTO partner_im_permission_outbox(idempotency_key,channel_uid,member_uid,action,status,attempts,next_retry_at,last_error,created_at,updated_at)
+ VALUES(?,?,?,?,0,0,0,'',?,?) ON DUPLICATE KEY UPDATE action=VALUES(action),status=IF(status=1,1,0),next_retry_at=0,updated_at=VALUES(updated_at)`, key, channelUID, memberUID, action, now, now).Exec()
+	return err
+}
+func (d *db) pendingIMPermissionTasks(now int64, limit int) ([]partnerIMPermissionTask, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	var rows []partnerIMPermissionTask
+	_, err := d.session.SelectBySql(`SELECT id,channel_uid,member_uid,action,attempts FROM partner_im_permission_outbox WHERE status IN (0,2) AND next_retry_at<=? ORDER BY id ASC LIMIT ?`, now, limit).Load(&rows)
+	return rows, err
+}
+func (d *db) markIMPermissionDone(id int64) error {
+	_, err := d.session.Update("partner_im_permission_outbox").Set("status", 1).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
+	return err
+}
+func (d *db) markIMPermissionRetry(id int64, attempts int, reason string) error {
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	delay := time.Duration(1<<uint(minPartnerInt(attempts, 6))) * time.Second
+	_, err := d.session.Update("partner_im_permission_outbox").Set("status", 2).Set("attempts", attempts+1).Set("next_retry_at", time.Now().Add(delay).UnixMilli()).Set("last_error", reason).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
+	return err
+}
+func minPartnerInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (d *db) enqueuePendingPermissionRepair(requesterUID, receiverUID string, now int64) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	if err = enqueuePartnerIMPermissionTx(tx, "pending:add:"+requesterUID+":"+receiverUID, requesterUID, receiverUID, "add", now); err != nil {
+		return err
+	}
+	if err = enqueuePartnerIMPermissionTx(tx, "pending:remove:"+receiverUID+":"+requesterUID, receiverUID, requesterUID, "remove", now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
