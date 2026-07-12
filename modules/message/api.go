@@ -202,13 +202,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 				return
 			}
 			if partnerGuard.DuplicateDelivered {
-				c.JSON(http.StatusOK, map[string]interface{}{
-					"status":              200,
-					"duplicate":           1,
-					"client_msg_no":       partnerGuard.ClientMsgNo,
-					"requester_msg_count": partnerGuard.MessageCount,
-					"max_message_count":   partnerPendingMaxMessages,
-				})
+				c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, nil, true))
 				return
 			}
 			if partnerGuard.Requester {
@@ -245,12 +239,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			return
 		}
 		if found {
-			c.JSON(http.StatusOK, map[string]interface{}{
-				"status": 200, "duplicate": 1, "client_msg_no": partnerGuard.ClientMsgNo,
-				"im_client_msg_no": imResp.ClientMsgNo, "message_id": imResp.MessageID,
-				"message_seq": imResp.MessageSeq, "requester_msg_count": partnerGuard.MessageCount,
-				"max_message_count": partnerPendingMaxMessages,
-			})
+			c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, imResp, true))
 			return
 		}
 	}
@@ -279,21 +268,20 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	if partnerGuard != nil && partnerGuard.ReceiverReply {
 		if activateErr := m.activatePartnerContactAfterReply(uid, req.ReceiveChannelID); activateErr != nil {
 			m.Error("激活语伴临时会话失败", zap.Error(activateErr), zap.String("uid", uid), zap.String("to_uid", req.ReceiveChannelID))
+		} else {
+			partnerGuard.Pending = false
+			partnerGuard.MessageCount = 0
 		}
+	}
+	if partnerGuard != nil {
+		c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, imResp, false))
+		return
 	}
 	resp := map[string]interface{}{"status": 200}
 	if imResp != nil {
 		resp["message_id"] = imResp.MessageID
 		resp["message_seq"] = imResp.MessageSeq
 		resp["im_client_msg_no"] = imResp.ClientMsgNo
-	}
-	if partnerGuard != nil {
-		resp["partner_pending"] = partnerGuard.Pending
-		resp["requester_msg_count"] = partnerGuard.MessageCount
-		resp["max_message_count"] = partnerPendingMaxMessages
-		if partnerGuard.ClientMsgNo != "" {
-			resp["client_msg_no"] = partnerGuard.ClientMsgNo
-		}
 	}
 	c.JSON(http.StatusOK, resp)
 }
