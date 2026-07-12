@@ -13,6 +13,7 @@ import (
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/group"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/message"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/openapi"
+	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/partnerlist"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/partners"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/qrcode"
 	_ "github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/report"
