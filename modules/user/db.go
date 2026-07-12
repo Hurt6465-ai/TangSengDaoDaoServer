@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/db"
@@ -202,14 +203,21 @@ func (d *DB) syncPartnerProfileFromUser(uid string) error {
 	if uid == "" {
 		return nil
 	}
-	_, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,last_active_at,created_at,updated_at)
-		SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
-		IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',1,0) AS has_photo,
-		(IF(IFNULL(u.profile_images,'')<>'' AND IFNULL(u.profile_images,'')<>'[]',20,0)+IF(IFNULL(u.native_languages,'')<>'',10,0)+IF(IFNULL(u.learning_languages,'')<>'',10,0)+IF(IFNULL(u.intro,'')<>'',5,0)+IF(IFNULL(u.country_code,'')<>'',5,0)) AS profile_score,
-		IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0) AS status,
-		GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
-		FROM user u WHERE u.uid=?
-		ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),status=VALUES(status),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at)),updated_at=NOW()`, uid).Exec()
+	_, err := d.session.UpdateBySql(`INSERT INTO partner_profiles(uid,name,username,sex,birthday,intro,country_code,country,native_languages,learning_languages,tags,profile_cover,profile_images,vercode,has_photo,profile_score,status,account_eligible,partner_enabled,profile_completed,review_status,profile_completed_at,last_active_at,created_at,updated_at)
+SELECT u.uid,IFNULL(u.name,''),IFNULL(u.username,''),IFNULL(u.sex,0),IFNULL(u.birthday,''),IFNULL(u.intro,''),IFNULL(u.country_code,''),IFNULL(u.country,''),IFNULL(u.native_languages,''),IFNULL(u.learning_languages,''),IFNULL(u.tags,''),IFNULL(u.profile_cover,''),IFNULL(u.profile_images,''),IFNULL(u.vercode,''),
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null'),1,0),
+(IF(IFNULL(u.intro,'')<>'',2,0)+IF(IFNULL(u.tags,'') NOT IN ('','[]','null'),2,0)+IF(IFNULL(u.country_code,'')<>'',1,0)+IF(IFNULL(u.birthday,'')<>'',1,0)),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService') AND IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),
+IF(u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')='' AND IFNULL(u.category,'') NOT IN ('system','customerService'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),1,0),1,
+IF(IFNULL(u.profile_images,'') NOT IN ('','[]','null') AND IFNULL(u.native_languages,'') NOT IN ('','[]','null') AND IFNULL(u.learning_languages,'') NOT IN ('','[]','null'),UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,0),
+GREATEST(UNIX_TIMESTAMP(IFNULL(u.updated_at,NOW()))*1000,UNIX_TIMESTAMP(IFNULL(u.created_at,NOW()))*1000),NOW(),NOW()
+FROM user u WHERE u.uid=?
+ON DUPLICATE KEY UPDATE name=VALUES(name),username=VALUES(username),sex=VALUES(sex),birthday=VALUES(birthday),intro=VALUES(intro),country_code=VALUES(country_code),country=VALUES(country),native_languages=VALUES(native_languages),learning_languages=VALUES(learning_languages),tags=VALUES(tags),profile_cover=VALUES(profile_cover),profile_images=VALUES(profile_images),vercode=VALUES(vercode),has_photo=VALUES(has_photo),profile_score=VALUES(profile_score),account_eligible=VALUES(account_eligible),profile_completed=VALUES(profile_completed),profile_completed_at=IF(profile_completed_at>0,profile_completed_at,VALUES(profile_completed_at)),status=IF(VALUES(account_eligible)=1 AND partner_enabled=1 AND VALUES(profile_completed)=1 AND review_status=1,1,0),last_active_at=GREATEST(IFNULL(last_active_at,0),VALUES(last_active_at))`, uid).Exec()
+	if err == nil && d.ctx != nil && d.ctx.GetRedisConn() != nil {
+		_, _ = d.ctx.GetRedisConn().LPUSH("partnerlist:pool:dirty_queue", uid)
+		_ = d.ctx.GetRedisConn().Expire("partnerlist:pool:dirty_queue", 24*time.Hour)
+	}
 	return err
 }
 
