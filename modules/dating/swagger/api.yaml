@@ -1,0 +1,128 @@
+openapi: 3.0.0
+info:
+  title: TangSengDaoDao Dating API
+  version: 1.1.0
+paths:
+  /v1/dating/profile/me:
+    get:
+      summary: 获取自己的交友资料和当日额度
+      responses:
+        '200': {description: OK}
+  /v1/dating/profile:
+    post:
+      summary: 保存交友专属资料
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: {type: integer, enum: [0, 1]}
+                intent: {type: string, enum: [long_term, long_term_open_short, short_term_open_long, short_term, friends, open]}
+                photos:
+                  type: array
+                  maxItems: 5
+                  items: {type: string}
+                  description: 详情页 1080/1440 主图，仅接受本人 common/profile 路径
+                card_photos:
+                  type: array
+                  maxItems: 5
+                  items: {type: string}
+                  description: 与 photos 一一对应的推荐页 720 WebP 派生图
+                show_distance: {type: integer, enum: [0, 1], description: 省略时保留原设置}
+                allow_voice: {type: integer, enum: [0, 1], description: 省略时保留原设置}
+                allow_video: {type: integer, enum: [0, 1], description: 省略时保留原设置}
+      responses:
+        '200': {description: OK}
+  /v1/dating/profile/enable:
+    post:
+      summary: 开启或关闭交友
+      responses:
+        '200': {description: OK}
+  /v1/dating/location:
+    post:
+      summary: 保存交友定位
+      responses:
+        '200': {description: OK}
+  /v1/dating/recommend:
+    get:
+      summary: 获取推荐或附近用户
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, default: 12, maximum: 20}}
+        - {name: cursor, in: query, schema: {type: string}, description: 使用上次响应返回的不透明游标}
+        - {name: scope, in: query, schema: {type: string, enum: [global, nearby]}}
+        - {name: session_id, in: query, schema: {type: string}}
+        - {name: country_mode, in: query, schema: {type: string, enum: [smart, same_country, foreign_open]}}
+        - {name: gender, in: query, schema: {type: string, enum: [all, female, male]}}
+        - {name: age_min, in: query, schema: {type: integer}}
+        - {name: age_max, in: query, schema: {type: integer}}
+        - {name: intent, in: query, schema: {type: string, enum: [all, serious, marriage, long_term, long_term_open_short, short_term_open_long, short_term, friends, open]}}
+      responses:
+        '200': {description: OK}
+  /v1/dating/swipes:
+    post:
+      summary: 不喜欢、喜欢或收藏
+      responses:
+        '200': {description: OK}
+  /v1/dating/swipes/undo:
+    post:
+      summary: 撤回最近一次未匹配动作
+      responses:
+        '200': {description: OK}
+  /v1/dating/exposures:
+    post:
+      summary: 批量上报曝光
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  maxItems: 30
+                  items:
+                    type: object
+                    required: [to_uid]
+                    properties:
+                      event_id: {type: string, description: 客户端生成的幂等事件ID；旧客户端省略时服务端自动生成}
+                      to_uid: {type: string}
+                      seen_at: {type: integer, format: int64}
+                      duration_ms: {type: integer, format: int64}
+                      event_type: {type: string}
+                      source: {type: string}
+                      photo_index: {type: integer}
+      responses:
+        '200': {description: OK}
+  /v1/dating/favorites:
+    get:
+      summary: 我的收藏
+      responses:
+        '200': {description: OK}
+  /v1/dating/likes/received:
+    get:
+      summary: 谁喜欢我，目前未开会员时只返回数量
+      responses:
+        '200': {description: OK}
+  /v1/dating/matches:
+    get:
+      summary: 我的匹配
+      responses:
+        '200': {description: OK}
+  /v1/dating/chat/check:
+    get:
+      summary: 检查双方是否允许交友私聊
+      responses:
+        '200': {description: OK}
+  /v1/dating/block:
+    post:
+      summary: 屏蔽用户
+      responses:
+        '200': {description: OK}
+  /v1/dating/report:
+    post:
+      summary: 举报交友资料
+      responses:
+        '200': {description: OK}
