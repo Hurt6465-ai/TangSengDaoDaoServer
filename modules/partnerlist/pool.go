@@ -9,13 +9,15 @@ import (
 	"strings"
 	"time"
 
+	appredis "github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/redisx"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	rd "github.com/go-redis/redis"
 )
 
 type poolService struct {
-	ctx *config.Context
-	db  *db
+	ctx    *config.Context
+	db     *db
+	redisx *appredis.Client
 }
 type poolMeta struct {
 	Version       string `json:"version"`
@@ -23,7 +25,9 @@ type poolMeta struct {
 	EligibleCount int    `json:"eligible_count"`
 }
 
-func newPoolService(ctx *config.Context, db *db) *poolService { return &poolService{ctx: ctx, db: db} }
+func newPoolService(ctx *config.Context, db *db, redisx *appredis.Client) *poolService {
+	return &poolService{ctx: ctx, db: db, redisx: redisx}
+}
 
 func (p *poolService) eligibleCount() int {
 	if p == nil || p.ctx == nil || p.ctx.GetRedisConn() == nil {
@@ -33,8 +37,10 @@ func (p *poolService) eligibleCount() int {
 	if version == "" {
 		return 0
 	}
-	if count, err := p.ctx.GetRedisConn().ZCard(poolEligibleKey(version)); err == nil {
-		return int(count)
+	if p.redisx != nil {
+		if count, err := p.redisx.ZCard(poolEligibleKey(version)); err == nil {
+			return int(count)
+		}
 	}
 	raw, err := p.ctx.GetRedisConn().GetString(poolMetaKey(version))
 	if err != nil || raw == "" {
@@ -75,15 +81,18 @@ func (p *poolService) rebuild() error {
 		return fmt.Errorf("Redis不可用，无法构建列表语伴共享池")
 	}
 	conn := p.ctx.GetRedisConn()
+	if p.redisx == nil {
+		return fmt.Errorf("Redis高级客户端不可用，无法构建列表语伴共享池")
+	}
 	token := fmt.Sprintf("%d", time.Now().UnixNano())
-	ok, err := conn.SetNX(poolBuildLockKey, token, 2*time.Hour)
+	ok, err := p.redisx.SetNX(poolBuildLockKey, token, 2*time.Hour)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return nil
 	}
-	defer conn.CompareAndDelete(poolBuildLockKey, token)
+	defer p.redisx.CompareAndDelete(poolBuildLockKey, token)
 	started := time.Now()
 	nowMS := started.UnixMilli()
 	cutoff := started.Add(-warmWindow).UnixMilli()
@@ -91,7 +100,7 @@ func (p *poolService) rebuild() error {
 	if err = conn.SetAndExpire(poolBuildingVersionKey, version, 2*time.Hour); err != nil {
 		return err
 	}
-	defer conn.CompareAndDelete(poolBuildingVersionKey, version)
+	defer p.redisx.CompareAndDelete(poolBuildingVersionKey, version)
 	afterUID := ""
 	total := 0
 	for {
@@ -128,15 +137,10 @@ func (p *poolService) rebuild() error {
 			if len(pairs) == 0 {
 				continue
 			}
-			if err = conn.ZAdd(key, pairs...); err != nil {
+			if err = p.redisx.ZAddAndRegister(poolKeysKey(version), key, poolVersionTTL, pairs...); err != nil {
 				return err
 			}
-			if err = conn.SAdd(poolKeysKey(version), key); err != nil {
-				return err
-			}
-			_ = conn.Expire(key, poolVersionTTL)
 		}
-		_ = conn.Expire(poolKeysKey(version), poolVersionTTL)
 		if len(rows) < PoolScanBatchSize {
 			break
 		}
@@ -217,25 +221,25 @@ func (p *poolService) removeUser(version, uid string) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	return p.ctx.GetRedisConn().ZRemFromKeys(keys, uid)
+	if p.redisx == nil {
+		return fmt.Errorf("Redis高级客户端不可用，无法更新列表语伴共享池")
+	}
+	return p.redisx.ZRemFromKeys(keys, uid)
 }
 func (p *poolService) addProfileToVersion(version string, profile *poolProfile) error {
 	if profile == nil || profile.UID == "" || version == "" {
 		return nil
 	}
-	conn := p.ctx.GetRedisConn()
+	if p.redisx == nil {
+		return fmt.Errorf("Redis高级客户端不可用，无法更新列表语伴共享池")
+	}
 	groups := map[string][]interface{}{}
 	addProfileGroups(groups, version, profile, time.Now().UnixMilli())
 	for key, pairs := range groups {
-		if err := conn.ZAdd(key, pairs...); err != nil {
+		if err := p.redisx.ZAddAndRegister(poolKeysKey(version), key, poolVersionTTL, pairs...); err != nil {
 			return err
 		}
-		if err := conn.SAdd(poolKeysKey(version), key); err != nil {
-			return err
-		}
-		_ = conn.Expire(key, poolVersionTTL)
 	}
-	_ = conn.Expire(poolKeysKey(version), poolVersionTTL)
 	return nil
 }
 func (p *poolService) activeVersions() []string {
@@ -324,7 +328,10 @@ func (p *poolService) candidateUIDs(viewer *viewerProfile, includeWarm bool) ([]
 	seen := map[string]struct{}{}
 	out := make([]string, 0, 512)
 	for _, key := range uniqueIDs(keys, 0) {
-		vals, e := p.ctx.GetRedisConn().ZRevRangeByScore(key, rd.ZRangeBy{Min: strconv.FormatInt(minAt, 10), Max: strconv.FormatInt(maxAt, 10), Offset: 0, Count: PoolHardCandidateLimit})
+		if p.redisx == nil {
+			return nil, version, fmt.Errorf("Redis高级客户端不可用，无法读取列表语伴候选池")
+		}
+		vals, e := p.redisx.ZRevRangeByScore(key, rd.ZRangeBy{Min: strconv.FormatInt(minAt, 10), Max: strconv.FormatInt(maxAt, 10), Offset: 0, Count: PoolHardCandidateLimit})
 		if e != nil {
 			return nil, version, e
 		}
@@ -352,7 +359,10 @@ func (p *poolService) newcomerUIDs(version string, nowMS int64, limit int) ([]st
 	if p == nil || p.ctx == nil || p.ctx.GetRedisConn() == nil || version == "" || limit <= 0 {
 		return []string{}, nil
 	}
-	return p.ctx.GetRedisConn().ZRevRangeByScore(poolNewKey(version), rd.ZRangeBy{
+	if p.redisx == nil {
+		return nil, fmt.Errorf("Redis高级客户端不可用，无法读取新人池")
+	}
+	return p.redisx.ZRevRangeByScore(poolNewKey(version), rd.ZRangeBy{
 		Min:    strconv.FormatInt(nowMS-int64(newcomerWindow/time.Millisecond), 10),
 		Max:    strconv.FormatInt(nowMS+int64(time.Minute/time.Millisecond), 10),
 		Offset: 0,
@@ -390,7 +400,10 @@ func (p *poolService) foregroundOnlineSet(uids []string, nowMS int64) map[string
 	if p == nil || p.ctx == nil || p.ctx.GetRedisConn() == nil || len(uids) == 0 {
 		return out
 	}
-	scores, err := p.ctx.GetRedisConn().ZScores(foregroundOnlineKey, uniqueIDs(uids, 0))
+	if p.redisx == nil {
+		return out
+	}
+	scores, err := p.redisx.ZScores(foregroundOnlineKey, uniqueIDs(uids, 0))
 	if err != nil {
 		return out
 	}
@@ -406,7 +419,10 @@ func (p *poolService) lastActiveScores(uids []string) map[string]int64 {
 	if p == nil || p.ctx == nil || p.ctx.GetRedisConn() == nil || len(uids) == 0 {
 		return out
 	}
-	scores, err := p.ctx.GetRedisConn().ZScores(lastActiveKey, uniqueIDs(uids, 0))
+	if p.redisx == nil {
+		return out
+	}
+	scores, err := p.redisx.ZScores(lastActiveKey, uniqueIDs(uids, 0))
 	if err != nil {
 		return out
 	}
