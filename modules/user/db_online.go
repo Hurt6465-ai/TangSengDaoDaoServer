@@ -41,6 +41,15 @@ func (o *onlineDB) insertOrUpdateUserOnlineTx(m *onlineStatusModel, tx *dbr.Tx) 
 		) onl ON onl.uid=pp.uid
 		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0)),pp.updated_at=NOW()
 		WHERE pp.uid=?`, m.UID, m.UID).Exec()
+
+	// 同步交友推荐聚合字段。推荐查询直接读取 dating_profiles，避免每次请求聚合 user_online。
+	_, _ = tx.UpdateBySql(`UPDATE dating_profiles dp
+		LEFT JOIN (
+			SELECT uid,MAX(online) AS online,MAX(GREATEST(last_online,last_offline))*1000 AS last_active_at
+			FROM user_online WHERE uid=? GROUP BY uid
+		) onl ON onl.uid=dp.uid
+		SET dp.online=IFNULL(onl.online,0),dp.last_active_at=GREATEST(IFNULL(dp.last_active_at,0),IFNULL(onl.last_active_at,0)),dp.updated_at=dp.updated_at
+		WHERE dp.uid=?`, m.UID, m.UID).Exec()
 	return nil
 }
 
