@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	appredis "github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/redisx"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 )
 
@@ -19,14 +20,16 @@ var (
 )
 
 type Service struct {
-	ctx  *config.Context
-	db   *db
-	pool *poolService
+	ctx    *config.Context
+	db     *db
+	pool   *poolService
+	redisx *appredis.Client
 }
 
 func NewService(ctx *config.Context) *Service {
 	d := newDB(ctx)
-	s := &Service{ctx: ctx, db: d, pool: newPoolService(ctx, d)}
+	rx := appredis.FromContext(ctx)
+	s := &Service{ctx: ctx, db: d, redisx: rx, pool: newPoolService(ctx, d, rx)}
 	s.startPoolJobs()
 	return s
 }
@@ -391,8 +394,8 @@ func (s *Service) stratifiedCandidateSample(values []string, version string, vie
 		}
 	}
 	assign := map[string]int{}
-	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		assign = readAssign(s.ctx.GetRedisConn(), assignmentGlobalKey(dayKey), values)
+	if s.redisx != nil {
+		assign = readAssign(s.redisx, assignmentGlobalKey(dayKey), values)
 	}
 	low := append([]string(nil), values...)
 	sort.SliceStable(low, func(i, j int) bool {
@@ -565,9 +568,7 @@ func (s *Service) repeatDays(viewerUID, currentDay string) map[string]int {
 	return out
 }
 
-func readAssign(conn interface {
-	HMGetMap(string, []string) (map[string]string, error)
-}, key string, ids []string) map[string]int {
+func readAssign(conn *appredis.Client, key string, ids []string) map[string]int {
 	out := map[string]int{}
 	vals, err := conn.HMGetMap(key, ids)
 	if err != nil {
@@ -592,7 +593,7 @@ func redisHashInt(conn interface {
 
 func (s *Service) assignmentContext(dayKey, bucket string, ids []string, bucketEligible int) (map[string]int, map[string]int, float64, float64) {
 	today, yesterday := map[string]int{}, map[string]int{}
-	if s.ctx == nil || s.ctx.GetRedisConn() == nil {
+	if s.ctx == nil || s.ctx.GetRedisConn() == nil || s.redisx == nil {
 		return today, yesterday, 1, 0
 	}
 	c := s.ctx.GetRedisConn()
@@ -601,10 +602,10 @@ func (s *Service) assignmentContext(dayKey, bucket string, ids []string, bucketE
 	previous := previousDayKey(dayKey)
 	globalYesterdayKey := assignmentGlobalKey(previous)
 	bucketYesterdayKey := assignmentBucketKey(previous, bucket)
-	gt := readAssign(c, globalTodayKey, ids)
-	bt := readAssign(c, bucketTodayKey, ids)
-	gy := readAssign(c, globalYesterdayKey, ids)
-	by := readAssign(c, bucketYesterdayKey, ids)
+	gt := readAssign(s.redisx, globalTodayKey, ids)
+	bt := readAssign(s.redisx, bucketTodayKey, ids)
+	gy := readAssign(s.redisx, globalYesterdayKey, ids)
+	by := readAssign(s.redisx, bucketYesterdayKey, ids)
 	for _, uid := range ids {
 		today[uid] = gt[uid]*7 + bt[uid]*3
 		yesterday[uid] = gy[uid]*7 + by[uid]*3
@@ -639,14 +640,14 @@ func (s *Service) recordViewerSeen(viewer string, ids []string, at int64) {
 	for _, uid := range uniqueIDs(ids, 0) {
 		pairs = append(pairs, float64(at), uid)
 	}
-	if len(pairs) > 0 {
-		_ = s.ctx.GetRedisConn().ZAdd(viewerSeenKey(viewer), pairs...)
+	if len(pairs) > 0 && s.redisx != nil {
+		_ = s.redisx.ZAdd(viewerSeenKey(viewer), pairs...)
 		_ = s.ctx.GetRedisConn().Expire(viewerSeenKey(viewer), viewerSeenTTL)
 	}
 }
 
 func (s *Service) flushAssignmentOutbox() {
-	if s.ctx == nil || s.ctx.GetRedisConn() == nil {
+	if s.ctx == nil || s.ctx.GetRedisConn() == nil || s.redisx == nil {
 		return
 	}
 	rows, err := s.db.pendingAssignmentOutbox(time.Now().UnixMilli(), 500)
@@ -672,7 +673,7 @@ redis.call('EXPIRE', bucket, ttl)
 return 1`
 	ttlSeconds := int64(recommendationTTL / time.Second)
 	for _, row := range rows {
-		_, err = s.ctx.GetRedisConn().EvalInt(script, []string{assignmentAppliedKey(row.DayKey), assignmentGlobalKey(row.DayKey), assignmentBucketKey(row.DayKey, row.Bucket)}, strconv.FormatInt(row.ID, 10), row.CandidateUID, ttlSeconds)
+		_, err = s.redisx.EvalInt(script, []string{assignmentAppliedKey(row.DayKey), assignmentGlobalKey(row.DayKey), assignmentBucketKey(row.DayKey, row.Bucket)}, strconv.FormatInt(row.ID, 10), row.CandidateUID, ttlSeconds)
 		if err == nil {
 			err = s.db.markAssignmentOutboxDone(row.ID)
 		}
@@ -696,7 +697,11 @@ func (s *Service) Heartbeat(uid string) (*HeartbeatResp, error) {
 		_ = c.Expire(foregroundOnlineKey, 24*time.Hour)
 		_ = c.ZAdd(lastActiveKey, float64(nowMS), uid)
 		_ = c.Expire(lastActiveKey, 10*24*time.Hour)
-		write, e := c.SetNX(activeWriteLockKey(uid), "1", activeWriteTTL)
+		write := false
+		var e error
+		if s.redisx != nil {
+			write, e = s.redisx.SetNX(activeWriteLockKey(uid), "1", activeWriteTTL)
+		}
 		if e == nil && write {
 			go func() { _ = s.db.touchActive(uid, nowMS); _ = s.pool.syncUserE(uid, nowMS) }()
 		}
@@ -790,13 +795,16 @@ func (s *Service) acquireLock(key string, ttl time.Duration) (string, bool, erro
 	if s.ctx == nil || s.ctx.GetRedisConn() == nil {
 		return "", true, nil
 	}
+	if s.redisx == nil {
+		return "", false, errors.New("Redis高级客户端不可用")
+	}
 	token := fmt.Sprintf("%d", time.Now().UnixNano())
-	ok, e := s.ctx.GetRedisConn().SetNX(key, token, ttl)
+	ok, e := s.redisx.SetNX(key, token, ttl)
 	return token, ok, e
 }
 func (s *Service) releaseLock(key, token string) {
-	if token != "" && s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		_, _ = s.ctx.GetRedisConn().CompareAndDelete(key, token)
+	if token != "" && s.redisx != nil {
+		_, _ = s.redisx.CompareAndDelete(key, token)
 	}
 }
 
@@ -827,7 +835,11 @@ func (s *Service) startPoolJobs() {
 					break
 				}
 				if e = s.pool.syncUserE(uid, 0); e != nil {
-					_, _ = s.ctx.GetRedisConn().RPUSH(poolDirtyQueueKey, uid)
+					if s.redisx != nil {
+						_, _ = s.redisx.RPush(poolDirtyQueueKey, uid)
+					} else {
+						_, _ = s.ctx.GetRedisConn().LPUSH(poolDirtyQueueKey, uid)
+					}
 					break
 				}
 			}
