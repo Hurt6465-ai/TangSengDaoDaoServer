@@ -131,14 +131,12 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 }
 
 func (m *Message) sendMsg(c *wkhttp.Context) {
-	if !m.ctx.GetConfig().Message.SendMessageOn {
-		c.ResponseError(errors.New("不支持代发消息"))
-		return
-	}
+	proxySendEnabled := m.ctx.GetConfig().Message.SendMessageOn
 	var req struct {
 		Token              string                 `json:"token"`                // 发送者
 		ReceiveChannelID   string                 `json:"receive_channel_id"`   // 接受者id
 		ReceiveChannelType uint8                  `json:"receive_channel_type"` // 接受类型
+		ClientMsgNo        string                 `json:"client_msg_no"`        // pending陌生消息业务幂等号
 		Payload            map[string]interface{} `json:"payload"`              // 消息体
 	}
 	if err := c.BindJSON(&req); err != nil {
@@ -178,6 +176,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		return
 	}
 
+	var partnerGuard *partnerPendingGuard
 	if req.ReceiveChannelType == common.ChannelTypePerson.Uint8() {
 		sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
 		if err != nil {
@@ -192,17 +191,37 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			return
 		}
 		if !sendUserIsFriend || !recvUserIsFriend {
-			allowed, err := m.isPartnerTemporaryMessageAllowed(uid, req.ReceiveChannelID)
+			partnerGuard, err = m.preparePartnerTemporaryMessage(uid, req.ReceiveChannelID, req.ClientMsgNo, req.Payload)
 			if err != nil {
-				m.Error("查询语伴临时会话关系错误", zap.Error(err))
-				c.ResponseError(errors.New("查询语伴临时会话关系错误"))
+				m.Warn("语伴pending消息投递前检查失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", req.ReceiveChannelID))
+				c.ResponseError(err)
 				return
 			}
-			if !allowed {
-				c.ResponseError(errors.New("发送者与接受者不是好友"))
+			if partnerGuard == nil || !partnerGuard.Handled {
+				c.ResponseError(errPartnerRelationDenied)
 				return
+			}
+			if partnerGuard.DuplicateDelivered {
+				c.JSON(http.StatusOK, map[string]interface{}{
+					"status":              200,
+					"duplicate":           1,
+					"client_msg_no":       partnerGuard.ClientMsgNo,
+					"requester_msg_count": partnerGuard.MessageCount,
+					"max_message_count":   partnerPendingMaxMessages,
+				})
+				return
+			}
+			if partnerGuard.Requester {
+				req.Payload["partner_pending_gateway"] = 1
+				req.Payload["partner_client_msg_no"] = partnerGuard.ClientMsgNo
+				req.Payload["requester_msg_count"] = partnerGuard.MessageCount
+				req.Payload["max_greeting_count"] = partnerPendingMaxMessages
 			}
 		}
+	}
+	if !proxySendEnabled && partnerGuard == nil {
+		c.ResponseError(errors.New("不支持代发消息"))
+		return
 	}
 	if req.ReceiveChannelType == common.ChannelTypeGroup.Uint8() {
 		isExist, err := m.groupService.ExistMember(req.ReceiveChannelID, uid)
@@ -216,16 +235,76 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			return
 		}
 	}
-	err = m.sendMessage(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload)
+	var imResp *config.MsgSendResp
+	if partnerGuard != nil && partnerGuard.Requester && partnerGuard.NeedsReconcile {
+		var found bool
+		imResp, found, err = m.reconcilePartnerPendingMessage(uid, req.ReceiveChannelID, partnerGuard)
+		if err != nil {
+			_ = m.markPartnerPendingUncertain(uid, partnerGuard, err)
+			c.ResponseError(errPartnerMessageUncertain)
+			return
+		}
+		if found {
+			c.JSON(http.StatusOK, map[string]interface{}{
+				"status": 200, "duplicate": 1, "client_msg_no": partnerGuard.ClientMsgNo,
+				"im_client_msg_no": imResp.ClientMsgNo, "message_id": imResp.MessageID,
+				"message_seq": imResp.MessageSeq, "requester_msg_count": partnerGuard.MessageCount,
+				"max_message_count": partnerPendingMaxMessages,
+			})
+			return
+		}
+	}
+	if partnerGuard != nil && partnerGuard.Requester {
+		imResp, err = m.sendPartnerMessageStable(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, partnerGuard.IMClientMsgNo)
+	} else {
+		imResp, err = m.sendMessageWithResult(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload)
+	}
 	if err != nil {
+		if partnerGuard != nil && partnerGuard.Reserved {
+			if isUncertainPartnerIMError(err) {
+				_ = m.markPartnerPendingUncertain(uid, partnerGuard, err)
+				c.ResponseError(errPartnerMessageUncertain)
+				return
+			}
+			_ = m.rollbackPartnerPendingMessage(uid, req.ReceiveChannelID, partnerGuard, err)
+		}
 		c.ResponseError(err)
 		return
 	}
-	c.ResponseOK()
+	if partnerGuard != nil && partnerGuard.Reserved {
+		if completeErr := m.completePartnerPendingMessageForSender(uid, partnerGuard, imResp); completeErr != nil {
+			m.Error("确认语伴pending消息投递状态失败", zap.Error(completeErr), zap.String("uid", uid), zap.String("client_msg_no", partnerGuard.ClientMsgNo))
+		}
+	}
+	if partnerGuard != nil && partnerGuard.ReceiverReply {
+		if activateErr := m.activatePartnerContactAfterReply(uid, req.ReceiveChannelID); activateErr != nil {
+			m.Error("激活语伴临时会话失败", zap.Error(activateErr), zap.String("uid", uid), zap.String("to_uid", req.ReceiveChannelID))
+		}
+	}
+	resp := map[string]interface{}{"status": 200}
+	if imResp != nil {
+		resp["message_id"] = imResp.MessageID
+		resp["message_seq"] = imResp.MessageSeq
+		resp["im_client_msg_no"] = imResp.ClientMsgNo
+	}
+	if partnerGuard != nil {
+		resp["partner_pending"] = partnerGuard.Pending
+		resp["requester_msg_count"] = partnerGuard.MessageCount
+		resp["max_message_count"] = partnerPendingMaxMessages
+		if partnerGuard.ClientMsgNo != "" {
+			resp["client_msg_no"] = partnerGuard.ClientMsgNo
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (m *Message) sendMessage(channelID string, channelType uint8, fromUID string, payload map[string]interface{}) error {
-	err := m.ctx.SendMessage(&config.MsgSendReq{
+	_, err := m.sendMessageWithResult(channelID, channelType, fromUID, payload)
+	return err
+}
+
+func (m *Message) sendMessageWithResult(channelID string, channelType uint8, fromUID string, payload map[string]interface{}) (*config.MsgSendResp, error) {
+	resp, err := m.ctx.SendMessageWithResult(&config.MsgSendReq{
 		Header: config.MsgHeader{
 			RedDot: 1,
 		},
@@ -236,24 +315,9 @@ func (m *Message) sendMessage(channelID string, channelType uint8, fromUID strin
 	})
 	if err != nil {
 		m.Error("发送消息错误", zap.Error(err))
-		return errors.New("发送消息错误")
+		return nil, errors.New("发送消息错误")
 	}
-	return nil
-}
-
-func (m *Message) isPartnerTemporaryMessageAllowed(fromUID, toUID string) (bool, error) {
-	if m == nil || m.ctx == nil || fromUID == "" || toUID == "" || fromUID == toUID {
-		return false, nil
-	}
-	var count int
-	err := m.ctx.DB().Select("COUNT(*)").
-		From("partner_contacts").
-		Where("uid=? AND to_uid=? AND (status=? OR (status=? AND requester_uid<>?))", fromUID, toUID, 1, 0, fromUID).
-		LoadOne(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
+	return resp, nil
 }
 
 // 消息编辑
