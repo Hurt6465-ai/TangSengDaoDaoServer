@@ -57,6 +57,7 @@ type partnerPendingGuard struct {
 	PayloadHash        string
 	ContentType        int
 	MessageCount       int
+	IMMessageID        string
 }
 
 type partnerContactGuardRow struct {
@@ -75,6 +76,55 @@ type partnerPendingMessageRow struct {
 	IMMessageID   string `db:"im_message_id"`
 	UpdatedAt     int64  `db:"updated_at"`
 	NextCheckAt   int64  `db:"next_check_at"`
+}
+
+// partnerMessageSendResponse is the stable wire contract used by the Android
+// pending-message gateway. Keep booleans as booleans and always return the
+// relationship state so clients do not remain stuck in a stale pending state.
+type partnerMessageSendResponse struct {
+	Status            int    `json:"status"`
+	Duplicate         int    `json:"duplicate"`
+	PartnerPending    bool   `json:"partner_pending"`
+	ContactStatus     int    `json:"contact_status"`
+	RequesterMsgCount int    `json:"requester_msg_count"`
+	MaxMessageCount   int    `json:"max_message_count"`
+	ClientMsgNo       string `json:"client_msg_no,omitempty"`
+	IMClientMsgNo     string `json:"im_client_msg_no,omitempty"`
+	MessageID         string `json:"message_id,omitempty"`
+	MessageSeq        uint32 `json:"message_seq"`
+	Timestamp         int64  `json:"timestamp"`
+}
+
+func newPartnerMessageSendResponse(guard *partnerPendingGuard, imResp *config.MsgSendResp, duplicate bool) *partnerMessageSendResponse {
+	resp := &partnerMessageSendResponse{
+		Status:          200,
+		ContactStatus:   partnerContactActive,
+		MaxMessageCount: partnerPendingMaxMessages,
+		Timestamp:       time.Now().Unix(),
+	}
+	if duplicate {
+		resp.Duplicate = 1
+	}
+	if guard != nil {
+		resp.PartnerPending = guard.Pending
+		if guard.Pending {
+			resp.ContactStatus = partnerContactPending
+		}
+		resp.RequesterMsgCount = guard.MessageCount
+		resp.ClientMsgNo = guard.ClientMsgNo
+		resp.IMClientMsgNo = guard.IMClientMsgNo
+		resp.MessageID = guard.IMMessageID
+	}
+	if imResp != nil {
+		if imResp.ClientMsgNo != "" {
+			resp.IMClientMsgNo = imResp.ClientMsgNo
+		}
+		if imResp.MessageID != 0 {
+			resp.MessageID = strconv.FormatInt(imResp.MessageID, 10)
+		}
+		resp.MessageSeq = imResp.MessageSeq
+	}
+	return resp
 }
 
 func normalizePartnerClientMsgNo(topLevel string, payload map[string]interface{}) (string, error) {
@@ -228,6 +278,7 @@ func (m *Message) preparePartnerTemporaryMessage(fromUID, toUID, clientMsgNo str
 		if r.IMClientMsgNo != "" {
 			guard.IMClientMsgNo = r.IMClientMsgNo
 		}
+		guard.IMMessageID = r.IMMessageID
 		switch r.Status {
 		case partnerPendingMessageDelivered:
 			guard.DuplicateDelivered = true
