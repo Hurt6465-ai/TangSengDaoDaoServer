@@ -48,6 +48,23 @@ func NewFriend(ctx *config.Context) *Friend {
 	return f
 }
 
+// canApplyFriendFromPartnerRelation allows a language-partner contact to become
+// a normal friend even when the profile page did not carry a legacy vercode.
+// Only an existing pending/active partner relation is accepted; blocked or
+// ignored relations must never bypass the normal source validation.
+func (f *Friend) canApplyFriendFromPartnerRelation(uid, toUID string) (bool, error) {
+	if f == nil || f.ctx == nil || uid == "" || toUID == "" || uid == toUID {
+		return false, nil
+	}
+	var count int
+	err := f.ctx.DB().SelectBySql(`SELECT COUNT(*) FROM partner_contacts
+ WHERE ((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status IN (0,1)`, uid, toUID, toUID, uid).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // Route 配置路由规则
 func (f *Friend) Route(r *wkhttp.WKHttp) {
 	friend := r.Group("/v1/friend", f.ctx.AuthMiddleware(r))
@@ -332,24 +349,38 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	}
 	verifyVercode := true
 	if req.Vercode == "" {
-		friend, err := f.db.queryWithUID(fromUID, req.ToUID)
-		if err != nil {
-			f.Error("查询好友信息错误", zap.String("to_uid", req.ToUID))
+		friend, queryErr := f.db.queryWithUID(fromUID, req.ToUID)
+		if queryErr != nil {
+			f.Error("查询好友信息错误", zap.Error(queryErr), zap.String("to_uid", req.ToUID))
 			c.ResponseError(errors.New("查询好友信息错误"))
 			return
 		}
-		if friend == nil {
-			f.Error("好友信息不存在", zap.String("to_uid", req.ToUID))
-			c.ResponseError(errors.New("好友信息不存在"))
-			return
+		if friend != nil && friend.SourceVercode != "" {
+			// Re-adding a previously deleted friend keeps the original source code.
+			req.Vercode = friend.SourceVercode
+			verifyVercode = false
+		} else {
+			allowed, relationErr := f.canApplyFriendFromPartnerRelation(fromUID, req.ToUID)
+			if relationErr != nil {
+				f.Error("查询语伴关系错误", zap.Error(relationErr), zap.String("to_uid", req.ToUID))
+				c.ResponseError(errors.New("查询语伴关系错误"))
+				return
+			}
+			if !allowed {
+				f.Warn("缺少有效好友来源", zap.String("uid", fromUID), zap.String("to_uid", req.ToUID))
+				c.ResponseError(errors.New("缺少有效的好友来源，请从用户资料重新发起"))
+				return
+			}
+			if strings.TrimSpace(toUser.Vercode) == "" {
+				f.Error("目标用户验证码为空", zap.String("to_uid", req.ToUID))
+				c.ResponseError(errors.New("目标用户好友信息不完整"))
+				return
+			}
+			// Partner profile pages may not expose the legacy vercode. Resolve it on
+			// the server from the already-authorized partner relation, then still run
+			// the normal source validator below.
+			req.Vercode = toUser.Vercode
 		}
-		if friend.SourceVercode == "" {
-			f.Error("验证码不能为空", zap.String("to_uid", req.ToUID))
-			c.ResponseError(errors.New("验证码不能为空"))
-			return
-		}
-		req.Vercode = friend.SourceVercode
-		verifyVercode = false
 	}
 
 	if verifyVercode {
