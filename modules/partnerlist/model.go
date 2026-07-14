@@ -2,6 +2,7 @@ package partnerlist
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -90,9 +91,13 @@ func (u *ListUser) normalize() {
 	u.NativeLanguages = parseStringList(u.NativeLanguagesRaw, 5)
 	u.LearningLanguages = parseStringList(u.LearningLanguagesRaw, 5)
 	u.Tags = parseRawStringList(u.TagsRaw, 20)
-	u.ProfileImages = parseRawStringList(u.ProfileImagesRaw, 9)
-	if len(u.ProfileImages) > 0 {
-		u.Avatar = u.ProfileImages[0]
+	// 语伴图片统一使用账号头像。历史 profile_images 可能保存旧域名、文件路径或
+	// 已删除图片，不能再覆盖稳定的用户头像接口。
+	if strings.TrimSpace(u.UID) != "" {
+		u.Avatar = fmt.Sprintf("users/%s/avatar", u.UID)
+		u.ProfileImages = []string{u.Avatar}
+	} else {
+		u.ProfileImages = []string{}
 	}
 	if strings.TrimSpace(u.Name) == "" {
 		if strings.TrimSpace(u.Username) != "" {
