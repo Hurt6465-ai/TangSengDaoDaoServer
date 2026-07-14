@@ -1020,7 +1020,7 @@ func (d *db) report(uid, feedID string, req ReportReq) error {
 		reason = "other"
 	}
 	var reported int
-	_, err := d.session.Select("count(*)").From("feed_reports").Where("feed_id=? AND uid=?", feedID, uid).Load(&reported)
+	_, err = d.session.Select("count(*)").From("feed_reports").Where("feed_id=? AND uid=?", feedID, uid).Load(&reported)
 	if err != nil {
 		return err
 	}
