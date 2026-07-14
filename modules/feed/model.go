@@ -1,7 +1,9 @@
 package feed
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +24,7 @@ var FeedEventTTL = time.Duration(FeedEventTTLDays) * 24 * time.Hour
 
 type ListResp struct {
 	List       []*FeedPost `json:"list"`
-	Feeds      []*FeedPost `json:"feeds"`
+	Feeds      []*FeedPost `json:"feeds,omitempty"`
 	Cursor     string      `json:"cursor"`
 	HasMore    int         `json:"has_more"`
 	ServerTime int64       `json:"server_time"`
@@ -30,10 +32,59 @@ type ListResp struct {
 
 type CommentListResp struct {
 	List       []*FeedComment `json:"list"`
-	Comments   []*FeedComment `json:"comments"`
+	Comments   []*FeedComment `json:"comments,omitempty"`
 	Cursor     string         `json:"cursor"`
 	HasMore    int            `json:"has_more"`
 	ServerTime int64          `json:"server_time"`
+}
+
+type TikTokPreviewReq struct {
+	URL string `json:"url"`
+}
+
+type TikTokPreviewResp struct {
+	Provider   string `json:"provider"`
+	VideoID    string `json:"video_id"`
+	URL        string `json:"url"`
+	EmbedURL   string `json:"embed_url"`
+	CoverURL   string `json:"cover_url"`
+	Title      string `json:"title"`
+	AuthorName string `json:"author_name"`
+}
+
+type timelineCursor struct {
+	CreatedAt int64 `json:"t"`
+	ID        int64 `json:"i"`
+}
+
+func encodeTimelineCursor(createdAt, id int64) string {
+	if createdAt <= 0 || id <= 0 {
+		return ""
+	}
+	b, err := json.Marshal(timelineCursor{CreatedAt: createdAt, ID: id})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeTimelineCursor(value string) (timelineCursor, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return timelineCursor{}, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return timelineCursor{}, err
+	}
+	var cursor timelineCursor
+	if err = json.Unmarshal(b, &cursor); err != nil {
+		return timelineCursor{}, err
+	}
+	if cursor.CreatedAt <= 0 || cursor.ID <= 0 {
+		return timelineCursor{}, fmt.Errorf("invalid timeline cursor")
+	}
+	return cursor, nil
 }
 
 type PublishReq struct {
@@ -79,7 +130,7 @@ func (b *FlexibleBool) UnmarshalJSON(data []byte) error {
 	case "0", "false", "no", "n", "off":
 		*b = FlexibleBool(false)
 	default:
-		return nil
+		return fmt.Errorf("invalid boolean value")
 	}
 	return nil
 }
@@ -120,6 +171,7 @@ func (r EventReq) NormalizedEventType() string {
 }
 
 type FeedPost struct {
+	ID             int64        `json:"-" db:"id"`
 	FeedID         string       `json:"feed_id" db:"feed_id"`
 	UID            string       `json:"uid" db:"uid"`
 	Text           string       `json:"text" db:"text"`
@@ -149,7 +201,7 @@ type FeedUser struct {
 	Country           string   `json:"country" db:"country"`
 	Sex               int      `json:"sex" db:"sex"`
 	Age               int      `json:"age" db:"-"`
-	Birthday          string   `json:"birthday" db:"birthday"`
+	Birthday          string   `json:"-" db:"birthday"`
 	NativeLanguages   []string `json:"native_languages" db:"-"`
 	LearningLanguages []string `json:"learning_languages" db:"-"`
 	Follow            int      `json:"follow" db:"follow"`
@@ -160,21 +212,26 @@ type FeedUser struct {
 }
 
 type FeedMedia struct {
-	ID          int64  `json:"id" db:"id"`
-	FeedID      string `json:"feed_id" db:"feed_id"`
-	Type        string `json:"type" db:"type"`
-	ThumbURL    string `json:"thumb_url" db:"thumb_url"`
-	DisplayURL  string `json:"display_url" db:"display_url"`
-	OriginURL   string `json:"origin_url" db:"origin_url"`
-	CoverURL    string `json:"cover_url" db:"cover_url"`
-	PlayURL480P string `json:"play_url_480p" db:"play_url_480p"`
-	PlayURL540P string `json:"play_url_540p" db:"play_url_540p"`
-	PlayURL720P string `json:"play_url_720p" db:"play_url_720p"`
-	Width       int    `json:"width" db:"width"`
-	Height      int    `json:"height" db:"height"`
-	DurationMS  int64  `json:"duration_ms" db:"duration_ms"`
-	Size        int64  `json:"size" db:"size"`
-	Sort        int    `json:"sort" db:"sort"`
+	ID               int64  `json:"id" db:"id"`
+	FeedID           string `json:"feed_id" db:"feed_id"`
+	Type             string `json:"type" db:"type"`
+	ThumbURL         string `json:"thumb_url,omitempty" db:"thumb_url"`
+	DisplayURL       string `json:"display_url,omitempty" db:"display_url"`
+	OriginURL        string `json:"origin_url,omitempty" db:"origin_url"`
+	CoverURL         string `json:"cover_url,omitempty" db:"cover_url"`
+	PlayURL480P      string `json:"play_url_480p,omitempty" db:"play_url_480p"`
+	PlayURL540P      string `json:"play_url_540p,omitempty" db:"play_url_540p"`
+	PlayURL720P      string `json:"play_url_720p,omitempty" db:"play_url_720p"`
+	ExternalProvider string `json:"external_provider,omitempty" db:"external_provider"`
+	ExternalID       string `json:"external_id,omitempty" db:"external_id"`
+	ExternalURL      string `json:"external_url,omitempty" db:"external_url"`
+	ExternalTitle    string `json:"external_title,omitempty" db:"external_title"`
+	ExternalAuthor   string `json:"external_author,omitempty" db:"external_author"`
+	Width            int    `json:"width" db:"width"`
+	Height           int    `json:"height" db:"height"`
+	DurationMS       int64  `json:"duration_ms" db:"duration_ms"`
+	Size             int64  `json:"size" db:"size"`
+	Sort             int    `json:"sort" db:"sort"`
 }
 
 type FeedComment struct {
@@ -214,6 +271,9 @@ func (u *FeedUser) Normalize() {
 	u.NativeLanguages = parseStringList(u.NativeLanguagesRaw, 5)
 	u.LearningLanguages = parseStringList(u.LearningLanguagesRaw, 5)
 	u.Age = ageFromBirthday(u.Birthday)
+	if strings.TrimSpace(u.AvatarCacheKey) == "" {
+		u.AvatarCacheKey = strings.TrimSpace(u.Vercode)
+	}
 	if strings.TrimSpace(u.Name) == "" {
 		if strings.TrimSpace(u.Username) != "" {
 			u.Name = u.Username
@@ -277,7 +337,7 @@ func ageFromBirthday(birthday string) int {
 	}
 	now := time.Now()
 	age := now.Year() - t.Year()
-	if now.YearDay() < t.YearDay() {
+	if now.Month() < t.Month() || (now.Month() == t.Month() && now.Day() < t.Day()) {
 		age--
 	}
 	if age < 0 || age > 120 {

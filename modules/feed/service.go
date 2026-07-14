@@ -20,6 +20,26 @@ func NewService(ctx *config.Context) *Service {
 	return &Service{ctx: ctx, db: newDB(ctx), Log: log.NewTLog("feedService")}
 }
 
+func (s *Service) StartTimelineMaintenanceLoop() {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.Warn("发现轻量维护退出", zap.Any("recover", r))
+			}
+		}()
+		timer := time.NewTimer(3 * time.Minute)
+		<-timer.C
+		s.CleanupExpiredVideos()
+		s.CleanupOldEvents()
+		for {
+			timer.Reset(delayUntilLocal(3, 30))
+			<-timer.C
+			s.CleanupExpiredVideos()
+			s.CleanupOldEvents()
+		}
+	}()
+}
+
 func (s *Service) StartMaintenanceLoop() {
 	go func() {
 		defer func() {
@@ -60,6 +80,14 @@ func (s *Service) RebuildRecommendScores() error {
 	return s.db.rebuildRecommendStats()
 }
 
+func (s *Service) Timeline(uid string, following bool, limit int, cursor string) ([]*FeedPost, string, int, error) {
+	return s.db.listTimeline(uid, following, limit, cursor)
+}
+
+func (s *Service) ResolveTikTok(rawURL string) (*TikTokPreviewResp, error) {
+	return resolveTikTok(rawURL)
+}
+
 func (s *Service) Recommend(uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		return s.listCachedCandidates(uid, "discover", page, limit, cursor, feedCandidateTTL, func(candidateLimit int) ([]string, error) {
@@ -84,6 +112,25 @@ func (s *Service) UserFeeds(loginUID, uid string, page, limit int, cursor string
 }
 
 func (s *Service) Publish(uid string, req PublishReq) (*FeedPost, error) {
+	for _, media := range req.Media {
+		if media == nil || !strings.EqualFold(strings.TrimSpace(media.Type), "tiktok") {
+			continue
+		}
+		preview, err := resolveTikTok(media.ExternalURL)
+		if err != nil {
+			return nil, err
+		}
+		media.Type = "tiktok"
+		media.ExternalProvider = preview.Provider
+		media.ExternalID = preview.VideoID
+		media.ExternalURL = preview.URL
+		media.ExternalTitle = preview.Title
+		media.ExternalAuthor = preview.AuthorName
+		media.CoverURL = preview.CoverURL
+		media.ThumbURL = ""
+		media.DisplayURL = ""
+		media.OriginURL = ""
+	}
 	post, err := s.db.createPost(uid, req)
 	if err == nil {
 		s.invalidateCandidateCache(uid)

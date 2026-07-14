@@ -2,6 +2,7 @@ package feed
 
 import (
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -318,9 +319,21 @@ func (d *db) limitOneBySameAuthor(raw []*FeedPost, limit int) []*FeedPost {
 
 func (d *db) listByUser(loginUID, uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
 	limit = clampLimit(limit)
+	loginUID = strings.TrimSpace(loginUID)
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return []*FeedPost{}, 0, nil
+	}
+	blocked, err := d.blockedBetween(loginUID, uid)
+	if err != nil {
+		return nil, 0, err
+	}
+	if blocked {
+		return []*FeedPost{}, 0, nil
+	}
 	offset := offsetFrom(page, cursor, limit)
 	var posts []*FeedPost
-	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
+	_, err = d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
         IFNULL(l.uid<>'',0) AS liked,
         UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
         UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
@@ -328,10 +341,12 @@ func (d *db) listByUser(loginUID, uid string, page, limit int, cursor string) ([
         FROM feed_posts p
         LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
         WHERE p.status=1 AND p.visibility='public' AND p.uid=?
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND EXISTS (SELECT 1 FROM user active_author WHERE active_author.uid=p.uid AND active_author.is_destroy=0)
+          AND EXISTS (SELECT 1 FROM feed_media fm WHERE fm.feed_id=p.feed_id AND fm.type IN ('image','tiktok'))
           AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-        ORDER BY p.created_at DESC
-        LIMIT ? OFFSET ?`, loginUID, uid, limit+1, offset).Load(&posts)
+          AND NOT EXISTS (SELECT 1 FROM feed_reports self_report WHERE self_report.feed_id=p.feed_id AND self_report.uid=?)
+        ORDER BY p.created_at DESC,p.id DESC
+        LIMIT ? OFFSET ?`, loginUID, uid, loginUID, limit+1, offset).Load(&posts)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -348,8 +363,9 @@ func (d *db) listByUser(loginUID, uid string, page, limit int, cursor string) ([
 
 func (d *db) listFollowing(loginUID string, page, limit int, cursor string) ([]*FeedPost, int, error) {
 	limit = clampLimit(limit)
+	loginUID = strings.TrimSpace(loginUID)
 	offset := offsetFrom(page, cursor, limit)
-	if strings.TrimSpace(loginUID) == "" {
+	if loginUID == "" {
 		return []*FeedPost{}, 0, nil
 	}
 	var posts []*FeedPost
@@ -362,10 +378,20 @@ func (d *db) listFollowing(loginUID string, page, limit int, cursor string) ([]*
         INNER JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
         LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
         WHERE p.status=1 AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
+          AND EXISTS (SELECT 1 FROM user active_author WHERE active_author.uid=p.uid AND active_author.is_destroy=0)
+          AND EXISTS (SELECT 1 FROM feed_media fm WHERE fm.feed_id=p.feed_id AND fm.type IN ('image','tiktok'))
           AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-        ORDER BY p.last_active_at DESC,p.created_at DESC
-        LIMIT ? OFFSET ?`, loginUID, loginUID, limit+1, offset).Load(&posts)
+          AND NOT EXISTS (SELECT 1 FROM feed_reports self_report WHERE self_report.feed_id=p.feed_id AND self_report.uid=?)
+          AND NOT EXISTS (
+              SELECT 1 FROM user_setting us_blocked_by_me
+              WHERE us_blocked_by_me.uid=? AND us_blocked_by_me.to_uid=p.uid AND us_blocked_by_me.blacklist=1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM user_setting us_blocked_me
+              WHERE us_blocked_me.uid=p.uid AND us_blocked_me.to_uid=? AND us_blocked_me.blacklist=1
+          )
+        ORDER BY p.created_at DESC,p.id DESC
+        LIMIT ? OFFSET ?`, loginUID, loginUID, loginUID, loginUID, loginUID, limit+1, offset).Load(&posts)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -381,12 +407,18 @@ func (d *db) listFollowing(loginUID string, page, limit int, cursor string) ([]*
 }
 
 func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return nil, fmt.Errorf("未登录")
+	}
 	feedID := fmt.Sprintf("feed_%d", time.Now().UnixNano())
 	text := strings.TrimSpace(req.Text)
 	if len([]rune(text)) > 280 {
 		text = string([]rune(text)[:280])
 	}
 	validMedia := make([]*FeedMedia, 0, len(req.Media))
+	imageCount := 0
+	tiktokCount := 0
 	for _, m := range req.Media {
 		if m == nil {
 			continue
@@ -395,27 +427,73 @@ func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
 		if m.Type == "" {
 			m.Type = "image"
 		}
-		if FeedImageOnly && m.Type == "video" {
-			return nil, fmt.Errorf("当前暂未开放视频发布")
-		}
-		if m.Type != "image" {
-			return nil, fmt.Errorf("当前仅支持图片发布")
-		}
-		if strings.TrimSpace(m.DisplayURL) == "" && strings.TrimSpace(m.ThumbURL) == "" && strings.TrimSpace(m.OriginURL) == "" {
-			continue
+		switch m.Type {
+		case "video":
+			return nil, fmt.Errorf("当前不开放本地视频发布")
+		case "image":
+			canonical, pathErr := normalizeFeedImagePath(uid, firstNonEmpty(m.DisplayURL, m.ThumbURL, m.OriginURL))
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			// One compressed WebP object is used for both list and fullscreen display.
+			// Store the canonical path once; clients already fall back from thumb/origin to display.
+			m.ThumbURL = ""
+			m.DisplayURL = canonical
+			m.OriginURL = ""
+			m.CoverURL = ""
+			m.ExternalProvider = ""
+			m.ExternalID = ""
+			m.ExternalURL = ""
+			m.ExternalTitle = ""
+			m.ExternalAuthor = ""
+			imageCount++
+		case "tiktok":
+			m.ExternalProvider = "tiktok"
+			// TikTok uses only the external cover. Do not repeat the same signed CDN URL
+			// in thumb/display/origin fields; FeedMedia.displayUrl() already prefers cover_url.
+			m.ThumbURL = ""
+			m.DisplayURL = ""
+			m.OriginURL = ""
+			m.ExternalID = strings.TrimSpace(m.ExternalID)
+			m.ExternalURL = strings.TrimSpace(m.ExternalURL)
+			m.CoverURL = strings.TrimSpace(m.CoverURL)
+			m.ExternalTitle = truncateRunes(strings.TrimSpace(m.ExternalTitle), 500)
+			m.ExternalAuthor = truncateRunes(strings.TrimSpace(m.ExternalAuthor), 200)
+			if m.ExternalID == "" || m.ExternalURL == "" || m.CoverURL == "" {
+				return nil, fmt.Errorf("TikTok视频信息不完整")
+			}
+			if len(m.ExternalID) > 80 || len(m.ExternalURL) > 600 || len(m.CoverURL) > 2048 {
+				return nil, fmt.Errorf("TikTok视频信息过长")
+			}
+			normalizedURL, parsedID, validateErr := validateCanonicalTikTokURL(m.ExternalURL)
+			if validateErr != nil || parsedID != m.ExternalID || !isHTTPSURL(m.CoverURL) {
+				return nil, fmt.Errorf("TikTok视频信息无效")
+			}
+			m.ExternalURL = normalizedURL
+			tiktokCount++
+		default:
+			return nil, fmt.Errorf("不支持的媒体类型")
 		}
 		validMedia = append(validMedia, m)
 	}
 	if len(validMedia) == 0 {
-		return nil, fmt.Errorf("请选择图片")
+		return nil, fmt.Errorf("请选择图片或TikTok视频")
 	}
-	if len(validMedia) > 9 {
-		return nil, fmt.Errorf("一次最多发布9张图片")
+	if tiktokCount > 1 || (tiktokCount > 0 && imageCount > 0) {
+		return nil, fmt.Errorf("TikTok视频不能与图片混合发布")
 	}
 	title := strings.TrimSpace(req.Title)
-	visibility := strings.TrimSpace(req.Visibility)
+	if len([]rune(title)) > 200 {
+		title = string([]rune(title)[:200])
+	}
+	visibility := strings.ToLower(strings.TrimSpace(req.Visibility))
 	if visibility == "" {
 		visibility = "public"
+	}
+	switch visibility {
+	case "public", "friends", "private":
+	default:
+		return nil, fmt.Errorf("动态可见范围无效")
 	}
 	nowMs := time.Now().UnixMilli()
 	tx, err := d.session.Begin()
@@ -429,11 +507,9 @@ func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
 		return nil, err
 	}
 	for i, m := range validMedia {
-		if m.Sort == 0 {
-			m.Sort = i
-		}
-		_, err = tx.InsertBySql(`INSERT INTO feed_media(feed_id,type,thumb_url,display_url,origin_url,cover_url,play_url_480p,play_url_540p,play_url_720p,width,height,duration_ms,size,sort,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`, feedID, m.Type, m.ThumbURL, m.DisplayURL, m.OriginURL, m.CoverURL, m.PlayURL480P, m.PlayURL540P, m.PlayURL720P, m.Width, m.Height, m.DurationMS, m.Size, m.Sort).Exec()
+		m.Sort = i
+		_, err = tx.InsertBySql(`INSERT INTO feed_media(feed_id,type,thumb_url,display_url,origin_url,cover_url,play_url_480p,play_url_540p,play_url_720p,external_provider,external_id,external_url,external_title,external_author,width,height,duration_ms,size,sort,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`, feedID, m.Type, m.ThumbURL, m.DisplayURL, m.OriginURL, m.CoverURL, m.PlayURL480P, m.PlayURL540P, m.PlayURL720P, m.ExternalProvider, m.ExternalID, m.ExternalURL, m.ExternalTitle, m.ExternalAuthor, m.Width, m.Height, m.DurationMS, m.Size, m.Sort).Exec()
 		if err != nil {
 			return nil, err
 		}
@@ -442,6 +518,7 @@ func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
 		return nil, err
 	}
 	post := &FeedPost{FeedID: feedID, UID: uid, Text: text, Title: title, Status: 1, Visibility: visibility, CreatedAt: nowMs, UpdatedAt: nowMs, LastActiveAt: nowMs, Score: 1}
+	_, _ = d.session.Select("id").From("feed_posts").Where("feed_id=?", feedID).Load(&post.ID)
 	_ = d.fillPosts(uid, []*FeedPost{post})
 	return post, nil
 }
@@ -462,11 +539,23 @@ func (d *db) fillPosts(loginUID string, posts []*FeedPost) error {
 		postMap[p.FeedID] = p
 	}
 	var media []*FeedMedia
-	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p", "width", "height", "duration_ms", "size", "sort").From("feed_media").Where("feed_id in ?", feedIDs).OrderBy("sort ASC").Load(&media)
+	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p", "external_provider", "external_id", "external_url", "external_title", "external_author", "width", "height", "duration_ms", "size", "sort").From("feed_media").Where("feed_id in ?", feedIDs).OrderBy("sort ASC").Load(&media)
 	if err != nil {
 		return err
 	}
 	for _, m := range media {
+		if m == nil {
+			continue
+		}
+		// Compact legacy rows at response time. Older records stored the same image URL
+		// in three columns; sending it three times only inflates timeline JSON.
+		if strings.EqualFold(strings.TrimSpace(m.Type), "tiktok") || strings.TrimSpace(m.ExternalProvider) != "" {
+			m.CoverURL = firstNonEmpty(m.CoverURL, m.DisplayURL, m.ThumbURL)
+			m.ThumbURL, m.DisplayURL, m.OriginURL = "", "", ""
+		} else if strings.EqualFold(strings.TrimSpace(m.Type), "image") {
+			m.DisplayURL = firstNonEmpty(m.DisplayURL, m.ThumbURL, m.OriginURL)
+			m.ThumbURL, m.OriginURL = "", ""
+		}
 		if p := postMap[m.FeedID]; p != nil {
 			p.Media = append(p.Media, m)
 		}
@@ -495,7 +584,7 @@ func (d *db) users(loginUID string, uids []string) (map[string]*FeedUser, error)
         IFNULL(ff.following_uid<>'',0) AS follow
         FROM user u
         LEFT JOIN feed_follows ff ON ff.following_uid=u.uid AND ff.follower_uid=?
-        WHERE u.uid in ?`, loginUID, uids).Load(&users)
+        WHERE u.uid in ? AND u.is_destroy=0`, loginUID, uids).Load(&users)
 	if err != nil {
 		return nil, err
 	}
@@ -504,6 +593,61 @@ func (d *db) users(loginUID string, uids []string) (map[string]*FeedUser, error)
 		out[u.UID] = u
 	}
 	return out, nil
+}
+
+func normalizeFeedImagePath(uid, value string) (string, error) {
+	uid = strings.TrimSpace(uid)
+	value = strings.TrimSpace(value)
+	if uid == "" || value == "" || len(value) > 2048 || strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("图片地址无效")
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "//") {
+		return "", fmt.Errorf("图片必须使用本站上传地址")
+	}
+	value = strings.TrimLeft(value, "/")
+	var relative string
+	switch {
+	case strings.HasPrefix(value, "file/preview/common/"):
+		relative = strings.TrimPrefix(value, "file/preview/common/")
+	case strings.HasPrefix(value, "common/"):
+		relative = strings.TrimPrefix(value, "common/")
+	case strings.HasPrefix(value, "feed/"):
+		relative = value
+	default:
+		return "", fmt.Errorf("图片上传路径无效")
+	}
+	relative = strings.TrimPrefix(path.Clean("/"+relative), "/")
+	expected := "feed/" + uid + "/"
+	if !strings.HasPrefix(relative, expected) {
+		return "", fmt.Errorf("图片不属于当前用户")
+	}
+	ext := strings.ToLower(path.Ext(relative))
+	switch ext {
+	case ".webp", ".jpg", ".jpeg", ".png":
+	default:
+		return "", fmt.Errorf("图片格式无效")
+	}
+	return "file/preview/common/" + relative, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func truncateRunes(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
 }
 
 func compactStrings(values []string) []string {
@@ -523,17 +667,47 @@ func compactStrings(values []string) []string {
 	return out
 }
 
+func (d *db) blockedBetween(uid, targetUID string) (bool, error) {
+	uid = strings.TrimSpace(uid)
+	targetUID = strings.TrimSpace(targetUID)
+	if uid == "" || targetUID == "" || uid == targetUID {
+		return false, nil
+	}
+	var count int
+	_, err := d.session.Select("COUNT(*)").From("user_setting").
+		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND blacklist=1", uid, targetUID, targetUID, uid).
+		Load(&count)
+	return count > 0, err
+}
+
+func (d *db) activePostAuthor(feedID string) (string, error) {
+	var authorUID string
+	_, err := d.session.SelectBySql(`SELECT p.uid FROM feed_posts p
+        INNER JOIN user u ON u.uid=p.uid AND u.is_destroy=0
+        WHERE p.feed_id=? AND p.status=1 LIMIT 1`, feedID).Load(&authorUID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(authorUID) == "" {
+		return "", fmt.Errorf("动态不存在")
+	}
+	return authorUID, nil
+}
+
 func (d *db) setLike(uid, feedID string, desired *bool) (int, int, error) {
 	if strings.TrimSpace(uid) == "" || strings.TrimSpace(feedID) == "" {
 		return 0, 0, fmt.Errorf("点赞参数无效")
 	}
-	var postExists int
-	_, err := d.session.Select("count(*)").From("feed_posts").Where("feed_id=? AND status=1", feedID).Load(&postExists)
+	authorUID, err := d.activePostAuthor(feedID)
 	if err != nil {
 		return 0, 0, err
 	}
-	if postExists == 0 {
-		return 0, 0, fmt.Errorf("动态不存在")
+	blocked, err := d.blockedBetween(uid, authorUID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if blocked {
+		return 0, 0, fmt.Errorf("已拉黑或被对方拉黑，无法点赞")
 	}
 	var exists int
 	_, err = d.session.Select("count(*)").From("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Load(&exists)
@@ -596,6 +770,40 @@ func (d *db) setLike(uid, feedID string, desired *bool) (int, int, error) {
 }
 
 func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error) {
+	uid = strings.TrimSpace(uid)
+	feedID = strings.TrimSpace(feedID)
+	if uid == "" || feedID == "" {
+		return nil, fmt.Errorf("评论参数无效")
+	}
+	authorUID, err := d.activePostAuthor(feedID)
+	if err != nil {
+		return nil, err
+	}
+	blocked, err := d.blockedBetween(uid, authorUID)
+	if err != nil {
+		return nil, err
+	}
+	if blocked {
+		return nil, fmt.Errorf("已拉黑或被对方拉黑，无法评论")
+	}
+	if replyID := strings.TrimSpace(req.ReplyToCommentID); replyID != "" {
+		var replyAuthorUID string
+		_, err = d.session.Select("uid").From("feed_comments").Where("comment_id=? AND feed_id=? AND status=1", replyID, feedID).Limit(1).Load(&replyAuthorUID)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(replyAuthorUID) == "" {
+			return nil, fmt.Errorf("回复的评论不存在")
+		}
+		replyBlocked, blockErr := d.blockedBetween(uid, replyAuthorUID)
+		if blockErr != nil {
+			return nil, blockErr
+		}
+		if replyBlocked {
+			return nil, fmt.Errorf("已拉黑或被对方拉黑，无法回复")
+		}
+		req.ReplyToCommentID = replyID
+	}
 	content := strings.TrimSpace(req.Content)
 	if content == "" {
 		return nil, nil
@@ -620,7 +828,7 @@ func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.Update("feed_posts").Set("comment_count", dbr.Expr("comment_count+1")).Set("score", dbr.Expr("score+4")).Set("last_active_at", nowMs).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=?", feedID).Exec()
+	_, err = tx.Update("feed_posts").Set("comment_count", dbr.Expr("comment_count+1")).Set("score", dbr.Expr("score+4")).Set("last_active_at", nowMs).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
 	if err != nil {
 		return nil, err
 	}
@@ -635,11 +843,33 @@ func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error
 }
 
 func (d *db) comments(loginUID, feedID string, page, limit int, cursor string) ([]*FeedComment, int, error) {
+	authorUID, err := d.activePostAuthor(feedID)
+	if err != nil {
+		return nil, 0, err
+	}
+	blocked, err := d.blockedBetween(loginUID, authorUID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if blocked {
+		return []*FeedComment{}, 0, nil
+	}
 	limit = clampLimit(limit)
 	offset := offsetFrom(page, cursor, limit)
 	var list []*FeedComment
-	_, err := d.session.SelectBySql(`SELECT comment_id,feed_id,uid,content,reply_to_comment_id,UNIX_TIMESTAMP(created_at)*1000 AS created_at_ms
-        FROM feed_comments WHERE feed_id=? AND status=1 ORDER BY created_at ASC LIMIT ? OFFSET ?`, feedID, limit+1, offset).Load(&list)
+	_, err = d.session.SelectBySql(`SELECT c.comment_id,c.feed_id,c.uid,c.content,c.reply_to_comment_id,UNIX_TIMESTAMP(c.created_at)*1000 AS created_at_ms
+        FROM feed_comments c
+        WHERE c.feed_id=? AND c.status=1
+          AND EXISTS (SELECT 1 FROM user active_user WHERE active_user.uid=c.uid AND active_user.is_destroy=0)
+          AND NOT EXISTS (
+              SELECT 1 FROM user_setting us_blocked_by_me
+              WHERE us_blocked_by_me.uid=? AND us_blocked_by_me.to_uid=c.uid AND us_blocked_by_me.blacklist=1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM user_setting us_blocked_me
+              WHERE us_blocked_me.uid=c.uid AND us_blocked_me.to_uid=? AND us_blocked_me.blacklist=1
+          )
+        ORDER BY c.created_at ASC LIMIT ? OFFSET ?`, feedID, loginUID, loginUID, limit+1, offset).Load(&list)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -688,7 +918,27 @@ func (d *db) recordExposure(uid string, posts []*FeedPost) {
 }
 
 func (d *db) follow(uid, targetUID string) error {
-	_, err := d.session.InsertBySql(`INSERT IGNORE INTO feed_follows(follower_uid,following_uid,created_at,updated_at) VALUES(?,?,NOW(),NOW())`, uid, targetUID).Exec()
+	uid = strings.TrimSpace(uid)
+	targetUID = strings.TrimSpace(targetUID)
+	if uid == "" || targetUID == "" || uid == targetUID {
+		return fmt.Errorf("关注用户无效")
+	}
+	var targetExists int
+	_, err := d.session.Select("count(*)").From("user").Where("uid=? AND is_destroy=0", targetUID).Load(&targetExists)
+	if err != nil {
+		return err
+	}
+	if targetExists == 0 {
+		return fmt.Errorf("用户不存在")
+	}
+	blocked, err := d.blockedBetween(uid, targetUID)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return fmt.Errorf("已拉黑或被对方拉黑，无法关注")
+	}
+	_, err = d.session.InsertBySql(`INSERT IGNORE INTO feed_follows(follower_uid,following_uid,created_at,updated_at) VALUES(?,?,NOW(),NOW())`, uid, targetUID).Exec()
 	return err
 }
 
@@ -698,13 +948,21 @@ func (d *db) unfollow(uid, targetUID string) error {
 }
 
 func (d *db) share(uid, feedID string) (int, error) {
-	var exists int
-	_, err := d.session.Select("count(*)").From("feed_posts").Where("feed_id=? AND status=1", feedID).Load(&exists)
+	uid = strings.TrimSpace(uid)
+	feedID = strings.TrimSpace(feedID)
+	if uid == "" || feedID == "" {
+		return 0, fmt.Errorf("分享参数无效")
+	}
+	authorUID, err := d.activePostAuthor(feedID)
 	if err != nil {
 		return 0, err
 	}
-	if exists == 0 {
-		return 0, fmt.Errorf("动态不存在")
+	blocked, err := d.blockedBetween(uid, authorUID)
+	if err != nil {
+		return 0, err
+	}
+	if blocked {
+		return 0, fmt.Errorf("已拉黑或被对方拉黑，无法分享")
 	}
 	var userShared int
 	_, err = d.session.Select("count(*)").From("feed_shares").Where("feed_id=? AND uid=?", feedID, uid).Load(&userShared)
@@ -743,8 +1001,22 @@ func (d *db) share(uid, feedID string) (int, error) {
 }
 
 func (d *db) report(uid, feedID string, req ReportReq) error {
-	reason := strings.TrimSpace(req.Reason)
-	if reason == "" {
+	uid = strings.TrimSpace(uid)
+	feedID = strings.TrimSpace(feedID)
+	if uid == "" || feedID == "" {
+		return fmt.Errorf("举报参数无效")
+	}
+	authorUID, err := d.activePostAuthor(feedID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(authorUID) == uid {
+		return fmt.Errorf("不能举报自己的动态")
+	}
+	reason := strings.ToLower(strings.TrimSpace(req.Reason))
+	switch reason {
+	case "sexual", "harassment", "spam", "fraud", "privacy", "other":
+	default:
 		reason = "other"
 	}
 	var reported int
@@ -949,7 +1221,7 @@ func (d *db) deletePost(uid, feedID string) ([]string, error) {
 
 func (d *db) hardDeletePost(feedID string) ([]string, error) {
 	var media []*FeedMedia
-	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p").From("feed_media").Where("feed_id=?", feedID).Load(&media)
+	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p", "external_provider").From("feed_media").Where("feed_id=?", feedID).Load(&media)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,6 +1280,9 @@ func mediaPaths(media []*FeedMedia) []string {
 	}
 	for _, m := range media {
 		if m == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(m.Type), "tiktok") || strings.TrimSpace(m.ExternalProvider) != "" {
 			continue
 		}
 		add(m.ThumbURL)

@@ -17,7 +17,7 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		x := ctx.(*config.Context)
 		api := New(x)
-		api.service.StartMaintenanceLoop()
+		api.service.StartTimelineMaintenanceLoop()
 		return register.Module{
 			Name:     "feed",
 			SQLDir:   register.NewSQLFS(sqlFS),
