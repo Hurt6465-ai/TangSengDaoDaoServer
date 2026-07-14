@@ -214,7 +214,14 @@ func (p *PartnerUser) Normalize() {
 	p.NativeLanguages = parseStringList(p.NativeLanguagesRaw, 5)
 	p.LearningLanguages = parseStringList(p.LearningLanguagesRaw, 5)
 	p.Tags = parseStringList(p.TagsRaw, 20)
-	p.ProfileImages = parseImageList(p.ProfileImagesRaw, 9)
+	// 语伴资料不再维护独立图片，统一使用唐僧账号头像。
+	// 这样旧客户端、旧缓存和历史 profile_images 坏路径都能稳定回退。
+	if strings.TrimSpace(p.UID) != "" {
+		p.Avatar = fmt.Sprintf("users/%s/avatar", p.UID)
+		p.ProfileImages = []string{p.Avatar}
+	} else {
+		p.ProfileImages = []string{}
+	}
 	p.Age = ageFromBirthday(p.Birthday)
 	p.LastActiveAt = normalizeMillis(p.LastActiveAt)
 	if p.LastActiveAt <= 0 && p.LastOffline > 0 {
