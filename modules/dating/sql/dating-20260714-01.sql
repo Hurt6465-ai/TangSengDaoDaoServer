@@ -4,7 +4,7 @@
 -- 旧资料没有 card_photos 时由服务端自动回退到 photos，无需重新上传。
 SET @dating_sql = IF(
   (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dating_profiles' AND COLUMN_NAME = 'card_photos') = 0,
-  'ALTER TABLE `dating_profiles` ADD COLUMN `card_photos` VARCHAR(3000) NOT NULL DEFAULT '''' AFTER `photos`',
+  'ALTER TABLE `dating_profiles` ADD COLUMN `card_photos` TEXT NULL AFTER `photos`',
   'SELECT 1'
 );
 PREPARE dating_stmt FROM @dating_sql;
