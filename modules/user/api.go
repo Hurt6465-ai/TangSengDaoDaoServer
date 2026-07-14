@@ -1768,6 +1768,13 @@ func (u *User) addBlacklist(c *wkhttp.Context) {
 		c.ResponseError(errors.New("添加黑名单失败！"))
 		return
 	}
+	// 发现关注关系独立于好友关系。拉黑时双向清掉，避免解除拉黑后旧关注自动恢复。
+	if _, err = tx.DeleteFrom("feed_follows").Where("(follower_uid=? AND following_uid=?) OR (follower_uid=? AND following_uid=?)", loginUID, uid, uid, loginUID).Exec(); err != nil {
+		tx.Rollback()
+		u.Error("清理发现关注关系失败！", zap.Error(err))
+		c.ResponseError(errors.New("添加黑名单失败！"))
+		return
+	}
 	err = u.friendDB.updateVersionTx(friendVersion, loginUID, uid, tx)
 	if err != nil {
 		tx.Rollback()
