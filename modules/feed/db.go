@@ -1,8 +1,8 @@
-package feed
+package dating
 
 import (
+	"crypto/sha256"
 	"fmt"
-	"path"
 	"strings"
 	"time"
 
@@ -19,1360 +19,1192 @@ func newDB(ctx *config.Context) *db {
 	return &db{session: ctx.DB(), ctx: ctx}
 }
 
-func (d *db) listRecommend(loginUID string, page, limit int, cursor string) ([]*FeedPost, int, error) {
-	limit = clampLimit(limit)
-	offset := offsetFrom(page, cursor, limit)
-	poolLimit := limit*6 + 8
-	if poolLimit < 40 {
-		poolLimit = 40
-	}
-	if poolLimit > 180 {
-		poolLimit = 180
-	}
+type sharedUserRow struct {
+	UID               string `db:"uid"`
+	Name              string `db:"name"`
+	Username          string `db:"username"`
+	Sex               int    `db:"sex"`
+	Birthday          string `db:"birthday"`
+	Intro             string `db:"intro"`
+	CountryCode       string `db:"country_code"`
+	Country           string `db:"country"`
+	NativeLanguages   string `db:"native_languages"`
+	LearningLanguages string `db:"learning_languages"`
+	Tags              string `db:"tags"`
+	Online            int    `db:"online"`
+	LastActiveAt      int64  `db:"last_active_at"`
+}
 
-	var raw []*FeedPost
-	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
-        IFNULL(l.uid<>'',0) AS liked,
-        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
-        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
-        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
-        FROM feed_posts p
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        LEFT JOIN feed_exposures ex ON ex.feed_id=p.feed_id AND ex.uid=?
-        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
-        LEFT JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
-        LEFT JOIN feed_recommend_stats rs ON rs.feed_id=p.feed_id
-        LEFT JOIN user author ON author.uid=p.uid
-        LEFT JOIN user viewer ON viewer.uid=?
-        WHERE p.status=1
-          AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND p.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-          AND (?='' OR p.uid<>?)
-          AND self_report.id IS NULL
-          AND IFNULL(ex.seen_count,0) < 3
-          AND IFNULL(rs.report_count,0) < 5
-        ORDER BY (
-            p.score
-            + CASE
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN 10
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 7
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 72 HOUR) THEN 4
-                ELSE 1
-              END
-            + CASE
-                WHEN viewer.sex=1 AND author.sex=0 THEN 8
-                WHEN viewer.sex=0 AND author.sex=1 THEN 8
-                WHEN viewer.sex=author.sex THEN -2
-                ELSE 0
-              END
-            + IF(ff.following_uid IS NULL,0,6)
-            + (p.like_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 30
-            + (p.comment_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 45
-            + (p.share_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 55
-            + IFNULL(rs.avg_percent,0) / 12
-            + (IFNULL(rs.complete_count,0) / GREATEST(IFNULL(rs.watch_count,0),5)) * 18
-            - IFNULL(ex.seen_count,0) * 3
-            - CASE WHEN IFNULL(ex.seen_count,0) >= 2 AND l.uid IS NULL THEN 6 ELSE 0 END
-            - IFNULL(rs.report_count,0) * 10
-            - IFNULL(rs.skip_count,0) * 2
-            - IFNULL(rs.dislike_count,0) * 6
-            - CASE WHEN IFNULL(rs.exposure_count,0) >= 10 AND (p.like_count+p.comment_count+p.share_count)=0 THEN LEAST(12,IFNULL(rs.exposure_count,0)*0.4) ELSE 0 END
-        ) DESC, p.last_active_at DESC, p.created_at DESC
-        LIMIT ? OFFSET ?`, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, poolLimit+1, offset).Load(&raw)
-	if err != nil {
-		// 兼容旧库：如果新推荐统计表/关注表迁移暂未执行，严格推荐 SQL 会失败。
-		// 用基础表兜底，避免前端直接显示“暂无作品”。
-		if offset == 0 {
-			if posts, hasMore, fbErr := d.listRecommendFallback(loginUID, limit); fbErr == nil {
-				return posts, hasMore, nil
+func (d *db) getSharedUser(uid string) (*sharedUserRow, error) {
+	var row *sharedUserRow
+	_, err := d.session.Select("uid", "IFNULL(name,'') name", "IFNULL(username,'') username", "IFNULL(sex,-1) sex", "IFNULL(birthday,'') birthday", "IFNULL(intro,'') intro", "IFNULL(country_code,'') country_code", "IFNULL(country,'') country", "IFNULL(native_languages,'') native_languages", "IFNULL(learning_languages,'') learning_languages", "IFNULL(tags,'') tags",
+		"IFNULL((SELECT MAX(uo.online) FROM user_online uo WHERE uo.uid=user.uid),0) online",
+		"IFNULL((SELECT MAX(GREATEST(uo.last_online,uo.last_offline))*1000 FROM user_online uo WHERE uo.uid=user.uid),0) last_active_at").
+		From("user").Where("uid=? AND IFNULL(is_destroy,0)=0", uid).Load(&row)
+	return row, err
+}
+
+func splitSharedTags(raw string) (relationship, jobStatus, education string, personality, pets, sports, movies []string) {
+	for _, tag := range parseStringList(raw, 100) {
+		lower := strings.ToLower(strings.TrimSpace(tag))
+		switch {
+		case strings.HasPrefix(lower, "relationship_"):
+			if relationship == "" {
+				relationship = tag
 			}
-		}
-		return nil, 0, err
-	}
-	if len(raw) == 0 && offset == 0 {
-		// 推荐池过滤比较严格：最近 7 天、排除自己、已曝光过多降权等。
-		// 新站、测试服或内容少的时候，严格池可能为空，前端就会显示“暂无作品”。
-		// 这里做一个兜底召回：放宽时间和曝光限制，并允许召回自己的公开作品，保证有内容时不会空屏。
-		return d.listRecommendFallback(loginUID, limit)
-	}
-
-	hasMore := 0
-	if len(raw) > poolLimit {
-		hasMore = 1
-		raw = raw[:poolLimit]
-	}
-	posts := d.limitOneBySameAuthor(raw, limit)
-	if len(raw) > limit || hasMore == 1 {
-		hasMore = 1
-	}
-	if err := d.fillPosts(loginUID, posts); err != nil {
-		return nil, 0, err
-	}
-	return posts, hasMore, nil
-}
-
-func (d *db) listRecommendFallback(loginUID string, limit int) ([]*FeedPost, int, error) {
-	limit = clampLimit(limit)
-	var raw []*FeedPost
-	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
-        IFNULL(l.uid<>'',0) AS liked,
-        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
-        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
-        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
-        FROM feed_posts p
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
-        WHERE p.status=1
-          AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND self_report.id IS NULL
-        ORDER BY p.created_at DESC, p.last_active_at DESC, p.score DESC
-        LIMIT ?`, loginUID, loginUID, limit+1).Load(&raw)
-	if err != nil {
-		return nil, 0, err
-	}
-	hasMore := 0
-	if len(raw) > limit {
-		hasMore = 1
-		raw = raw[:limit]
-	}
-	posts := d.limitOneBySameAuthor(raw, limit)
-	if err := d.fillPosts(loginUID, posts); err != nil {
-		return nil, 0, err
-	}
-	return posts, hasMore, nil
-}
-
-func (d *db) listRecommendCandidateIDs(loginUID string, limit int) ([]string, error) {
-	limit = clampLimit(limit)
-	if limit < feedCandidateLimit {
-		limit = feedCandidateLimit
-	}
-	var ids []string
-	_, err := d.session.SelectBySql(`SELECT p.feed_id
-        FROM feed_posts p
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        LEFT JOIN feed_exposures ex ON ex.feed_id=p.feed_id AND ex.uid=?
-        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
-        LEFT JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
-        LEFT JOIN feed_recommend_stats rs ON rs.feed_id=p.feed_id
-        LEFT JOIN user author ON author.uid=p.uid
-        LEFT JOIN user viewer ON viewer.uid=?
-        WHERE p.status=1
-          AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND p.created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)
-          AND (?='' OR p.uid<>?)
-          AND self_report.id IS NULL
-          AND IFNULL(ex.seen_count,0) < 3
-          AND IFNULL(rs.report_count,0) < 5
-        ORDER BY (
-            p.score
-            + CASE
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN 10
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 7
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 72 HOUR) THEN 4
-                ELSE 1
-              END
-            + CASE
-                WHEN viewer.sex=1 AND author.sex=0 THEN 8
-                WHEN viewer.sex=0 AND author.sex=1 THEN 8
-                WHEN viewer.sex=author.sex THEN -2
-                ELSE 0
-              END
-            + IF(ff.following_uid IS NULL,0,6)
-            + (p.like_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 30
-            + (p.comment_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 45
-            + (p.share_count / GREATEST(IFNULL(rs.exposure_count,0),10)) * 55
-            + IFNULL(rs.avg_percent,0) / 12
-            + (IFNULL(rs.complete_count,0) / GREATEST(IFNULL(rs.watch_count,0),5)) * 18
-            - IFNULL(ex.seen_count,0) * 3
-            - CASE WHEN IFNULL(ex.seen_count,0) >= 2 AND l.uid IS NULL THEN 6 ELSE 0 END
-            - IFNULL(rs.report_count,0) * 10
-            - IFNULL(rs.skip_count,0) * 2
-            - IFNULL(rs.dislike_count,0) * 6
-            - CASE WHEN IFNULL(rs.exposure_count,0) >= 10 AND (p.like_count+p.comment_count+p.share_count)=0 THEN LEAST(12,IFNULL(rs.exposure_count,0)*0.4) ELSE 0 END
-        ) DESC, p.last_active_at DESC, p.created_at DESC, p.feed_id DESC
-        LIMIT ?`, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, limit).Load(&ids)
-	if err != nil || len(ids) == 0 {
-		return d.listRecommendFallbackCandidateIDs(loginUID, limit)
-	}
-	return ids, nil
-}
-
-func (d *db) listRecommendFallbackCandidateIDs(loginUID string, limit int) ([]string, error) {
-	var ids []string
-	_, err := d.session.SelectBySql(`SELECT p.feed_id
-        FROM feed_posts p
-        LEFT JOIN feed_reports self_report ON self_report.feed_id=p.feed_id AND self_report.uid=?
-        WHERE p.status=1
-          AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND self_report.id IS NULL
-        ORDER BY p.created_at DESC, p.last_active_at DESC, p.score DESC, p.feed_id DESC
-        LIMIT ?`, loginUID, limit).Load(&ids)
-	return ids, err
-}
-
-func (d *db) listFollowingCandidateIDs(loginUID string, limit int) ([]string, error) {
-	limit = clampLimit(limit)
-	if limit < feedCandidateLimit {
-		limit = feedCandidateLimit
-	}
-	if strings.TrimSpace(loginUID) == "" {
-		return []string{}, nil
-	}
-	var ids []string
-	_, err := d.session.SelectBySql(`SELECT p.feed_id
-        FROM feed_posts p
-        INNER JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
-        WHERE p.status=1 AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-        ORDER BY p.last_active_at DESC,p.created_at DESC,p.feed_id DESC
-        LIMIT ?`, loginUID, limit).Load(&ids)
-	return ids, err
-}
-
-func (d *db) listByFeedIDs(loginUID string, feedIDs []string) ([]*FeedPost, error) {
-	feedIDs = compactStrings(feedIDs)
-	if len(feedIDs) == 0 {
-		return []*FeedPost{}, nil
-	}
-	var posts []*FeedPost
-	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
-        IFNULL(l.uid<>'',0) AS liked,
-        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
-        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
-        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
-        FROM feed_posts p
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        WHERE p.status=1 AND p.visibility='public' AND p.feed_id IN ?
-          AND EXISTS (SELECT 1 FROM feed_media fm_img WHERE fm_img.feed_id=p.feed_id AND fm_img.type='image')
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')`, loginUID, feedIDs).Load(&posts)
-	if err != nil {
-		return nil, err
-	}
-	if err := d.fillPosts(loginUID, posts); err != nil {
-		return nil, err
-	}
-	byID := map[string]*FeedPost{}
-	for _, post := range posts {
-		if post != nil {
-			byID[post.FeedID] = post
-		}
-	}
-	ordered := make([]*FeedPost, 0, len(posts))
-	for _, id := range feedIDs {
-		if post := byID[id]; post != nil {
-			ordered = append(ordered, post)
-		}
-	}
-	return ordered, nil
-}
-
-func (d *db) limitOneBySameAuthor(raw []*FeedPost, limit int) []*FeedPost {
-	if len(raw) == 0 || limit <= 0 {
-		return []*FeedPost{}
-	}
-	out := make([]*FeedPost, 0, limit)
-	delayed := make([]*FeedPost, 0)
-	for _, p := range raw {
-		if p == nil {
-			continue
-		}
-		if len(out) == 0 || out[len(out)-1].UID != p.UID {
-			out = append(out, p)
-			if len(out) >= limit {
-				return out
+		case strings.HasPrefix(lower, "job_"):
+			if jobStatus == "" {
+				jobStatus = tag
 			}
-		} else {
-			delayed = append(delayed, p)
-		}
-	}
-	for len(out) < limit && len(delayed) > 0 {
-		used := -1
-		lastUID := ""
-		if len(out) > 0 {
-			lastUID = out[len(out)-1].UID
-		}
-		for i, p := range delayed {
-			if p != nil && p.UID != lastUID {
-				used = i
-				break
+		case strings.HasPrefix(lower, "education_"):
+			if education == "" {
+				education = tag
 			}
+		case strings.HasPrefix(lower, "personality_"):
+			personality = append(personality, tag)
+		case strings.HasPrefix(lower, "pet_"):
+			pets = append(pets, tag)
+		case strings.HasPrefix(lower, "sport_"):
+			sports = append(sports, tag)
+		case strings.HasPrefix(lower, "movie_"):
+			movies = append(movies, tag)
 		}
-		if used < 0 {
-			// 极端情况下召回池只有同一个作者，只能补足结果，否则列表会空。
-			used = 0
-		}
-		out = append(out, delayed[used])
-		delayed = append(delayed[:used], delayed[used+1:]...)
 	}
-	return out
+	return relationship, jobStatus, education,
+		compactStringList(personality, 10), compactStringList(pets, 10), compactStringList(sports, 10), compactStringList(movies, 10)
 }
 
-func (d *db) listByUser(loginUID, uid string, page, limit int, cursor string) ([]*FeedPost, int, error) {
-	limit = clampLimit(limit)
-	loginUID = strings.TrimSpace(loginUID)
-	uid = strings.TrimSpace(uid)
-	if uid == "" {
-		return []*FeedPost{}, 0, nil
+// syncSharedFromUser keeps account-owned fields sourced from TangSengDaoDao user data.
+// Dating-only fields (photos, intent, bio, preferences) are not overwritten.
+func (d *db) syncSharedFromUser(uid string) error {
+	user, err := d.getSharedUser(uid)
+	if err != nil || user == nil {
+		return err
 	}
-	blocked, err := d.blockedBetween(loginUID, uid)
-	if err != nil {
-		return nil, 0, err
+	relationship, jobStatus, education, personality, pets, sports, movies := splitSharedTags(user.Tags)
+	lastActiveAt := normalizeMillis(user.LastActiveAt)
+	sharedValues := []interface{}{
+		safeText(user.Name, 100), safeText(user.Username, 40), normalizeSex(user.Sex), safeText(user.Birthday, 20),
+		safeText(user.CountryCode, 10), safeText(user.Country, 80), user.NativeLanguages, user.LearningLanguages,
+		safeText(relationship, 40), safeText(jobStatus, 80), safeText(education, 80),
+		toJSONString(personality, 10), toJSONString(pets, 10), toJSONString(sports, 10), toJSONString(movies, 10),
 	}
-	if blocked {
-		return []*FeedPost{}, 0, nil
-	}
-	offset := offsetFrom(page, cursor, limit)
-	var posts []*FeedPost
-	_, err = d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
-        IFNULL(l.uid<>'',0) AS liked,
-        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
-        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
-        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
-        FROM feed_posts p
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        WHERE p.status=1 AND p.visibility='public' AND p.uid=?
-          AND EXISTS (SELECT 1 FROM user active_author WHERE active_author.uid=p.uid AND active_author.is_destroy=0)
-          AND EXISTS (SELECT 1 FROM feed_media fm WHERE fm.feed_id=p.feed_id AND fm.type IN ('image','tiktok'))
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND NOT EXISTS (SELECT 1 FROM feed_reports self_report WHERE self_report.feed_id=p.feed_id AND self_report.uid=?)
-        ORDER BY p.created_at DESC,p.id DESC
-        LIMIT ? OFFSET ?`, loginUID, uid, loginUID, limit+1, offset).Load(&posts)
-	if err != nil {
-		return nil, 0, err
-	}
-	hasMore := 0
-	if len(posts) > limit {
-		hasMore = 1
-		posts = posts[:limit]
-	}
-	if err := d.fillPosts(loginUID, posts); err != nil {
-		return nil, 0, err
-	}
-	return posts, hasMore, nil
-}
 
-func (d *db) listFollowing(loginUID string, page, limit int, cursor string) ([]*FeedPost, int, error) {
-	limit = clampLimit(limit)
-	loginUID = strings.TrimSpace(loginUID)
-	offset := offsetFrom(page, cursor, limit)
-	if loginUID == "" {
-		return []*FeedPost{}, 0, nil
-	}
-	var posts []*FeedPost
-	_, err := d.session.SelectBySql(`SELECT p.feed_id,p.uid,p.text,p.title,p.status,p.visibility,p.like_count,p.comment_count,p.share_count,p.score,
-        IFNULL(l.uid<>'',0) AS liked,
-        UNIX_TIMESTAMP(p.created_at)*1000 AS created_at_ms,
-        UNIX_TIMESTAMP(p.updated_at)*1000 AS updated_at_ms,
-        IFNULL(p.last_active_at,UNIX_TIMESTAMP(p.updated_at)*1000) AS last_active_at
-        FROM feed_posts p
-        INNER JOIN feed_follows ff ON ff.following_uid=p.uid AND ff.follower_uid=?
-        LEFT JOIN feed_likes l ON l.feed_id=p.feed_id AND l.uid=?
-        WHERE p.status=1 AND p.visibility='public'
-          AND EXISTS (SELECT 1 FROM user active_author WHERE active_author.uid=p.uid AND active_author.is_destroy=0)
-          AND EXISTS (SELECT 1 FROM feed_media fm WHERE fm.feed_id=p.feed_id AND fm.type IN ('image','tiktok'))
-          AND NOT EXISTS (SELECT 1 FROM feed_media fm_vid WHERE fm_vid.feed_id=p.feed_id AND fm_vid.type='video')
-          AND NOT EXISTS (SELECT 1 FROM feed_reports self_report WHERE self_report.feed_id=p.feed_id AND self_report.uid=?)
-          AND NOT EXISTS (
-              SELECT 1 FROM user_setting us_blocked_by_me
-              WHERE us_blocked_by_me.uid=? AND us_blocked_by_me.to_uid=p.uid AND us_blocked_by_me.blacklist=1
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM user_setting us_blocked_me
-              WHERE us_blocked_me.uid=p.uid AND us_blocked_me.to_uid=? AND us_blocked_me.blacklist=1
-          )
-        ORDER BY p.created_at DESC,p.id DESC
-        LIMIT ? OFFSET ?`, loginUID, loginUID, loginUID, loginUID, loginUID, limit+1, offset).Load(&posts)
-	if err != nil {
-		return nil, 0, err
-	}
-	hasMore := 0
-	if len(posts) > limit {
-		hasMore = 1
-		posts = posts[:limit]
-	}
-	if err := d.fillPosts(loginUID, posts); err != nil {
-		return nil, 0, err
-	}
-	return posts, hasMore, nil
-}
-
-func (d *db) createPost(uid string, req PublishReq) (*FeedPost, error) {
-	uid = strings.TrimSpace(uid)
-	if uid == "" {
-		return nil, fmt.Errorf("未登录")
-	}
-	feedID := fmt.Sprintf("feed_%d", time.Now().UnixNano())
-	text := strings.TrimSpace(req.Text)
-	if len([]rune(text)) > 280 {
-		text = string([]rune(text)[:280])
-	}
-	validMedia := make([]*FeedMedia, 0, len(req.Media))
-	imageCount := 0
-	tiktokCount := 0
-	for _, m := range req.Media {
-		if m == nil {
-			continue
-		}
-		m.Type = strings.ToLower(strings.TrimSpace(m.Type))
-		if m.Type == "" {
-			m.Type = "image"
-		}
-		switch m.Type {
-		case "video":
-			return nil, fmt.Errorf("当前不开放本地视频发布")
-		case "image":
-			canonical, pathErr := normalizeFeedImagePath(uid, firstNonEmpty(m.DisplayURL, m.ThumbURL, m.OriginURL))
-			if pathErr != nil {
-				return nil, pathErr
-			}
-			// One compressed WebP object is used for both list and fullscreen display.
-			// Store the canonical path once; clients already fall back from thumb/origin to display.
-			m.ThumbURL = ""
-			m.DisplayURL = canonical
-			m.OriginURL = ""
-			m.CoverURL = ""
-			m.ExternalProvider = ""
-			m.ExternalID = ""
-			m.ExternalURL = ""
-			m.ExternalTitle = ""
-			m.ExternalAuthor = ""
-			imageCount++
-		case "tiktok":
-			m.ExternalProvider = "tiktok"
-			// TikTok uses only the external cover. Do not repeat the same signed CDN URL
-			// in thumb/display/origin fields; FeedMedia.displayUrl() already prefers cover_url.
-			m.ThumbURL = ""
-			m.DisplayURL = ""
-			m.OriginURL = ""
-			m.ExternalID = strings.TrimSpace(m.ExternalID)
-			m.ExternalURL = strings.TrimSpace(m.ExternalURL)
-			m.CoverURL = strings.TrimSpace(m.CoverURL)
-			m.ExternalTitle = truncateRunes(strings.TrimSpace(m.ExternalTitle), 500)
-			m.ExternalAuthor = truncateRunes(strings.TrimSpace(m.ExternalAuthor), 200)
-			if m.ExternalID == "" || m.ExternalURL == "" || m.CoverURL == "" {
-				return nil, fmt.Errorf("TikTok视频信息不完整")
-			}
-			if len(m.ExternalID) > 80 || len(m.ExternalURL) > 600 || len(m.CoverURL) > 2048 {
-				return nil, fmt.Errorf("TikTok视频信息过长")
-			}
-			normalizedURL, parsedID, validateErr := validateCanonicalTikTokURL(m.ExternalURL)
-			if validateErr != nil || parsedID != m.ExternalID || !isHTTPSURL(m.CoverURL) {
-				return nil, fmt.Errorf("TikTok视频信息无效")
-			}
-			m.ExternalURL = normalizedURL
-			tiktokCount++
-		default:
-			return nil, fmt.Errorf("不支持的媒体类型")
-		}
-		validMedia = append(validMedia, m)
-	}
-	if len(validMedia) == 0 {
-		return nil, fmt.Errorf("请选择图片或TikTok视频")
-	}
-	if tiktokCount > 1 || (tiktokCount > 0 && imageCount > 0) {
-		return nil, fmt.Errorf("TikTok视频不能与图片混合发布")
-	}
-	title := strings.TrimSpace(req.Title)
-	if len([]rune(title)) > 200 {
-		title = string([]rune(title)[:200])
-	}
-	visibility := strings.ToLower(strings.TrimSpace(req.Visibility))
-	if visibility == "" {
-		visibility = "public"
-	}
-	switch visibility {
-	case "public", "friends", "private":
-	default:
-		return nil, fmt.Errorf("动态可见范围无效")
-	}
-	nowMs := time.Now().UnixMilli()
-	tx, err := d.session.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.RollbackUnlessCommitted()
-	_, err = tx.InsertBySql(`INSERT INTO feed_posts(feed_id,uid,text,title,status,visibility,last_active_at,score,created_at,updated_at)
-        VALUES(?,?,?,?,1,?,?,1,NOW(),NOW())`, feedID, uid, text, title, visibility, nowMs).Exec()
-	if err != nil {
-		return nil, err
-	}
-	for i, m := range validMedia {
-		m.Sort = i
-		_, err = tx.InsertBySql(`INSERT INTO feed_media(feed_id,type,thumb_url,display_url,origin_url,cover_url,play_url_480p,play_url_540p,play_url_720p,external_provider,external_id,external_url,external_title,external_author,width,height,duration_ms,size,sort,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),NOW())`, feedID, m.Type, m.ThumbURL, m.DisplayURL, m.OriginURL, m.CoverURL, m.PlayURL480P, m.PlayURL540P, m.PlayURL720P, m.ExternalProvider, m.ExternalID, m.ExternalURL, m.ExternalTitle, m.ExternalAuthor, m.Width, m.Height, m.DurationMS, m.Size, m.Sort).Exec()
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	post := &FeedPost{FeedID: feedID, UID: uid, Text: text, Title: title, Status: 1, Visibility: visibility, CreatedAt: nowMs, UpdatedAt: nowMs, LastActiveAt: nowMs, Score: 1}
-	_, _ = d.session.Select("id").From("feed_posts").Where("feed_id=?", feedID).Load(&post.ID)
-	_ = d.fillPosts(uid, []*FeedPost{post})
-	return post, nil
-}
-
-func (d *db) fillPosts(loginUID string, posts []*FeedPost) error {
-	if len(posts) == 0 {
-		return nil
-	}
-	feedIDs := make([]string, 0, len(posts))
-	uids := make([]string, 0, len(posts))
-	postMap := map[string]*FeedPost{}
-	for _, p := range posts {
-		if p == nil {
-			continue
-		}
-		feedIDs = append(feedIDs, p.FeedID)
-		uids = append(uids, p.UID)
-		postMap[p.FeedID] = p
-	}
-	var media []*FeedMedia
-	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p", "external_provider", "external_id", "external_url", "external_title", "external_author", "width", "height", "duration_ms", "size", "sort").From("feed_media").Where("feed_id in ?", feedIDs).OrderBy("sort ASC").Load(&media)
+	// Insert a profile shell only once. Online/active values are initial values;
+	// subsequent presence updates are handled by user/db_online.go and touchActive.
+	_, err = d.session.InsertBySql(`INSERT IGNORE INTO dating_profiles(
+        uid,name,username,sex,birthday,country_code,country,bio,native_languages,learning_languages,
+        relationship_status,job_status,education,personality_tags,pet_tags,sport_tags,movie_tags,
+        cross_border_preference,enabled,status,show_distance,allow_voice,allow_video,online,last_active_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open_foreign',0,1,1,1,0,?,?,NOW(),NOW())`,
+		user.UID, sharedValues[0], sharedValues[1], sharedValues[2], sharedValues[3], sharedValues[4], sharedValues[5],
+		safeText(user.Intro, 500), sharedValues[6], sharedValues[7], sharedValues[8], sharedValues[9], sharedValues[10],
+		sharedValues[11], sharedValues[12], sharedValues[13], sharedValues[14], user.Online, lastActiveAt).Exec()
 	if err != nil {
 		return err
 	}
-	for _, m := range media {
-		if m == nil {
-			continue
-		}
-		// Compact legacy rows at response time. Older records stored the same image URL
-		// in three columns; sending it three times only inflates timeline JSON.
-		if strings.EqualFold(strings.TrimSpace(m.Type), "tiktok") || strings.TrimSpace(m.ExternalProvider) != "" {
-			m.CoverURL = firstNonEmpty(m.CoverURL, m.DisplayURL, m.ThumbURL)
-			m.ThumbURL, m.DisplayURL, m.OriginURL = "", "", ""
-		} else if strings.EqualFold(strings.TrimSpace(m.Type), "image") {
-			m.DisplayURL = firstNonEmpty(m.DisplayURL, m.ThumbURL, m.OriginURL)
-			m.ThumbURL, m.OriginURL = "", ""
-		}
-		if p := postMap[m.FeedID]; p != nil {
-			p.Media = append(p.Media, m)
-		}
-	}
-	users, err := d.users(loginUID, uids)
-	if err != nil {
-		return err
-	}
-	for _, p := range posts {
-		if p == nil {
-			continue
-		}
-		p.User = users[p.UID]
-	}
-	return nil
+
+	// Refresh account-owned fields only when one of them really changed. This
+	// avoids turning every profile read into a row write/lock while still making
+	// account edits visible in dating profiles.
+	updateArgs := append([]interface{}{}, sharedValues...)
+	updateArgs = append(updateArgs, user.UID)
+	updateArgs = append(updateArgs, sharedValues...)
+	_, err = d.session.UpdateBySql(`UPDATE dating_profiles SET
+        name=?,username=?,sex=?,birthday=?,country_code=?,country=?,native_languages=?,learning_languages=?,
+        relationship_status=?,job_status=?,education=?,personality_tags=?,pet_tags=?,sport_tags=?,movie_tags=?,updated_at=NOW()
+        WHERE uid=? AND (
+          NOT(name<=>?) OR NOT(username<=>?) OR NOT(sex<=>?) OR NOT(birthday<=>?) OR
+          NOT(country_code<=>?) OR NOT(country<=>?) OR NOT(native_languages<=>?) OR NOT(learning_languages<=>?) OR
+          NOT(relationship_status<=>?) OR NOT(job_status<=>?) OR NOT(education<=>?) OR
+          NOT(personality_tags<=>?) OR NOT(pet_tags<=>?) OR NOT(sport_tags<=>?) OR NOT(movie_tags<=>?)
+        )`, updateArgs...).Exec()
+	return err
 }
 
-func (d *db) users(loginUID string, uids []string) (map[string]*FeedUser, error) {
-	out := map[string]*FeedUser{}
-	uids = compactStrings(uids)
-	if len(uids) == 0 {
+func normalizeSex(v int) int {
+	if v == 0 || v == 1 {
+		return v
+	}
+	return -1
+}
+
+func profileSelect(profileAlias, userAlias string) string {
+	return fmt.Sprintf(`%[1]s.uid,
+        COALESCE(NULLIF(%[2]s.name,''),%[1]s.name) AS name,
+        COALESCE(NULLIF(%[2]s.username,''),%[1]s.username) AS username,
+        CONCAT('users/',%[1]s.uid,'/avatar') AS avatar,
+        CASE WHEN %[2]s.sex IN (0,1) THEN %[2]s.sex ELSE %[1]s.sex END AS sex,
+        COALESCE(NULLIF(%[2]s.birthday,''),%[1]s.birthday) AS birthday,
+        %[1]s.enabled,%[1]s.intent,%[1]s.cross_border_preference,%[1]s.gender_preference,%[1]s.min_age,%[1]s.max_age,%[1]s.city,
+        COALESCE(NULLIF(%[2]s.country_code,''),%[1]s.country_code) AS country_code,
+        COALESCE(NULLIF(%[2]s.country,''),%[1]s.country) AS country,
+        %[1]s.height_cm,%[1]s.weight_kg,%[1]s.job,%[1]s.job_status,%[1]s.education,%[1]s.relationship_status,%[1]s.sexual_orientation,%[1]s.drinking,%[1]s.smoking,
+        %[1]s.bio,%[1]s.ideal_partner,
+        COALESCE(NULLIF(%[2]s.native_languages,''),%[1]s.native_languages,'') AS native_languages,
+        COALESCE(NULLIF(%[2]s.learning_languages,''),%[1]s.learning_languages,'') AS learning_languages,
+        IFNULL(%[1]s.tags,'') AS tags,IFNULL(%[1]s.personality_tags,'') AS personality_tags,
+        IFNULL(%[1]s.pet_tags,'') AS pet_tags,IFNULL(%[1]s.sport_tags,'') AS sport_tags,
+        IFNULL(%[1]s.movie_tags,'') AS movie_tags,IFNULL(%[1]s.dealbreakers,'') AS dealbreakers,
+        IFNULL(%[1]s.photos,'') AS photos,IFNULL(%[1]s.card_photos,'') AS card_photos,
+        %[1]s.show_distance,%[1]s.allow_voice,%[1]s.allow_video,%[1]s.profile_score,%[1]s.status,
+        IFNULL(%[1]s.online,0) AS online,IFNULL(%[1]s.last_active_at,0) AS last_active_at,0 AS distance_meters,
+        IFNULL(%[2]s.tags,'') AS shared_tags,
+        UNIX_TIMESTAMP(%[1]s.created_at) AS created_at_unix,UNIX_TIMESTAMP(%[1]s.updated_at) AS updated_at_unix`, profileAlias, userAlias)
+}
+
+func (d *db) getProfile(uid string) (*DatingProfileResp, error) {
+	if strings.TrimSpace(uid) == "" {
+		return nil, nil
+	}
+	var profile *DatingProfileResp
+	sql := "SELECT " + profileSelect("dp", "u") + " FROM dating_profiles dp JOIN user u ON u.uid=dp.uid AND IFNULL(u.is_destroy,0)=0 WHERE dp.uid=?"
+	_, err := d.session.SelectBySql(sql, uid).Load(&profile)
+	if err != nil {
+		return nil, err
+	}
+	if profile != nil {
+		profile.Normalize()
+	}
+	return profile, nil
+}
+
+func (d *db) getProfilesByUIDs(uids []string) (map[string]*DatingProfileResp, error) {
+	unique := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		unique = append(unique, uid)
+	}
+	out := make(map[string]*DatingProfileResp, len(unique))
+	if len(unique) == 0 {
 		return out, nil
 	}
-	var users []*FeedUser
-	_, err := d.session.SelectBySql(`SELECT u.uid AS user_uid,u.name AS user_name,u.username,u.country_code,u.country,u.sex,u.birthday,u.native_languages,u.learning_languages,u.vercode,
-        IFNULL(ff.following_uid<>'',0) AS follow
-        FROM user u
-        LEFT JOIN feed_follows ff ON ff.following_uid=u.uid AND ff.follower_uid=?
-        WHERE u.uid in ? AND u.is_destroy=0`, loginUID, uids).Load(&users)
-	if err != nil {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(unique)), ",")
+	args := make([]interface{}, 0, len(unique))
+	for _, uid := range unique {
+		args = append(args, uid)
+	}
+	query := "SELECT " + profileSelect("dp", "u") +
+		" FROM dating_profiles dp JOIN user u ON u.uid=dp.uid AND IFNULL(u.is_destroy,0)=0 WHERE dp.uid IN (" + placeholders + ")"
+	var profiles []*DatingProfileResp
+	if _, err := d.session.SelectBySql(query, args...).Load(&profiles); err != nil {
 		return nil, err
 	}
-	for _, u := range users {
-		u.Normalize()
-		out[u.UID] = u
+	for _, profile := range profiles {
+		if profile == nil {
+			continue
+		}
+		profile.Normalize()
+		out[profile.UID] = profile
 	}
 	return out, nil
 }
 
-func normalizeFeedImagePath(uid, value string) (string, error) {
+func (d *db) profileMe(uid string) (*DatingProfileResp, error) {
+	if err := d.syncSharedFromUser(uid); err != nil {
+		return nil, err
+	}
+	return d.getProfile(uid)
+}
+
+// profileForUse avoids rewriting shared fields on every recommendation/swipe.
+// A row is synchronized only when it does not exist; ProfileMe/SaveProfile still
+// perform an explicit shared-field refresh.
+func (d *db) profileForUse(uid string) (*DatingProfileResp, error) {
+	profile, err := d.getProfile(uid)
+	if err != nil || profile != nil {
+		return profile, err
+	}
+	if err = d.syncSharedFromUser(uid); err != nil {
+		return nil, err
+	}
+	return d.getProfile(uid)
+}
+
+func (d *db) userExists(uid string) (bool, error) {
 	uid = strings.TrimSpace(uid)
-	value = strings.TrimSpace(value)
-	if uid == "" || value == "" || len(value) > 2048 || strings.ContainsAny(value, "\x00\r\n") {
-		return "", fmt.Errorf("图片地址无效")
-	}
-	if strings.Contains(value, "://") || strings.HasPrefix(value, "//") {
-		return "", fmt.Errorf("图片必须使用本站上传地址")
-	}
-	value = strings.TrimLeft(value, "/")
-	var relative string
-	switch {
-	case strings.HasPrefix(value, "file/preview/common/"):
-		relative = strings.TrimPrefix(value, "file/preview/common/")
-	case strings.HasPrefix(value, "common/"):
-		relative = strings.TrimPrefix(value, "common/")
-	case strings.HasPrefix(value, "feed/"):
-		relative = value
-	default:
-		return "", fmt.Errorf("图片上传路径无效")
-	}
-	relative = strings.TrimPrefix(path.Clean("/"+relative), "/")
-	expected := "feed/" + uid + "/"
-	if !strings.HasPrefix(relative, expected) {
-		return "", fmt.Errorf("图片不属于当前用户")
-	}
-	ext := strings.ToLower(path.Ext(relative))
-	switch ext {
-	case ".webp", ".jpg", ".jpeg", ".png":
-	default:
-		return "", fmt.Errorf("图片格式无效")
-	}
-	return "file/preview/common/" + relative, nil
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func truncateRunes(value string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= max {
-		return value
-	}
-	return string(runes[:max])
-}
-
-func compactStrings(values []string) []string {
-	out := make([]string, 0, len(values))
-	seen := map[string]struct{}{}
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		out = append(out, value)
-	}
-	return out
-}
-
-func (d *db) blockedBetween(uid, targetUID string) (bool, error) {
-	uid = strings.TrimSpace(uid)
-	targetUID = strings.TrimSpace(targetUID)
-	if uid == "" || targetUID == "" || uid == targetUID {
+	if uid == "" {
 		return false, nil
 	}
 	var count int
-	_, err := d.session.Select("COUNT(*)").From("user_setting").
-		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND blacklist=1", uid, targetUID, targetUID, uid).
-		Load(&count)
+	err := d.session.Select("COUNT(*)").From("user").Where("uid=? AND IFNULL(is_destroy,0)=0", uid).LoadOne(&count)
 	return count > 0, err
 }
 
-func (d *db) activePostAuthor(feedID string) (string, error) {
-	var authorUID string
-	_, err := d.session.SelectBySql(`SELECT p.uid FROM feed_posts p
-        INNER JOIN user u ON u.uid=p.uid AND u.is_destroy=0
-        WHERE p.feed_id=? AND p.status=1 LIMIT 1`, feedID).Load(&authorUID)
-	if err != nil {
-		return "", err
+func (d *db) saveProfile(uid string, req SaveProfileReq) (*DatingProfileResp, error) {
+	photos := req.Photos
+	if len(photos) == 0 {
+		photos = req.ProfileImages
 	}
-	if strings.TrimSpace(authorUID) == "" {
-		return "", fmt.Errorf("动态不存在")
+	photosRaw := toJSONString(photos, DatingMaxPhotos)
+	cardPhotos := alignCardPhotos(parseImageList(photosRaw, DatingMaxPhotos), req.CardPhotos)
+	cardPhotosRaw := toJSONString(cardPhotos, DatingMaxPhotos)
+	intent := safeText(req.Intent, 80)
+	if intent == "" {
+		intent = safeText(req.RelationshipGoal, 80)
 	}
-	return authorUID, nil
-}
-
-func (d *db) setLike(uid, feedID string, desired *bool) (int, int, error) {
-	if strings.TrimSpace(uid) == "" || strings.TrimSpace(feedID) == "" {
-		return 0, 0, fmt.Errorf("点赞参数无效")
+	bio := safeText(req.Bio, 500)
+	if bio == "" {
+		bio = safeText(req.Intro, 500)
 	}
-	authorUID, err := d.activePostAuthor(feedID)
-	if err != nil {
-		return 0, 0, err
+	cross := safeText(req.CrossBorderPreference, 40)
+	minAge, maxAge := normalizeAgeRange(req.MinAge, req.MaxAge)
+	genderPreference := req.GenderPreference
+	if genderPreference < -1 || genderPreference > 1 {
+		genderPreference = -1
 	}
-	blocked, err := d.blockedBetween(uid, authorUID)
-	if err != nil {
-		return 0, 0, err
+	enabled := 0
+	if req.Enabled == 1 {
+		enabled = 1
 	}
-	if blocked {
-		return 0, 0, fmt.Errorf("已拉黑或被对方拉黑，无法点赞")
-	}
-	var exists int
-	_, err = d.session.Select("count(*)").From("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Load(&exists)
-	if err != nil {
-		return 0, 0, err
-	}
-	// New wkfeed clients always send the desired final state. If an old/empty request
-	// reaches here, prefer idempotent "set liked" over legacy toggle to avoid retry/order races.
-	wantLike := true
-	if desired != nil {
-		wantLike = *desired
-	}
-	if (exists > 0 && wantLike) || (exists == 0 && !wantLike) {
-		var count int
-		_, _ = d.session.Select("like_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
-		if wantLike {
-			return 1, count, nil
-		}
-		return 0, count, nil
-	}
-	tx, err := d.session.Begin()
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.RollbackUnlessCommitted()
-	liked := 0
-	if wantLike {
-		res, err := tx.InsertBySql("INSERT IGNORE INTO feed_likes(feed_id,uid,created_at) VALUES(?,?,NOW())", feedID, uid).Exec()
-		if err != nil {
-			return 0, 0, err
-		}
-		affected, _ := res.RowsAffected()
-		if affected > 0 {
-			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("like_count+1")).Set("score", dbr.Expr("score+2")).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-			if err != nil {
-				return 0, 0, err
-			}
-		}
-		liked = 1
-	} else {
-		res, err := tx.DeleteFrom("feed_likes").Where("feed_id=? and uid=?", feedID, uid).Exec()
-		if err != nil {
-			return 0, 0, err
-		}
-		affected, _ := res.RowsAffected()
-		if affected > 0 {
-			_, err = tx.Update("feed_posts").Set("like_count", dbr.Expr("GREATEST(like_count-1,0)")).Set("score", dbr.Expr("GREATEST(score-2,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-			if err != nil {
-				return 0, 0, err
-			}
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, 0, err
-	}
-	var count int
-	_, _ = d.session.Select("like_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
-	d.syncRecommendCounters(feedID)
-	return liked, count, nil
-}
-
-func (d *db) addComment(uid, feedID string, req CommentReq) (*FeedComment, error) {
-	uid = strings.TrimSpace(uid)
-	feedID = strings.TrimSpace(feedID)
-	if uid == "" || feedID == "" {
-		return nil, fmt.Errorf("评论参数无效")
-	}
-	authorUID, err := d.activePostAuthor(feedID)
+	_, err := d.session.Update("dating_profiles").
+		Set("enabled", enabled).
+		Set("intent", intent).
+		Set("cross_border_preference", dbr.Expr("IF(?='',cross_border_preference,?)", cross, cross)).
+		Set("gender_preference", genderPreference).
+		Set("min_age", minAge).
+		Set("max_age", maxAge).
+		Set("city", safeText(req.City, 80)).
+		Set("height_cm", clampInt(req.HeightCM, 0, 260)).
+		Set("weight_kg", clampInt(req.WeightKG, 0, 400)).
+		Set("sexual_orientation", safeText(req.SexualOrientation, 40)).
+		Set("drinking", safeText(req.Drinking, 40)).
+		Set("smoking", safeText(req.Smoking, 40)).
+		Set("bio", bio).
+		Set("ideal_partner", safeText(req.IdealPartner, 200)).
+		Set("tags", toJSONString(req.Tags, DatingMaxTags)).
+		Set("dealbreakers", toJSONString(req.Dealbreakers, DatingMaxDealbreakers)).
+		Set("photos", photosRaw).
+		Set("card_photos", cardPhotosRaw).
+		Set("has_photo", boolInt(len(parseImageList(photosRaw, DatingMaxPhotos)) > 0)).
+		Set("show_distance", optionalFlag(req.ShowDistance, 1)).
+		Set("allow_voice", optionalFlag(req.AllowVoice, 1)).
+		Set("allow_video", optionalFlag(req.AllowVideo, 0)).
+		Set("last_active_at", time.Now().UnixMilli()).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("uid=?", uid).Exec()
 	if err != nil {
 		return nil, err
 	}
-	blocked, err := d.blockedBetween(uid, authorUID)
-	if err != nil {
-		return nil, err
+	profile, err := d.getProfile(uid)
+	if err == nil && profile != nil {
+		_, _ = d.session.Update("dating_profiles").Set("profile_score", profile.ProfileScore).Where("uid=?", uid).Exec()
 	}
-	if blocked {
-		return nil, fmt.Errorf("已拉黑或被对方拉黑，无法评论")
-	}
-	if replyID := strings.TrimSpace(req.ReplyToCommentID); replyID != "" {
-		var replyAuthorUID string
-		_, err = d.session.Select("uid").From("feed_comments").Where("comment_id=? AND feed_id=? AND status=1", replyID, feedID).Limit(1).Load(&replyAuthorUID)
-		if err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(replyAuthorUID) == "" {
-			return nil, fmt.Errorf("回复的评论不存在")
-		}
-		replyBlocked, blockErr := d.blockedBetween(uid, replyAuthorUID)
-		if blockErr != nil {
-			return nil, blockErr
-		}
-		if replyBlocked {
-			return nil, fmt.Errorf("已拉黑或被对方拉黑，无法回复")
-		}
-		req.ReplyToCommentID = replyID
-	}
-	content := strings.TrimSpace(req.Content)
-	if content == "" {
-		return nil, nil
-	}
-	maxLen := 500
-	if strings.HasPrefix(content, "voice:") || strings.HasPrefix(content, "voice_local:") {
-		// 语音评论会把 音频地址|时长|waveformBase64 放在 content 内，500 字容易截断导致无法播放。
-		maxLen = 4096
-	}
-	if len([]rune(content)) > maxLen {
-		content = string([]rune(content)[:maxLen])
-	}
-	commentID := fmt.Sprintf("cmt_%d", time.Now().UnixNano())
-	nowMs := time.Now().UnixMilli()
-	tx, err := d.session.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.RollbackUnlessCommitted()
-	_, err = tx.InsertBySql(`INSERT INTO feed_comments(comment_id,feed_id,uid,content,reply_to_comment_id,status,created_at,updated_at)
-        VALUES(?,?,?,?,?,1,NOW(),NOW())`, commentID, feedID, uid, content, req.ReplyToCommentID).Exec()
-	if err != nil {
-		return nil, err
-	}
-	_, err = tx.Update("feed_posts").Set("comment_count", dbr.Expr("comment_count+1")).Set("score", dbr.Expr("score+4")).Set("last_active_at", nowMs).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-	if err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	comment := &FeedComment{CommentID: commentID, FeedID: feedID, UID: uid, Content: content, ReplyToCommentID: req.ReplyToCommentID, CreatedAt: nowMs}
-	d.syncRecommendCounters(feedID)
-	users, _ := d.users(uid, []string{uid})
-	comment.FillUser(users[uid])
-	return comment, nil
+	return profile, err
 }
 
-func (d *db) comments(loginUID, feedID string, page, limit int, cursor string) ([]*FeedComment, int, error) {
-	authorUID, err := d.activePostAuthor(feedID)
-	if err != nil {
-		return nil, 0, err
-	}
-	blocked, err := d.blockedBetween(loginUID, authorUID)
-	if err != nil {
-		return nil, 0, err
-	}
-	if blocked {
-		return []*FeedComment{}, 0, nil
-	}
-	limit = clampLimit(limit)
-	offset := offsetFrom(page, cursor, limit)
-	var list []*FeedComment
-	_, err = d.session.SelectBySql(`SELECT c.comment_id,c.feed_id,c.uid,c.content,c.reply_to_comment_id,UNIX_TIMESTAMP(c.created_at)*1000 AS created_at_ms
-        FROM feed_comments c
-        WHERE c.feed_id=? AND c.status=1
-          AND EXISTS (SELECT 1 FROM user active_user WHERE active_user.uid=c.uid AND active_user.is_destroy=0)
-          AND NOT EXISTS (
-              SELECT 1 FROM user_setting us_blocked_by_me
-              WHERE us_blocked_by_me.uid=? AND us_blocked_by_me.to_uid=c.uid AND us_blocked_by_me.blacklist=1
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM user_setting us_blocked_me
-              WHERE us_blocked_me.uid=c.uid AND us_blocked_me.to_uid=? AND us_blocked_me.blacklist=1
-          )
-        ORDER BY c.created_at ASC LIMIT ? OFFSET ?`, feedID, loginUID, loginUID, limit+1, offset).Load(&list)
-	if err != nil {
-		return nil, 0, err
-	}
-	hasMore := 0
-	if len(list) > limit {
-		hasMore = 1
-		list = list[:limit]
-	}
-	uids := make([]string, 0, len(list))
-	for _, c := range list {
-		if c != nil {
-			uids = append(uids, c.UID)
-		}
-	}
-	users, err := d.users(loginUID, uids)
-	if err != nil {
-		return nil, 0, err
-	}
-	for _, c := range list {
-		if c != nil {
-			c.FillUser(users[c.UID])
-		}
-	}
-	return list, hasMore, nil
-}
-
-func (d *db) recordExposure(uid string, posts []*FeedPost) {
-	if uid == "" || len(posts) == 0 {
-		return
-	}
-	tx, err := d.session.Begin()
-	if err != nil {
-		return
-	}
-	defer tx.RollbackUnlessCommitted()
-	now := time.Now().UnixMilli()
-	for _, p := range posts {
-		if p == nil || p.FeedID == "" {
-			continue
-		}
-		_, _ = tx.InsertBySql(`INSERT INTO feed_exposures(uid,feed_id,seen_count,last_seen_at,created_at,updated_at)
-            VALUES(?,?,1,?,NOW(),NOW())
-            ON DUPLICATE KEY UPDATE seen_count=seen_count+1,last_seen_at=VALUES(last_seen_at),updated_at=NOW()`, uid, p.FeedID, now).Exec()
-	}
-	_ = tx.Commit()
-}
-
-func (d *db) follow(uid, targetUID string) error {
-	uid = strings.TrimSpace(uid)
-	targetUID = strings.TrimSpace(targetUID)
-	if uid == "" || targetUID == "" || uid == targetUID {
-		return fmt.Errorf("关注用户无效")
-	}
-	var targetExists int
-	_, err := d.session.Select("count(*)").From("user").Where("uid=? AND is_destroy=0", targetUID).Load(&targetExists)
-	if err != nil {
-		return err
-	}
-	if targetExists == 0 {
-		return fmt.Errorf("用户不存在")
-	}
-	blocked, err := d.blockedBetween(uid, targetUID)
-	if err != nil {
-		return err
-	}
-	if blocked {
-		return fmt.Errorf("已拉黑或被对方拉黑，无法关注")
-	}
-	_, err = d.session.InsertBySql(`INSERT IGNORE INTO feed_follows(follower_uid,following_uid,created_at,updated_at) VALUES(?,?,NOW(),NOW())`, uid, targetUID).Exec()
-	return err
-}
-
-func (d *db) unfollow(uid, targetUID string) error {
-	_, err := d.session.DeleteFrom("feed_follows").Where("follower_uid=? AND following_uid=?", uid, targetUID).Exec()
-	return err
-}
-
-func (d *db) share(uid, feedID string) (int, error) {
-	uid = strings.TrimSpace(uid)
-	feedID = strings.TrimSpace(feedID)
-	if uid == "" || feedID == "" {
-		return 0, fmt.Errorf("分享参数无效")
-	}
-	authorUID, err := d.activePostAuthor(feedID)
-	if err != nil {
-		return 0, err
-	}
-	blocked, err := d.blockedBetween(uid, authorUID)
-	if err != nil {
-		return 0, err
-	}
-	if blocked {
-		return 0, fmt.Errorf("已拉黑或被对方拉黑，无法分享")
-	}
-	var userShared int
-	_, err = d.session.Select("count(*)").From("feed_shares").Where("feed_id=? AND uid=?", feedID, uid).Load(&userShared)
-	if err != nil {
-		return 0, err
-	}
-	if userShared > 0 {
-		var count int
-		_, _ = d.session.Select("share_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
-		return count, nil
-	}
-	nowMs := time.Now().UnixMilli()
-	tx, err := d.session.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.RollbackUnlessCommitted()
-	res, err := tx.InsertBySql(`INSERT IGNORE INTO feed_shares(feed_id,uid,created_at) VALUES(?,?,NOW())`, feedID, uid).Exec()
-	if err != nil {
-		return 0, err
-	}
-	affected, _ := res.RowsAffected()
-	if affected > 0 {
-		_, err = tx.Update("feed_posts").Set("share_count", dbr.Expr("share_count+1")).Set("last_active_at", nowMs).Set("score", dbr.Expr("score+3")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-		if err != nil {
-			return 0, err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, err
-	}
-	var count int
-	_, _ = d.session.Select("share_count").From("feed_posts").Where("feed_id=?", feedID).Load(&count)
-	d.syncRecommendCounters(feedID)
-	return count, nil
-}
-
-func (d *db) report(uid, feedID string, req ReportReq) error {
-	uid = strings.TrimSpace(uid)
-	feedID = strings.TrimSpace(feedID)
-	if uid == "" || feedID == "" {
-		return fmt.Errorf("举报参数无效")
-	}
-	authorUID, err := d.activePostAuthor(feedID)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(authorUID) == uid {
-		return fmt.Errorf("不能举报自己的动态")
-	}
-	reason := strings.ToLower(strings.TrimSpace(req.Reason))
-	switch reason {
-	case "sexual", "harassment", "spam", "fraud", "privacy", "other":
-	default:
-		reason = "other"
-	}
-	var reported int
-	_, err = d.session.Select("count(*)").From("feed_reports").Where("feed_id=? AND uid=?", feedID, uid).Load(&reported)
-	if err != nil {
-		return err
-	}
-	if reported > 0 {
-		return nil
-	}
-	tx, err := d.session.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.RollbackUnlessCommitted()
-	res, err := tx.InsertBySql(`INSERT IGNORE INTO feed_reports(feed_id,uid,reason,status,created_at,updated_at) VALUES(?,?,?,0,NOW(),NOW())`, feedID, uid, reason).Exec()
-	if err != nil {
-		return err
-	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		return tx.Commit()
-	}
-	if _, err = tx.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score-8,0)")).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec(); err != nil {
-		return err
-	}
-	var reportCount int
-	_, _ = tx.Select("count(*)").From("feed_reports").Where("feed_id=? AND status=0", feedID).Load(&reportCount)
-	if reportCount >= 10 {
-		_, _ = tx.Update("feed_posts").Set("status", 3).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	d.syncRecommendCounters(feedID)
-	return nil
-}
-
-func (d *db) event(uid, feedID string, req EventReq) error {
-	eventType := req.NormalizedEventType()
-	if d.isRecentDuplicateEvent(uid, feedID, eventType) {
-		return nil
-	}
-	if len([]rune(req.Extra)) > 1000 {
-		req.Extra = string([]rune(req.Extra)[:1000])
-	}
-	_, err := d.session.InsertBySql(`INSERT INTO feed_events(feed_id,uid,event_type,watch_ms,duration_ms,percent,media_type,extra,created_at)
-        VALUES(?,?,?,?,?,?,?,?,NOW())`, feedID, uid, eventType, req.WatchMS, req.DurationMS, req.Percent, strings.TrimSpace(req.MediaType), strings.TrimSpace(req.Extra)).Exec()
-	if err != nil {
-		return err
-	}
-	if eventType == "expose" {
-		// The exact exposure aggregate lives in feed_exposures and is rebuilt into
-		// feed_recommend_stats by the maintenance job. Avoid double/approx realtime
-		// exposure counters here; per-user repeat control works from feed_exposures.
-		d.recordExposure(uid, []*FeedPost{{FeedID: feedID}})
-	} else {
-		d.bumpRecommendStats(feedID, eventType, req)
-	}
-	delta := d.eventScoreDelta(req)
-	if delta != 0 {
-		_, _ = d.session.Update("feed_posts").Set("score", dbr.Expr("GREATEST(score+?,0)", delta)).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("feed_id=? AND status=1", feedID).Exec()
-	}
-	return nil
-}
-
-func (d *db) isRecentDuplicateEvent(uid, feedID, eventType string) bool {
-	if uid == "" || feedID == "" {
-		return true
-	}
-	window := eventDedupeWindow(eventType)
-	if window <= 0 {
-		return false
-	}
-	var recent int
-	_, err := d.session.SelectBySql(`SELECT COUNT(*) FROM feed_events WHERE uid=? AND feed_id=? AND event_type=? AND created_at>=?`, uid, feedID, eventType, time.Now().Add(-window)).Load(&recent)
-	if err != nil {
-		return false
-	}
-	return recent > 0
-}
-
-func eventDedupeWindow(eventType string) time.Duration {
-	switch eventType {
-	case "watch":
-		return 30 * time.Second
-	case "complete":
-		return 10 * time.Minute
-	case "skip":
-		return 45 * time.Second
-	case "dislike":
-		return 6 * time.Hour
-	case "expose":
-		return 60 * time.Second
-	default:
-		return 60 * time.Second
-	}
-}
-
-func (d *db) eventScoreDelta(req EventReq) float64 {
-	eventType := req.NormalizedEventType()
-	switch eventType {
-	case "complete":
-		return 1.2
-	case "watch":
-		if req.Percent >= 80 || req.WatchMS >= 5000 {
-			return 0.8
-		}
-		if req.Percent <= 10 && req.WatchMS <= 1500 {
-			return -0.5
-		}
-	case "skip":
-		return -1
-	case "dislike":
-		return -3
+func boolInt(v bool) int {
+	if v {
+		return 1
 	}
 	return 0
 }
 
-func (d *db) syncRecommendCounters(feedID string) {
-	if strings.TrimSpace(feedID) == "" {
-		return
+func optionalFlag(value *int, fallback int) int {
+	if value == nil {
+		return boolInt(fallback != 0)
 	}
-	_, _ = d.session.InsertBySql(`INSERT INTO feed_recommend_stats(feed_id,like_count,comment_count,share_count,report_count,updated_at)
-        SELECT p.feed_id,p.like_count,p.comment_count,p.share_count,IFNULL(r.report_count,0),NOW()
-        FROM feed_posts p
-        LEFT JOIN (SELECT feed_id,COUNT(*) report_count FROM feed_reports WHERE feed_id=? AND status=0 GROUP BY feed_id) r ON r.feed_id=p.feed_id
-        WHERE p.feed_id=?
-        ON DUPLICATE KEY UPDATE
-          like_count=VALUES(like_count),
-          comment_count=VALUES(comment_count),
-          share_count=VALUES(share_count),
-          report_count=VALUES(report_count),
-          updated_at=NOW()`, feedID, feedID).Exec()
+	return boolInt(*value != 0)
 }
 
-func (d *db) bumpRecommendStats(feedID string, eventType string, req EventReq) {
-	if strings.TrimSpace(feedID) == "" || strings.TrimSpace(eventType) == "" {
-		return
+func (d *db) setEnabled(uid string, enabled int) (*DatingProfileResp, error) {
+	if enabled != 1 {
+		enabled = 0
 	}
-	watchInc := 0
-	completeInc := 0
-	skipInc := 0
-	dislikeInc := 0
-	exposureInc := 0
-	switch eventType {
-	case "expose":
-		exposureInc = 1
-	case "watch":
-		watchInc = 1
-	case "complete":
-		completeInc = 1
-		watchInc = 1
-	case "skip":
-		skipInc = 1
-	case "dislike":
-		dislikeInc = 1
+	builder := d.session.Update("dating_profiles").Set("enabled", enabled).Set("last_active_at", time.Now().UnixMilli()).Set("updated_at", dbr.Expr("NOW()")).Where("uid=?", uid)
+	if enabled == 1 {
+		builder = builder.Where("status=?", DatingProfileNormal)
 	}
-	if exposureInc == 0 && watchInc == 0 && completeInc == 0 && skipInc == 0 && dislikeInc == 0 {
-		return
+	if _, err := builder.Exec(); err != nil {
+		return nil, err
 	}
-	watchMS := req.WatchMS
-	if watchMS < 0 {
-		watchMS = 0
-	}
-	percent := req.Percent
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-	_, _ = d.session.InsertBySql(`INSERT INTO feed_recommend_stats(
-        feed_id,exposure_count,exposed_users,watch_count,complete_count,skip_count,dislike_count,avg_watch_ms,avg_percent,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,NOW())
-        ON DUPLICATE KEY UPDATE
-          avg_watch_ms=CASE WHEN VALUES(watch_count)>0 AND VALUES(avg_watch_ms)>0 THEN ROUND((avg_watch_ms*GREATEST(watch_count,0)+VALUES(avg_watch_ms))/GREATEST(watch_count+VALUES(watch_count),1)) ELSE avg_watch_ms END,
-          avg_percent=CASE WHEN VALUES(watch_count)>0 AND VALUES(avg_percent)>0 THEN ROUND((avg_percent*GREATEST(watch_count,0)+VALUES(avg_percent))/GREATEST(watch_count+VALUES(watch_count),1)) ELSE avg_percent END,
-          exposure_count=exposure_count+VALUES(exposure_count),
-          exposed_users=GREATEST(exposed_users, VALUES(exposed_users)),
-          watch_count=watch_count+VALUES(watch_count),
-          complete_count=complete_count+VALUES(complete_count),
-          skip_count=skip_count+VALUES(skip_count),
-          dislike_count=dislike_count+VALUES(dislike_count),
-          updated_at=NOW()`, feedID, exposureInc, exposureInc, watchInc, completeInc, skipInc, dislikeInc, watchMS, percent).Exec()
+	return d.getProfile(uid)
 }
 
-func (d *db) deletePost(uid, feedID string) ([]string, error) {
-	var owner string
-	_, err := d.session.Select("uid").From("feed_posts").Where("feed_id=? AND status<>0", feedID).Load(&owner)
+func (d *db) upsertLocation(uid string, req LocationReq) (*DatingProfileResp, error) {
+	if err := d.syncSharedFromUser(uid); err != nil {
+		return nil, err
+	}
+	lat, lng := req.NormalizedLatLng()
+	now := time.Now().UnixMilli()
+	expires := now + DatingLocationTTLMS
+	radius := req.RadiusMeters
+	if radius <= 0 || radius > DatingRadiusMeters {
+		radius = DatingRadiusMeters
+	}
+	if req.ExpiresDays > 0 && req.ExpiresDays <= 60 {
+		expires = now + int64(req.ExpiresDays)*int64(24*time.Hour/time.Millisecond)
+	}
+	update := d.session.Update("dating_profiles").Set("lat", lat).Set("lng", lng).Set("accuracy", req.Accuracy).
+		Set("radius_meters", radius).Set("location_updated_at", now).Set("expires_at", expires).
+		Set("last_active_at", now).Set("updated_at", dbr.Expr("updated_at"))
+	if city := safeText(req.City, 80); city != "" {
+		update = update.Set("city", city)
+	}
+	if countryCode := safeText(strings.ToUpper(req.CountryCode), 10); countryCode != "" {
+		update = update.Set("country_code", countryCode)
+	}
+	_, err := update.Where("uid=?", uid).Exec()
 	if err != nil {
 		return nil, err
 	}
-	if owner == "" {
-		return nil, fmt.Errorf("动态不存在")
-	}
-	if owner != uid {
-		return nil, fmt.Errorf("只能删除自己的作品")
-	}
-	return d.hardDeletePost(feedID)
+	return d.getProfile(uid)
 }
 
-func (d *db) hardDeletePost(feedID string) ([]string, error) {
-	var media []*FeedMedia
-	_, err := d.session.Select("id", "feed_id", "type", "thumb_url", "display_url", "origin_url", "cover_url", "play_url_480p", "play_url_540p", "play_url_720p", "external_provider").From("feed_media").Where("feed_id=?", feedID).Load(&media)
-	if err != nil {
-		return nil, err
-	}
-	paths := mediaPaths(media)
-	tx, err := d.session.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.RollbackUnlessCommitted()
-	if _, err = tx.DeleteFrom("feed_likes").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_comments").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_exposures").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_reports").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_shares").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_events").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_recommend_stats").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_media").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if _, err = tx.DeleteFrom("feed_posts").Where("feed_id=?", feedID).Exec(); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	return paths, nil
+type datingLocation struct {
+	Lat float64 `db:"lat"`
+	Lng float64 `db:"lng"`
 }
 
-func mediaPaths(media []*FeedMedia) []string {
-	seen := map[string]struct{}{}
-	paths := make([]string, 0)
-	add := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
+func (d *db) getDatingLocation(uid string) (*datingLocation, error) {
+	var loc *datingLocation
+	_, err := d.session.Select("lat", "lng").From("dating_profiles").Where("uid=? AND expires_at>?", uid, time.Now().UnixMilli()).Load(&loc)
+	return loc, err
+}
+
+func (d *db) recommend(loginUID string, viewer *DatingProfileResp, req RecommendReq) ([]*DatingProfileResp, string, int, error) {
+	limit := req.Limit
+	if limit <= 0 {
+		limit = DefaultDatingLimit
+	}
+	if limit > MaxDatingLimit {
+		limit = MaxDatingLimit
+	}
+	batchSize := limit * 6
+	if batchSize < 80 {
+		batchSize = 80
+	}
+	if batchSize > 200 {
+		batchSize = 200
+	}
+	const maxScan = 1200
+
+	distanceSelect := "0 AS distance_meters"
+	whereLocation := ""
+	argsPrefix := []interface{}{}
+	argsLocation := []interface{}{}
+	loc, _ := d.getDatingLocation(loginUID)
+	if loc != nil && validLatLng(loc.Lat, loc.Lng) {
+		distanceExpr := `IF(dp.expires_at>? AND dp.lat<>0 AND dp.lng<>0, IFNULL(CAST((6371000 * 2 * ASIN(SQRT(POWER(SIN(RADIANS(dp.lat - ?)/2),2)+COS(RADIANS(?))*COS(RADIANS(dp.lat))*POWER(SIN(RADIANS(dp.lng - ?)/2),2)))) AS UNSIGNED),0),0)`
+		distanceSelect = distanceExpr + " AS distance_meters"
+		argsPrefix = append(argsPrefix, time.Now().UnixMilli(), loc.Lat, loc.Lat, loc.Lng)
+		if normalizeScope(req.Scope) == DatingScopeNearby {
+			minLat, maxLat, minLng, maxLng := latLngBounds(loc.Lat, loc.Lng, DatingRadiusMeters)
+			whereLocation = " AND dp.expires_at>? AND dp.lat BETWEEN ? AND ? AND dp.lng BETWEEN ? AND ? AND " + distanceExpr + " <= ? "
+			argsLocation = append(argsLocation, time.Now().UnixMilli(), minLat, maxLat, minLng, maxLng,
+				time.Now().UnixMilli(), loc.Lat, loc.Lat, loc.Lng, DatingRadiusMeters)
 		}
-		if _, ok := seen[v]; ok {
-			return
-		}
-		seen[v] = struct{}{}
-		paths = append(paths, v)
+	} else if normalizeScope(req.Scope) == DatingScopeNearby {
+		return []*DatingProfileResp{}, "", 0, nil
 	}
-	for _, m := range media {
-		if m == nil {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(m.Type), "tiktok") || strings.TrimSpace(m.ExternalProvider) != "" {
-			continue
-		}
-		add(m.ThumbURL)
-		add(m.DisplayURL)
-		add(m.OriginURL)
-		add(m.CoverURL)
-		add(m.PlayURL480P)
-		add(m.PlayURL540P)
-		add(m.PlayURL720P)
+
+	sessionID := safeText(req.SessionID, 80)
+	if sessionID == "" {
+		sessionID = "default"
 	}
-	return paths
+	activeAfter := time.Now().UnixMilli() - DatingActiveWindowMS
+	desiredSex := viewer.GenderPreference
+	switch strings.ToLower(strings.TrimSpace(req.Gender)) {
+	case "female", "woman", "0":
+		desiredSex = 0
+	case "male", "man", "1":
+		desiredSex = 1
+	}
+	effectiveAgeMin, effectiveAgeMax := viewer.MinAge, viewer.MaxAge
+	if req.AgeMin > effectiveAgeMin {
+		effectiveAgeMin = req.AgeMin
+	}
+	if req.AgeMax > 0 && req.AgeMax < effectiveAgeMax {
+		effectiveAgeMax = req.AgeMax
+	}
+	if effectiveAgeMin < 18 {
+		effectiveAgeMin = 18
+	}
+	if effectiveAgeMax > 99 {
+		effectiveAgeMax = 99
+	}
+	if effectiveAgeMax < effectiveAgeMin {
+		return []*DatingProfileResp{}, "", 0, nil
+	}
+
+	intentFilter := safeText(req.Intent, 80)
+	intentWhere := ""
+	intentArgs := make([]interface{}, 0, 2)
+	switch intentFilter {
+	case "":
+	case DatingIntentFilterSerious:
+		intentWhere = " AND dp.intent IN (?,?) "
+		intentArgs = append(intentArgs, DatingIntentLongTerm, DatingIntentLongTermOpenShort)
+	case DatingIntentFilterMarriage:
+		intentWhere = " AND dp.intent=? "
+		intentArgs = append(intentArgs, DatingIntentLongTerm)
+	default:
+		normalized, ok := normalizeDatingIntent(intentFilter)
+		if !ok {
+			return []*DatingProfileResp{}, "", 0, ErrDatingInvalidIntent
+		}
+		intentWhere = " AND dp.intent=? "
+		intentArgs = append(intentArgs, normalized)
+	}
+
+	targetCountryExpr := "UPPER(TRIM(COALESCE(NULLIF(u.country_code,''),dp.country_code)))"
+	targetRejectExpr := `(LOWER(TRIM(dp.cross_border_preference)) IN ('same_country','same-country','local_only','nearby_only','no_foreign','refuse_foreign')
+        OR dp.cross_border_preference LIKE '%只接受本国%' OR dp.cross_border_preference LIKE '%拒绝异国%' OR dp.cross_border_preference LIKE '%本国恋%')`
+	viewerCountry := strings.ToUpper(strings.TrimSpace(viewer.CountryCode))
+	countryWhere := ""
+	countryArgs := make([]interface{}, 0, 2)
+	countryMode := strings.ToLower(strings.TrimSpace(req.CountryMode))
+	if viewer.RejectsCrossBorder() || countryMode == "same_country" || countryMode == "same-country" || countryMode == "local_only" {
+		if viewerCountry == "" {
+			return []*DatingProfileResp{}, "", 0, nil
+		}
+		countryWhere = " AND " + targetCountryExpr + "=? "
+		countryArgs = append(countryArgs, viewerCountry)
+	} else if countryMode == "foreign_open" || countryMode == "foreign" || countryMode == "cross_border" {
+		if viewerCountry == "" {
+			return []*DatingProfileResp{}, "", 0, nil
+		}
+		countryWhere = " AND " + targetCountryExpr + "<>'' AND " + targetCountryExpr + "<>? AND NOT " + targetRejectExpr + " "
+		countryArgs = append(countryArgs, viewerCountry)
+	} else if viewerCountry == "" {
+		countryWhere = " AND NOT " + targetRejectExpr + " "
+	} else {
+		countryWhere = " AND NOT (" + targetRejectExpr + " AND (" + targetCountryExpr + "='' OR " + targetCountryExpr + "<>?)) "
+		countryArgs = append(countryArgs, viewerCountry)
+	}
+
+	laneWhere := ""
+	if req.FreshOnly {
+		laneWhere += " AND dp.created_at>=DATE_SUB(NOW(),INTERVAL 30 DAY) AND dp.profile_score>=40 "
+	}
+	if req.ExploreOnly {
+		laneWhere += " AND dp.profile_score>=35 "
+	}
+	excludeWhere := ""
+	excludeArgs := make([]interface{}, 0, len(req.ExcludeUIDs))
+	excludeUIDs := compactStringList(req.ExcludeUIDs, 100)
+	if len(excludeUIDs) > 0 {
+		excludeWhere = " AND dp.uid NOT IN (" + strings.TrimSuffix(strings.Repeat("?,", len(excludeUIDs)), ",") + ") "
+		for _, excludedUID := range excludeUIDs {
+			excludeArgs = append(excludeArgs, excludedUID)
+		}
+	}
+
+	cursor, cursorOK := decodeRecommendCursor(req.Cursor)
+	if !cursorOK || req.FreshOnly || req.ExploreOnly {
+		// Rolling upgrades may send the timestamp cursor produced by older builds.
+		// Reserved exploration lanes are intentionally cursorless and rely on served.
+		cursor = nil
+	}
+	cursorWhere := ""
+	cursorArgs := make([]interface{}, 0, 14)
+	if cursor != nil {
+		cursorWhere = ` AND (
+			dp.online < ? OR
+			(dp.online=? AND dp.last_active_at<?) OR
+			(dp.online=? AND dp.last_active_at=? AND dp.profile_score<?) OR
+			(dp.online=? AND dp.last_active_at=? AND dp.profile_score=? AND UNIX_TIMESTAMP(dp.updated_at)<?) OR
+			(dp.online=? AND dp.last_active_at=? AND dp.profile_score=? AND UNIX_TIMESTAMP(dp.updated_at)=? AND dp.uid>?)
+		) `
+		cursorArgs = append(cursorArgs,
+			cursor.Online,
+			cursor.Online, cursor.LastActiveAt,
+			cursor.Online, cursor.LastActiveAt, cursor.ProfileScore,
+			cursor.Online, cursor.LastActiveAt, cursor.ProfileScore, cursor.UpdatedAt,
+			cursor.Online, cursor.LastActiveAt, cursor.ProfileScore, cursor.UpdatedAt, cursor.UID,
+		)
+	}
+
+	orderBy := "dp.online DESC,dp.last_active_at DESC,dp.profile_score DESC,dp.updated_at DESC,dp.uid ASC"
+	if req.ExploreOnly {
+		orderBy = "dp.exposure_count ASC,dp.last_active_at DESC,dp.profile_score DESC,dp.uid ASC"
+	}
+	selectColumns := strings.Replace(profileSelect("dp", "u"), "0 AS distance_meters", distanceSelect, 1)
+	sql := `SELECT ` + selectColumns + `
+        FROM dating_profiles dp
+        JOIN user u ON u.uid=dp.uid AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.status,1)=1
+        LEFT JOIN dating_swipes ds ON ds.uid=? AND ds.to_uid=dp.uid
+        LEFT JOIN dating_favorites df ON df.uid=? AND df.to_uid=dp.uid
+        LEFT JOIN dating_blocks b1 ON b1.uid=? AND b1.to_uid=dp.uid
+        LEFT JOIN dating_blocks b2 ON b2.uid=dp.uid AND b2.to_uid=?
+        LEFT JOIN dating_matches dm ON dm.pair_key=IF(dp.uid<?,CONCAT(dp.uid,':',?),CONCAT(?,':',dp.uid)) AND dm.status IN (1,2,3)
+        LEFT JOIN dating_served served ON served.uid=? AND served.session_id=? AND served.to_uid=dp.uid AND served.expires_at>?
+        LEFT JOIN dating_exposures de ON de.uid=? AND de.to_uid=dp.uid AND de.last_seen_at>?
+        LEFT JOIN user_setting us1 ON us1.uid=? AND us1.to_uid=dp.uid
+        LEFT JOIN user_setting us2 ON us2.uid=dp.uid AND us2.to_uid=?
+        WHERE dp.uid<>? AND dp.enabled=1 AND dp.status=1 AND dp.has_photo=1
+          AND IFNULL(u.robot,0)=0 AND IFNULL(u.category,'') NOT IN ('system','customerService') AND IFNULL(u.bench_no,'')=''
+          AND dp.last_active_at>=? AND de.uid IS NULL
+          AND CASE WHEN u.sex IN (0,1) THEN u.sex ELSE dp.sex END IN (0,1)
+          AND (?<0 OR CASE WHEN u.sex IN (0,1) THEN u.sex ELSE dp.sex END=?)
+          AND (dp.gender_preference<0 OR dp.gender_preference=?)
+          AND TIMESTAMPDIFF(YEAR,STR_TO_DATE(COALESCE(NULLIF(u.birthday,''),dp.birthday),'%Y-%m-%d'),CURDATE()) BETWEEN ? AND ?
+          AND ? BETWEEN dp.min_age AND dp.max_age
+          ` + intentWhere + countryWhere + laneWhere + excludeWhere + `
+          AND ds.uid IS NULL AND df.uid IS NULL AND b1.uid IS NULL AND b2.uid IS NULL
+          AND dm.match_id IS NULL AND served.uid IS NULL
+          AND IFNULL(us1.blacklist,0)=0 AND IFNULL(us2.blacklist,0)=0
+          AND IFNULL(dp.photos,'')<>'' AND IFNULL(dp.photos,'')<>'[]'
+          ` + cursorWhere + whereLocation + `
+        ORDER BY ` + orderBy + `
+        LIMIT ? OFFSET ?`
+
+	baseArgs := make([]interface{}, 0, 52)
+	baseArgs = append(baseArgs, argsPrefix...)
+	baseArgs = append(baseArgs,
+		loginUID, loginUID, loginUID, loginUID,
+		loginUID, loginUID, loginUID,
+		loginUID, sessionID, time.Now().UnixMilli(),
+		loginUID, time.Now().UnixMilli()-DatingExposureCooldownMS,
+		loginUID, loginUID, loginUID, activeAfter,
+		desiredSex, desiredSex, viewer.Sex,
+		effectiveAgeMin, effectiveAgeMax, viewer.Age,
+	)
+	baseArgs = append(baseArgs, intentArgs...)
+	baseArgs = append(baseArgs, countryArgs...)
+	baseArgs = append(baseArgs, excludeArgs...)
+	baseArgs = append(baseArgs, cursorArgs...)
+	baseArgs = append(baseArgs, argsLocation...)
+
+	filtered := make([]*DatingProfileResp, 0, limit+1)
+	filteredCursors := make([]string, 0, limit+1)
+	offset := 0
+	exhausted := false
+	lastScannedCursor := ""
+	for len(filtered) < limit+1 && offset < maxScan {
+		currentBatch := batchSize
+		if currentBatch > maxScan-offset {
+			currentBatch = maxScan - offset
+		}
+		args := append([]interface{}{}, baseArgs...)
+		args = append(args, currentBatch, offset)
+		var rows []*DatingProfileResp
+		_, err := d.session.SelectBySql(sql, args...).Load(&rows)
+		if err != nil {
+			return nil, "", 0, err
+		}
+		if len(rows) == 0 {
+			exhausted = true
+			break
+		}
+		for _, profile := range rows {
+			if profile == nil {
+				continue
+			}
+			rowCursor := encodeRecommendCursor(profile)
+			if rowCursor != "" {
+				lastScannedCursor = rowCursor
+			}
+			profile.Normalize()
+			if !fitsMutualFilters(viewer, profile) || !fitsRequestFilters(viewer, profile, req) {
+				continue
+			}
+			filtered = append(filtered, profile)
+			filteredCursors = append(filteredCursors, rowCursor)
+			if len(filtered) >= limit+1 {
+				break
+			}
+		}
+		offset += len(rows)
+		if len(rows) < currentBatch {
+			exhausted = true
+			break
+		}
+	}
+
+	if len(filtered) > limit {
+		nextCursor := filteredCursors[limit-1]
+		return filtered[:limit], nextCursor, 1, nil
+	}
+	if exhausted {
+		return filtered, "", 0, nil
+	}
+	// The safety scan cap was reached. Advance by the last scanned SQL row even
+	// when every row was filtered out, so an empty page can never loop forever.
+	if lastScannedCursor != "" {
+		return filtered, lastScannedCursor, 1, nil
+	}
+	return filtered, "", 0, nil
 }
 
-type expiredFeedItem struct {
-	FeedID string `db:"feed_id"`
-}
-
-func (d *db) expiredVideoPosts(cutoffMs int64, limit int) ([]*expiredFeedItem, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	var list []*expiredFeedItem
-	_, err := d.session.SelectBySql(`SELECT DISTINCT p.feed_id
-        FROM feed_posts p
-        INNER JOIN feed_media m ON m.feed_id=p.feed_id AND m.type='video'
-        WHERE p.status=1 AND UNIX_TIMESTAMP(p.created_at)*1000 < ?
-        ORDER BY p.created_at ASC LIMIT ?`, cutoffMs, limit).Load(&list)
-	return list, err
-}
-
-func (d *db) deleteOldEvents(cutoff time.Time, limit int) (int64, error) {
+func (d *db) cleanupExpiredServedBatch(now int64, limit int) (int64, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 1000
 	}
-	res, err := d.session.UpdateBySql(`DELETE FROM feed_events WHERE created_at<? LIMIT ?`, cutoff, limit).Exec()
+	result, err := d.session.DeleteBySql(`DELETE FROM dating_served WHERE expires_at<? LIMIT ?`, now, limit).Exec()
 	if err != nil {
 		return 0, err
 	}
-	affected, _ := res.RowsAffected()
-	return affected, nil
+	return result.RowsAffected()
 }
 
-func (d *db) rebuildRecommendStats() error {
-	_, err := d.session.InsertBySql(`REPLACE INTO feed_recommend_stats(
-        feed_id,exposure_count,exposed_users,like_count,comment_count,share_count,report_count,watch_count,complete_count,skip_count,dislike_count,avg_watch_ms,avg_percent,updated_at
-    )
-    SELECT p.feed_id,
-           IFNULL(ex.exposure_count,0),IFNULL(ex.exposed_users,0),
-           p.like_count,p.comment_count,p.share_count,
-           IFNULL(r.report_count,0),
-           IFNULL(ev.watch_count,0),IFNULL(ev.complete_count,0),IFNULL(ev.skip_count,0),IFNULL(ev.dislike_count,0),
-           IFNULL(ev.avg_watch_ms,0),IFNULL(ev.avg_percent,0),NOW()
-    FROM feed_posts p
-    LEFT JOIN (SELECT feed_id,SUM(seen_count) exposure_count,COUNT(*) exposed_users FROM feed_exposures GROUP BY feed_id) ex ON ex.feed_id=p.feed_id
-    LEFT JOIN (SELECT feed_id,COUNT(*) report_count FROM feed_reports WHERE status=0 GROUP BY feed_id) r ON r.feed_id=p.feed_id
-    LEFT JOIN (
-        SELECT feed_id,
-               SUM(event_type='watch') watch_count,
-               SUM(event_type='complete') complete_count,
-               SUM(event_type='skip') skip_count,
-               SUM(event_type='dislike') dislike_count,
-               AVG(CASE WHEN watch_ms>0 THEN watch_ms ELSE NULL END) avg_watch_ms,
-               AVG(CASE WHEN percent>0 THEN percent ELSE NULL END) avg_percent
-        FROM feed_events GROUP BY feed_id
-    ) ev ON ev.feed_id=p.feed_id
-    WHERE p.status<>0`).Exec()
+func (d *db) markServed(uid, sessionID string, profiles []*DatingProfileResp) error {
+	if uid == "" || sessionID == "" || len(profiles) == 0 {
+		return nil
+	}
+	tx, err := d.session.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = d.session.UpdateBySql(`UPDATE feed_posts p
-        LEFT JOIN feed_recommend_stats rs ON rs.feed_id=p.feed_id
-        SET p.score=GREATEST(0,
-            1
-            + CASE
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 6 HOUR) THEN 10
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN 7
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 72 HOUR) THEN 4
-                WHEN p.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1
-                ELSE 0
-              END
-            + p.like_count*0.6
-            + p.comment_count*1.5
-            + p.share_count*2.0
-            + IFNULL(rs.avg_percent,0)/12
-            + IFNULL(rs.complete_count,0)*1.2
-            - IFNULL(rs.report_count,0)*10
-            - IFNULL(rs.skip_count,0)*1.5
-            - IFNULL(rs.dislike_count,0)*6
-            - CASE WHEN IFNULL(rs.exposure_count,0)>=10 AND (p.like_count+p.comment_count+p.share_count)=0 THEN LEAST(12,IFNULL(rs.exposure_count,0)*0.4) ELSE 0 END
-        )
-        WHERE p.status=1`).Exec()
+	defer tx.RollbackUnlessCommitted()
+	now := time.Now().UnixMilli()
+	for _, p := range profiles {
+		if p == nil || p.UID == "" {
+			continue
+		}
+		_, err = tx.InsertBySql(`INSERT INTO dating_served(uid,session_id,to_uid,served_at,expires_at,created_at)
+            VALUES(?,?,?,?,?,NOW()) ON DUPLICATE KEY UPDATE served_at=VALUES(served_at),expires_at=VALUES(expires_at)`,
+			uid, sessionID, p.UID, now, now+DatingServedTTLMS).Exec()
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (d *db) recentSameSwipe(uid, toUID, action string, since int64) (bool, error) {
+	var count int
+	err := d.session.Select("COUNT(*)").From("dating_swipes").
+		Where("uid=? AND to_uid=? AND action=? AND swiped_at>=?", uid, toUID, action, since).
+		LoadOne(&count)
+	return count > 0, err
+}
+
+func (d *db) recordSwipe(uid string, req SwipeReq) (int64, error) {
+	toUID := req.Target()
+	action := normalizeAction(req.Action)
+	now := time.Now().UnixMilli()
+
+	// Android 网络重试时，同一动作在短时间内可能重复到达。这里不重复写额度流水。
+	var current *struct {
+		Action   string `db:"action"`
+		SwipedAt int64  `db:"swiped_at"`
+	}
+	_, _ = d.session.Select("action", "swiped_at").From("dating_swipes").Where("uid=? AND to_uid=?", uid, toUID).Load(&current)
+	if current != nil && current.Action == action && now-normalizeMillis(current.SwipedAt) <= SwipeRetryWindowMS {
+		_, err := d.session.Update("dating_swipes").
+			Set("source", safeText(req.Source, 32)).
+			Set("photo_index", clampInt(req.PhotoIndex, 0, DatingMaxPhotos-1)).
+			Set("session_id", safeText(req.SessionID, 80)).
+			Set("updated_at", dbr.Expr("NOW()")).
+			Where("uid=? AND to_uid=?", uid, toUID).Exec()
+		return 0, err
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	_, err = tx.InsertBySql(`INSERT INTO dating_swipes(uid,to_uid,action,source,photo_index,session_id,swiped_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,NOW(),NOW())
+        ON DUPLICATE KEY UPDATE action=VALUES(action),source=VALUES(source),photo_index=VALUES(photo_index),session_id=VALUES(session_id),swiped_at=VALUES(swiped_at),updated_at=NOW()`,
+		uid, toUID, action, safeText(req.Source, 32), clampInt(req.PhotoIndex, 0, DatingMaxPhotos-1), safeText(req.SessionID, 80), now).Exec()
+	if err != nil {
+		return 0, err
+	}
+	result, err := tx.InsertBySql(`INSERT INTO dating_swipe_events(uid,to_uid,action,source,photo_index,session_id,swiped_at,undone,created_at)
+        VALUES(?,?,?,?,?,?,?,0,NOW())`, uid, toUID, action, safeText(req.Source, 32), clampInt(req.PhotoIndex, 0, DatingMaxPhotos-1), safeText(req.SessionID, 80), now).Exec()
+	if err != nil {
+		return 0, err
+	}
+	if action == DatingActionFavorite {
+		_, err = tx.InsertBySql(`INSERT INTO dating_favorites(uid,to_uid,favorited_at,created_at,updated_at)
+            VALUES(?,?,?,NOW(),NOW()) ON DUPLICATE KEY UPDATE favorited_at=VALUES(favorited_at),updated_at=NOW()`, uid, toUID, now).Exec()
+	} else {
+		_, err = tx.DeleteFrom("dating_favorites").Where("uid=? AND to_uid=?", uid, toUID).Exec()
+	}
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	id, _ := result.LastInsertId()
+	return id, nil
+}
+
+func (d *db) isPairBlocked(uid, toUID string) (bool, error) {
+	var count int
+	err := d.session.SelectBySql(`SELECT
+        (SELECT COUNT(*) FROM dating_blocks WHERE (uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) +
+        (SELECT COUNT(*) FROM user_setting WHERE ((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND blacklist=1)`,
+		uid, toUID, toUID, uid, uid, toUID, toUID, uid).LoadOne(&count)
+	return count > 0, err
+}
+
+func (d *db) hasLiked(uid, toUID string) (bool, error) {
+	var count int
+	err := d.session.Select("COUNT(*)").From("dating_swipes").Where("uid=? AND to_uid=? AND action=?", uid, toUID, DatingActionLike).LoadOne(&count)
+	return count > 0, err
+}
+
+func (d *db) countRecentPasses(uid string, since int64) (int, error) {
+	var count int
+	err := d.session.Select("COUNT(*)").From("dating_swipe_events").
+		Where("uid=? AND action=? AND undone=0 AND swiped_at>=?", uid, DatingActionPass, since).
+		LoadOne(&count)
+	return count, err
+}
+
+func (d *db) countTodayActions(uid string) (likeUsed, favoriteUsed, rewindUsed int, err error) {
+	start := startOfTodayMillis()
+	type row struct {
+		Action string `db:"action"`
+		Count  int    `db:"count"`
+	}
+	var rows []*row
+	_, err = d.session.SelectBySql(`SELECT action,COUNT(*) count FROM dating_swipe_events
+        WHERE uid=? AND swiped_at>=? AND undone=0 AND action IN ('like','favorite') GROUP BY action`, uid, start).Load(&rows)
+	if err != nil {
+		return
+	}
+	for _, item := range rows {
+		if item == nil {
+			continue
+		}
+		if item.Action == DatingActionLike {
+			likeUsed = item.Count
+		} else if item.Action == DatingActionFavorite {
+			favoriteUsed = item.Count
+		}
+	}
+	err = d.session.Select("COUNT(*)").From("dating_undo_events").Where("uid=? AND undone_at>=?", uid, start).LoadOne(&rewindUsed)
+	return
+}
+
+func (d *db) latestUndoableEvent(uid string) (*swipeEventModel, error) {
+	var event *swipeEventModel
+	_, err := d.session.Select("id", "uid", "to_uid", "action", "swiped_at", "photo_index", "session_id").
+		From("dating_swipe_events").Where("uid=? AND undone=0", uid).OrderDesc("id").Limit(1).Load(&event)
+	return event, err
+}
+
+func (d *db) undoSwipe(uid string, event *swipeEventModel) error {
+	if event == nil {
+		return ErrDatingNothingToUndo
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	result, err := tx.Update("dating_swipe_events").Set("undone", 1).Where("id=? AND uid=? AND undone=0", event.ID, uid).Exec()
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrDatingNothingToUndo
+	}
+	_, err = tx.DeleteFrom("dating_swipes").Where("uid=? AND to_uid=? AND action=? AND swiped_at=?", uid, event.ToUID, event.Action, event.SwipedAt).Exec()
+	if err != nil {
+		return err
+	}
+	if event.Action == DatingActionFavorite {
+		_, err = tx.DeleteFrom("dating_favorites").Where("uid=? AND to_uid=?", uid, event.ToUID).Exec()
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.InsertBySql(`INSERT INTO dating_undo_events(uid,swipe_event_id,to_uid,action,undone_at,created_at)
+        VALUES(?,?,?,?,?,NOW())`, uid, event.ID, event.ToUID, event.Action, time.Now().UnixMilli()).Exec()
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *db) createMatch(uid, toUID string) (*datingMatchModel, bool, error) {
+	a, b := orderedPair(uid, toUID)
+	pk := pairKey(uid, toUID)
+	matchID := "dm_" + strings.ReplaceAll(pk, ":", "_")
+	result, err := d.session.InsertBySql(`INSERT INTO dating_matches(match_id,pair_key,uid_a,uid_b,status,notice_sent,matched_at,created_at,updated_at)
+        VALUES(?,?,?,?,1,0,?,NOW(),NOW())
+        ON DUPLICATE KEY UPDATE
+          notice_sent=IF(status=2,0,notice_sent),
+          matched_at=IF(status=2,VALUES(matched_at),matched_at),
+          status=IF(status=3,status,1),updated_at=NOW()`, matchID, pk, a, b, time.Now().UnixMilli()).Exec()
+	if err != nil {
+		return nil, false, err
+	}
+	rows, _ := result.RowsAffected()
+	model, err := d.getMatchByPair(uid, toUID)
+	return model, rows > 0, err
+}
+
+func (d *db) markMatchNoticeSent(matchID string) error {
+	_, err := d.session.Update("dating_matches").Set("notice_sent", 1).Set("updated_at", dbr.Expr("NOW()")).Where("match_id=?", matchID).Exec()
 	return err
+}
+
+func (d *db) getMatchByID(matchID string) (*datingMatchModel, error) {
+	var model *datingMatchModel
+	_, err := d.session.Select("match_id", "uid_a", "uid_b", "status", "notice_sent").From("dating_matches").Where("match_id=?", matchID).Load(&model)
+	return model, err
+}
+
+func (d *db) getMatchByPair(uid, toUID string) (*datingMatchModel, error) {
+	var model *datingMatchModel
+	_, err := d.session.Select("match_id", "uid_a", "uid_b", "status", "notice_sent").From("dating_matches").Where("pair_key=?", pairKey(uid, toUID)).Load(&model)
+	return model, err
+}
+
+func (d *db) hasActiveMatch(uid, toUID string) (string, bool, error) {
+	m, err := d.getMatchByPair(uid, toUID)
+	if err != nil || m == nil {
+		return "", false, err
+	}
+	return m.MatchID, m.Status == DatingMatchActive, nil
+}
+
+func (d *db) matches(uid string, limit int) ([]*DatingMatchResp, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 30
+	}
+	type matchRow struct {
+		MatchID   string `db:"match_id"`
+		Status    int    `db:"status"`
+		OtherUID  string `db:"other_uid"`
+		CreatedAt int64  `db:"created_at_ms"`
+		UpdatedAt int64  `db:"updated_at_ms"`
+	}
+	var rows []*matchRow
+	_, err := d.session.SelectBySql(`SELECT match_id,status,IF(uid_a=?,uid_b,uid_a) AS other_uid,
+        UNIX_TIMESTAMP(created_at)*1000 AS created_at_ms,UNIX_TIMESTAMP(updated_at)*1000 AS updated_at_ms
+        FROM dating_matches WHERE (uid_a=? OR uid_b=?) AND status=1 ORDER BY updated_at DESC LIMIT ?`, uid, uid, uid, limit).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	uids := make([]string, 0, len(rows))
+	for _, item := range rows {
+		if item != nil && strings.TrimSpace(item.OtherUID) != "" {
+			uids = append(uids, item.OtherUID)
+		}
+	}
+	profiles, err := d.getProfilesByUIDs(uids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*DatingMatchResp, 0, len(rows))
+	for _, item := range rows {
+		if item == nil {
+			continue
+		}
+		profile := profiles[item.OtherUID]
+		if profile == nil {
+			continue
+		}
+		out = append(out, &DatingMatchResp{MatchID: item.MatchID, Status: item.Status, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, User: profile})
+	}
+	return out, nil
+}
+
+func (d *db) cancelMatch(uid, matchID string) error {
+	_, err := d.session.Update("dating_matches").Set("status", DatingMatchCanceled).Set("updated_at", dbr.Expr("NOW()")).Where("match_id=? AND (uid_a=? OR uid_b=?)", matchID, uid, uid).Exec()
+	return err
+}
+
+func (d *db) favorites(uid string, limit int) ([]*DatingProfileResp, int, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	selectColumns := profileSelect("p", "u")
+	sql := `SELECT ` + selectColumns + ` FROM dating_favorites f JOIN dating_profiles p ON p.uid=f.to_uid JOIN user u ON u.uid=p.uid AND IFNULL(u.is_destroy,0)=0
+        LEFT JOIN dating_blocks b1 ON b1.uid=f.uid AND b1.to_uid=p.uid
+        LEFT JOIN dating_blocks b2 ON b2.uid=p.uid AND b2.to_uid=f.uid
+        WHERE f.uid=? AND p.enabled=1 AND p.status=1 AND p.has_photo=1
+          AND b1.uid IS NULL AND b2.uid IS NULL ORDER BY f.favorited_at DESC LIMIT ?`
+	var profiles []*DatingProfileResp
+	_, err := d.session.SelectBySql(sql, uid, limit).Load(&profiles)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, p := range profiles {
+		p.Normalize()
+	}
+	var total int
+	err = d.session.SelectBySql(`SELECT COUNT(*) FROM dating_favorites f
+        JOIN dating_profiles p ON p.uid=f.to_uid AND p.enabled=1 AND p.status=1 AND p.has_photo=1
+        LEFT JOIN dating_blocks b1 ON b1.uid=f.uid AND b1.to_uid=p.uid
+        LEFT JOIN dating_blocks b2 ON b2.uid=p.uid AND b2.to_uid=f.uid
+        WHERE f.uid=? AND b1.uid IS NULL AND b2.uid IS NULL`, uid).LoadOne(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	return profiles, total, nil
+}
+
+func (d *db) removeFavorite(uid, toUID string) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	_, err = tx.DeleteFrom("dating_favorites").Where("uid=? AND to_uid=?", uid, toUID).Exec()
+	if err != nil {
+		return err
+	}
+	_, err = tx.DeleteFrom("dating_swipes").Where("uid=? AND to_uid=? AND action=?", uid, toUID, DatingActionFavorite).Exec()
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *db) receivedLikes(uid string, limit int, reveal bool) ([]*DatingProfileResp, int, error) {
+	var total int
+	err := d.session.SelectBySql(`SELECT COUNT(*) FROM dating_swipes s
+        JOIN dating_profiles p ON p.uid=s.uid AND p.enabled=1 AND p.status=1 AND p.has_photo=1
+        LEFT JOIN dating_matches m ON m.pair_key=IF(s.uid<?,CONCAT(s.uid,':',?),CONCAT(?,':',s.uid)) AND m.status=1
+        LEFT JOIN dating_blocks b1 ON b1.uid=? AND b1.to_uid=s.uid
+        LEFT JOIN dating_blocks b2 ON b2.uid=s.uid AND b2.to_uid=?
+        WHERE s.to_uid=? AND s.action='like' AND m.match_id IS NULL AND b1.uid IS NULL AND b2.uid IS NULL`, uid, uid, uid, uid, uid, uid).LoadOne(&total)
+	if err != nil || !reveal {
+		return nil, total, err
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	selectColumns := profileSelect("p", "u")
+	sql := `SELECT ` + selectColumns + ` FROM dating_swipes s JOIN dating_profiles p ON p.uid=s.uid JOIN user u ON u.uid=p.uid AND IFNULL(u.is_destroy,0)=0
+        LEFT JOIN dating_matches m ON m.pair_key=IF(s.uid<?,CONCAT(s.uid,':',?),CONCAT(?,':',s.uid)) AND m.status=1
+        LEFT JOIN dating_blocks b1 ON b1.uid=? AND b1.to_uid=s.uid
+        LEFT JOIN dating_blocks b2 ON b2.uid=s.uid AND b2.to_uid=?
+        WHERE s.to_uid=? AND s.action='like' AND p.enabled=1 AND p.status=1 AND p.has_photo=1
+          AND m.match_id IS NULL AND b1.uid IS NULL AND b2.uid IS NULL
+        ORDER BY s.swiped_at DESC LIMIT ?`
+	var profiles []*DatingProfileResp
+	_, err = d.session.SelectBySql(sql, uid, uid, uid, uid, uid, uid, limit).Load(&profiles)
+	if err != nil {
+		return nil, total, err
+	}
+	for _, p := range profiles {
+		p.Normalize()
+	}
+	return profiles, total, nil
+}
+
+func (d *db) block(uid string, req BlockReq) error {
+	toUID := req.Target()
+	if uid == "" || toUID == "" {
+		return nil
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+	_, err = tx.InsertBySql(`INSERT INTO dating_blocks(uid,to_uid,reason,created_at,updated_at) VALUES(?,?,?,NOW(),NOW())
+        ON DUPLICATE KEY UPDATE reason=VALUES(reason),updated_at=NOW()`, uid, toUID, safeText(req.Reason, 200)).Exec()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Update("dating_matches").Set("status", DatingMatchBlocked).Set("updated_at", dbr.Expr("NOW()")).Where("pair_key=?", pairKey(uid, toUID)).Exec()
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *db) report(uid string, req ReportReq) error {
+	toUID := req.Target()
+	_, err := d.session.InsertBySql(`INSERT INTO dating_reports(uid,to_uid,reason,description,images,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,0,NOW(),NOW())`, uid, toUID, safeText(req.Reason, 80), safeText(req.Description, 500), toJSONString(req.Images, 6)).Exec()
+	return err
+}
+
+func (d *db) validExposureTargets(uids []string) (map[string]bool, error) {
+	unique := make([]string, 0, len(uids))
+	seen := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		unique = append(unique, uid)
+	}
+	valid := make(map[string]bool, len(unique))
+	if len(unique) == 0 {
+		return valid, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(unique)), ",")
+	args := make([]interface{}, 0, len(unique))
+	for _, uid := range unique {
+		args = append(args, uid)
+	}
+	var rows []struct {
+		UID string `db:"uid"`
+	}
+	query := `SELECT dp.uid FROM dating_profiles dp
+        JOIN user u ON u.uid=dp.uid AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.status,1)=1
+        WHERE dp.enabled=1 AND dp.status=1 AND dp.has_photo=1
+          AND IFNULL(u.robot,0)=0 AND IFNULL(u.category,'') NOT IN ('system','customerService')
+          AND IFNULL(u.bench_no,'')='' AND dp.uid IN (` + placeholders + `)`
+	if _, err := d.session.SelectBySql(query, args...).Load(&rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		valid[row.UID] = true
+	}
+	return valid, nil
+}
+
+func exposureEventID(uid, toUID string, item ExposureItem, eventAt int64) string {
+	raw := strings.TrimSpace(item.EventID)
+	if raw != "" {
+		sum := sha256.Sum256([]byte(uid + ":" + raw))
+		return fmt.Sprintf("client-%x", sum[:16])
+	}
+	// Old clients do not send event_id. A ten-minute bucket makes immediate
+	// network retries idempotent while still allowing later genuine exposures.
+	bucket := eventAt / int64(10*time.Minute/time.Millisecond)
+	payload := fmt.Sprintf("%s|%s|%s|%s|%d|%d|%d", uid, toUID,
+		safeText(item.EventType, 24), safeText(item.Source, 32), item.DurationMS,
+		clampInt(item.PhotoIndex, 0, DatingMaxPhotos-1), bucket)
+	sum := sha256.Sum256([]byte(payload))
+	return fmt.Sprintf("auto-%x", sum[:16])
+}
+
+func (d *db) recordExposures(uid string, req ExposureReq) (int, error) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" || len(req.Items) == 0 {
+		return 0, nil
+	}
+	targetUIDs := make([]string, 0, len(req.Items))
+	for _, item := range req.Items {
+		toUID := item.Target()
+		if toUID != "" && toUID != uid {
+			targetUIDs = append(targetUIDs, toUID)
+		}
+	}
+	validTargets, err := d.validExposureTargets(targetUIDs)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+	now := time.Now().UnixMilli()
+	minSeenAt := now - int64(7*24*time.Hour/time.Millisecond)
+	maxSeenAt := now + int64(5*time.Minute/time.Millisecond)
+	count := 0
+	for _, item := range req.Items {
+		toUID := item.Target()
+		if toUID == "" || toUID == uid || !validTargets[toUID] {
+			continue
+		}
+		eventAt := normalizeMillis(item.SeenAt)
+		if eventAt < minSeenAt || eventAt > maxSeenAt {
+			eventAt = now
+		}
+		duration := item.DurationMS
+		if duration < 0 {
+			duration = 0
+		}
+		if duration > int64(24*time.Hour/time.Millisecond) {
+			duration = int64(24 * time.Hour / time.Millisecond)
+		}
+		eventType := safeText(item.EventType, 24)
+		if eventType == "" {
+			eventType = "expose"
+		}
+		eventID := exposureEventID(uid, toUID, item, eventAt)
+		result, err := tx.InsertBySql(`INSERT IGNORE INTO dating_exposure_events(event_id,uid,to_uid,event_type,source,duration_ms,photo_index,event_at,created_at)
+            VALUES(?,?,?,?,?,?,?,?,NOW())`, eventID, uid, toUID, eventType, safeText(item.Source, 32), duration,
+			clampInt(item.PhotoIndex, 0, DatingMaxPhotos-1), eventAt).Exec()
+		if err != nil {
+			return 0, err
+		}
+		inserted, _ := result.RowsAffected()
+		if inserted == 0 {
+			continue
+		}
+		_, err = tx.InsertBySql(`INSERT INTO dating_exposures(uid,to_uid,seen_count,last_seen_at,last_duration_ms,created_at,updated_at)
+            VALUES(?,?,1,?,?,NOW(),NOW()) ON DUPLICATE KEY UPDATE seen_count=seen_count+1,
+            last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),last_duration_ms=VALUES(last_duration_ms),updated_at=NOW()`,
+			uid, toUID, eventAt, duration).Exec()
+		if err != nil {
+			return 0, err
+		}
+		if _, err = tx.Update("dating_profiles").Set("exposure_count", dbr.Expr("exposure_count+1")).
+			Set("updated_at", dbr.Expr("updated_at")).Where("uid=?", toUID).Exec(); err != nil {
+			return 0, err
+		}
+		count++
+		if count >= DatingExposureMax {
+			break
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	d.touchActive(uid, now)
+	return count, nil
+}
+
+func (d *db) hasOtherChatRelationship(uid, toUID string) (bool, error) {
+	if uid == "" || toUID == "" || uid == toUID {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(`SELECT
+        (SELECT COUNT(*) FROM friend WHERE uid=? AND to_uid=? AND is_deleted=0) +
+        (SELECT COUNT(*) FROM partner_contacts WHERE uid=? AND to_uid=? AND (status=1 OR (status=0 AND requester_uid=?)))`,
+		uid, toUID, uid, toUID, uid).LoadOne(&count)
+	return count > 0, err
+}
+
+func (d *db) touchActive(uid string, at int64) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return
+	}
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	// Active heartbeats are throttled and must not mutate updated_at, which is
+	// reserved for actual profile edits and participates in recommendation order.
+	_, _ = d.session.Update("dating_profiles").Set("last_active_at", at).
+		Set("updated_at", dbr.Expr("updated_at")).
+		Where("uid=? AND last_active_at<?", uid, at-int64(time.Minute/time.Millisecond)).Exec()
+}
+
+func normalizeAgeRange(minAge, maxAge int) (int, int) {
+	if minAge < 18 {
+		minAge = 18
+	}
+	if maxAge <= 0 {
+		maxAge = 99
+	}
+	if maxAge < minAge {
+		maxAge = minAge
+	}
+	if maxAge > 99 {
+		maxAge = 99
+	}
+	return minAge, maxAge
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
