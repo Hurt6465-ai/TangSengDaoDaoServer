@@ -143,6 +143,7 @@ type RecommendReq struct {
 	AgeMin      int
 	AgeMax      int
 	Intent      string
+	AllowRepeat bool
 
 	// Internal recommendation lanes; never bound directly from the HTTP query.
 	FreshOnly   bool

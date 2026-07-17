@@ -294,6 +294,7 @@ func (s *Service) Recommend(uid string, req RecommendReq) (*RecommendResp, error
 	baseReq := RecommendReq{
 		Scope: scope, SessionID: req.SessionID, CountryMode: req.CountryMode,
 		Gender: req.Gender, AgeMin: req.AgeMin, AgeMax: req.AgeMax, Intent: req.Intent,
+		AllowRepeat: req.AllowRepeat,
 	}
 
 	normalReq := baseReq

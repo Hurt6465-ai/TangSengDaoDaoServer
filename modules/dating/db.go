@@ -527,6 +527,13 @@ func (d *db) recommend(loginUID string, viewer *DatingProfileResp, req Recommend
 	if req.ExploreOnly {
 		orderBy = "dp.exposure_count ASC,dp.last_active_at DESC,dp.profile_score DESC,dp.uid ASC"
 	}
+	historyWhere := " AND ds.uid IS NULL AND df.uid IS NULL AND de.uid IS NULL "
+	if req.AllowRepeat {
+		// A repeated round is only entered after the unseen pool is exhausted. It keeps
+		// blocks/matches/current-session served filtering, but allows previously viewed
+		// or swiped profiles to return so the deck never collapses to a black dead end.
+		historyWhere = ""
+	}
 	selectColumns := strings.Replace(profileSelect("dp", "u"), "0 AS distance_meters", distanceSelect, 1)
 	sql := `SELECT ` + selectColumns + `
         FROM dating_profiles dp
@@ -542,14 +549,14 @@ func (d *db) recommend(loginUID string, viewer *DatingProfileResp, req Recommend
         LEFT JOIN user_setting us2 ON us2.uid=dp.uid AND us2.to_uid=?
         WHERE dp.uid<>? AND dp.enabled=1 AND dp.status=1 AND dp.has_photo=1
           AND IFNULL(u.robot,0)=0 AND IFNULL(u.category,'') NOT IN ('system','customerService') AND IFNULL(u.bench_no,'')=''
-          AND dp.last_active_at>=? AND de.uid IS NULL
+          AND dp.last_active_at>=?
           AND CASE WHEN u.sex IN (0,1) THEN u.sex ELSE dp.sex END IN (0,1)
           AND (?<0 OR CASE WHEN u.sex IN (0,1) THEN u.sex ELSE dp.sex END=?)
           AND (dp.gender_preference<0 OR dp.gender_preference=?)
           AND TIMESTAMPDIFF(YEAR,STR_TO_DATE(COALESCE(NULLIF(u.birthday,''),dp.birthday),'%Y-%m-%d'),CURDATE()) BETWEEN ? AND ?
           AND ? BETWEEN dp.min_age AND dp.max_age
           ` + intentWhere + countryWhere + laneWhere + excludeWhere + `
-          AND ds.uid IS NULL AND df.uid IS NULL AND b1.uid IS NULL AND b2.uid IS NULL
+          ` + historyWhere + ` AND b1.uid IS NULL AND b2.uid IS NULL
           AND dm.match_id IS NULL AND served.uid IS NULL
           AND IFNULL(us1.blacklist,0)=0 AND IFNULL(us2.blacklist,0)=0
           AND IFNULL(dp.photos,'')<>'' AND IFNULL(dp.photos,'')<>'[]'

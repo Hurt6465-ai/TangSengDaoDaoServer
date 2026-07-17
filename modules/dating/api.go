@@ -119,11 +119,12 @@ func (d *Dating) recommend(c *wkhttp.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", strconv.Itoa(DefaultDatingLimit)))
 	ageMin, _ := strconv.Atoi(c.DefaultQuery("age_min", "0"))
 	ageMax, _ := strconv.Atoi(c.DefaultQuery("age_max", "0"))
+	repeat, _ := strconv.Atoi(c.DefaultQuery("repeat", "0"))
 	resp, err := d.service.Recommend(c.GetLoginUID(), RecommendReq{
 		Limit: limit, Cursor: c.Query("cursor"), SessionID: c.Query("session_id"),
 		Scope:       strings.TrimSpace(c.DefaultQuery("scope", DatingScopeGlobal)),
 		CountryMode: strings.TrimSpace(c.Query("country_mode")), Gender: strings.TrimSpace(c.Query("gender")),
-		AgeMin: ageMin, AgeMax: ageMax, Intent: strings.TrimSpace(c.Query("intent")),
+		AgeMin: ageMin, AgeMax: ageMax, Intent: strings.TrimSpace(c.Query("intent")), AllowRepeat: repeat == 1,
 	})
 	if err != nil {
 		d.Warn("查询交友推荐失败", zap.Error(err))
