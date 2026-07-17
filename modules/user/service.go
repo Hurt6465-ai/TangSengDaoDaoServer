@@ -230,20 +230,24 @@ func (s *Service) getFreshProfileOnlineStatus(uid string, onlineM *onlineStatusM
 		return online, lastOffline, deviceFlag
 	}
 
-	// 个人主页必须尽量避免“假在线”。数据库里的 user_online 可能因为断网、杀进程、后台切换
-	// 短时间残留 online=1，所以这里在返回资料页前再向 IM 查询一次实时在线状态。
-	// IM 确认在线才显示在线；IM 明确查不到在线设备时，资料页按离线返回。
+	// user_online 可能因断网、杀进程或异常退出残留 online=1。个人主页只有在
+	// WuKongIM 实时确认存在在线设备时才返回在线；查询失败也按离线处理。
+	// 宁可短暂少显示在线，也不能把整批正常用户长期显示成“在线”。
+	lastSeen := onlineM.LastOffline
+	if onlineM.LastOnline > lastSeen {
+		lastSeen = onlineM.LastOnline
+	}
 	statusList, err := s.ctx.IMSOnlineStatus([]string{uid})
 	if err != nil {
-		s.Warn("实时确认用户在线状态失败，使用数据库在线状态", zap.Error(err), zap.String("uid", uid))
-		return online, lastOffline, deviceFlag
+		s.Warn("实时确认用户在线状态失败，个人主页按离线返回", zap.Error(err), zap.String("uid", uid))
+		return 0, lastSeen, deviceFlag
 	}
 	for _, status := range statusList {
 		if status.UID == uid {
 			return 1, 0, config.DeviceFlag(status.DeviceFlag)
 		}
 	}
-	return 0, int(time.Now().Unix()), deviceFlag
+	return 0, lastSeen, deviceFlag
 }
 
 func (s *Service) GetUserDetails(uids []string, loginUID string) ([]*UserDetailResp, error) {
