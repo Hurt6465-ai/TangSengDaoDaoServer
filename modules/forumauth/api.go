@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -198,11 +199,30 @@ func (a *API) avatarURL(uid string) string {
 	baseURL := strings.TrimSpace(os.Getenv("FORUM_PUBLIC_API_BASE_URL"))
 	if baseURL == "" {
 		baseURL = strings.TrimSpace(a.ctx.GetConfig().External.APIBaseURL)
+	} else {
+		// FORUM_PUBLIC_API_BASE_URL may be configured as the public domain root.
+		// TangSeng's avatar path is relative to its /v1 API base, so append /v1
+		// only when the configured URL has no path component.
+		baseURL = normalizePublicAPIBaseURL(baseURL)
 	}
 	if baseURL == "" || avatarPath == "" {
 		return ""
 	}
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(avatarPath, "/")
+}
+
+func normalizePublicAPIBaseURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		parsed.Path = "/v1"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
 }
 
 func parseStringList(raw string, limit int) []string {
