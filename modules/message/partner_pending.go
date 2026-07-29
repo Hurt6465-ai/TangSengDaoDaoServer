@@ -127,6 +127,17 @@ func newPartnerMessageSendResponse(guard *partnerPendingGuard, imResp *config.Ms
 	return resp
 }
 
+func truncatePartnerPendingRunes(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
+}
+
 func normalizePartnerClientMsgNo(topLevel string, payload map[string]interface{}) (string, error) {
 	value := strings.TrimSpace(topLevel)
 	if value == "" && payload != nil {
@@ -410,9 +421,7 @@ func (m *Message) markPartnerPendingUncertain(senderUID string, guard *partnerPe
 	if cause != nil {
 		reason = cause.Error()
 	}
-	if len(reason) > 255 {
-		reason = reason[:255]
-	}
+	reason = truncatePartnerPendingRunes(reason, 255)
 	now := time.Now().UnixMilli()
 	_, err := m.ctx.DB().Update("partner_pending_message").Set("status", partnerPendingMessageUncertain).Set("failed_reason", reason).Set("next_check_at", now+5000).Set("updated_at", now).Where("sender_uid=? AND client_msg_no=? AND status IN ?", senderUID, guard.ClientMsgNo, []int{partnerPendingMessageReserved, partnerPendingMessageUncertain}).Exec()
 	return err
@@ -439,9 +448,7 @@ func (m *Message) rollbackPartnerPendingMessage(senderUID, receiverUID string, g
 	if cause != nil {
 		reason = cause.Error()
 	}
-	if len(reason) > 255 {
-		reason = reason[:255]
-	}
+	reason = truncatePartnerPendingRunes(reason, 255)
 	if rows[0].ReservedCount > 0 {
 		_, err = tx.Update("partner_contacts").Set("requester_msg_count", dbr.Expr("GREATEST(IFNULL(requester_msg_count,1)-1,1)")).Set("updated_at", now).Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=?", senderUID, receiverUID, receiverUID, senderUID, partnerContactPending, senderUID).Exec()
 		if err != nil {
@@ -544,9 +551,7 @@ func (m *Message) sendPartnerMessageStable(channelID string, channelType uint8, 
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		message := strings.TrimSpace(string(data))
-		if len(message) > 300 {
-			message = message[:300]
-		}
+		message = truncatePartnerPendingRunes(message, 300)
 		lower := strings.ToLower(message)
 		uncertain := resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooManyRequests || strings.Contains(lower, "duplicate") || strings.Contains(lower, "client_msg_no") || strings.Contains(message, "重复") || strings.Contains(message, "已存在")
 		e := fmt.Errorf("IM服务返回状态[%d]: %s", resp.StatusCode, message)
