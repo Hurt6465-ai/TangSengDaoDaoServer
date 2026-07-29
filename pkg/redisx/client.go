@@ -83,6 +83,13 @@ func (c *Client) SetNX(key string, value interface{}, expire time.Duration) (boo
 	return c.client.SetNX(key, value, expire).Result()
 }
 
+func (c *Client) Expire(key string, expire time.Duration) error {
+	if err := c.available(); err != nil {
+		return err
+	}
+	return c.client.Expire(key, expire).Err()
+}
+
 func (c *Client) CompareAndDelete(key, expected string) (bool, error) {
 	if err := c.available(); err != nil {
 		return false, err
@@ -118,7 +125,9 @@ func (c *Client) TouchPresence(foregroundKey, lastActiveKey, writeLockKey, uid s
 	}
 	const script = `
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[3])
+redis.call('EXPIRE', KEYS[1], 86400)
 redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+redis.call('EXPIRE', KEYS[2], 864000)
 local locked = redis.call('SET', KEYS[3], ARGV[4], 'PX', ARGV[5], 'NX')
 if locked then return 1 end
 return 0`
