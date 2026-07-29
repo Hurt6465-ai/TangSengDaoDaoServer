@@ -357,17 +357,20 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	userMap := map[string]*user.UserDetailResp{}                // 用户详情
 	groupMap := map[string]*group.GroupResp{}                   // 群详情
 	conversationExtraMap := map[string]*conversationExtraResp{} // 最近会话扩展
-	groupVailds := make([]string, 0, len(conversations))        // 有效群
+	groupValids := make([]string, 0, len(conversations))        // 有效群
 
 	// ---------- 是否在群内 ----------
 	if len(groupNos) > 0 {
-		groupVailds, err = co.groupService.ExistMembers(groupNos, loginUID)
+		groupValids, err = co.groupService.ExistMembers(groupNos, loginUID)
 		if err != nil {
 			co.Error("查询有效群失败！", zap.Error(err))
 			c.ResponseError(errors.New("查询有效群失败！"))
 			return
 		}
-
+	}
+	validGroupSet := make(map[string]struct{}, len(groupValids))
+	for _, groupNo := range groupValids {
+		validGroupSet[groupNo] = struct{}{}
 	}
 
 	// ---------- 扩展 ----------
@@ -448,20 +451,18 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		}
 	}
 
+	// 一次收集本轮同步的全部消息 ID，再批量查询消息扩展、用户扩展和回应，
+	// 避免在每个会话中分别执行三次查询形成 N+1。
+	messageIDs := collectConversationMessageIDs(conversations)
+	messageExtraMap, messageReactionMap, messageUserExtraMap := co.queryConversationMessageDetails(messageIDs, loginUID)
+
 	syncUserConversationResps := make([]*SyncUserConversationResp, 0, len(conversations))
 	userKey := loginUID
 	if len(conversations) > 0 {
 		for _, conversation := range conversations {
 
 			if conversation.ChannelType == common.ChannelTypeGroup.Uint8() {
-				vaild := false
-				for _, groupVaild := range groupVailds {
-					if groupVaild == conversation.ChannelID {
-						vaild = true
-						break
-					}
-				}
-				if !vaild { // 无效群则跳过
+				if _, valid := validGroupSet[conversation.ChannelID]; !valid { // 无效群则跳过
 					continue
 				}
 			}
@@ -488,7 +489,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 			channelOffsetM := channelOffsetModelMap[channelKey]
 			deviceOffsetM := deviceOffsetModelMap[channelKey]
 			extra := conversationExtraMap[channelKey]
-			syncUserConversationResp := newSyncUserConversationResp(conversation, extra, loginUID, co.messageExtraDB, co.messageReactionDB, co.messageUserExtraDB, mute, stick, channelOffsetM, deviceOffsetM, channelOffsetMessageSeq)
+			syncUserConversationResp := newSyncUserConversationResp(conversation, extra, loginUID, messageExtraMap, messageReactionMap, messageUserExtraMap, mute, stick, channelOffsetM, deviceOffsetM, channelOffsetMessageSeq)
 			if len(syncUserConversationResp.Recents) > 0 {
 				syncUserConversationResps = append(syncUserConversationResps, syncUserConversationResp)
 			}
@@ -525,42 +526,37 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		co.syncConversationVersionMap[userKey] = lastVersion
 	}
 	co.syncConversationResultCacheLock.Unlock()
-	// 查询通话中的频道
-	// 加入的群聊
-	joinedGroups, err := co.groupService.GetGroupsWithMemberUID(loginUID)
-	if err != nil {
-		co.Error("查询加入的群聊错误", zap.Error(err))
-		c.ResponseError(errors.New("查询加入的群聊错误"))
-		return
-	}
-	callChannelIDs := make([]string, 0)
-	if len(joinedGroups) > 0 {
-		for _, g := range joinedGroups {
-			callChannelIDs = append(callChannelIDs, g.GroupNo)
+	// 只查询本次同步实际返回会话的通话状态，避免每次同步都加载全部好友和全部群。
+	callChannelIDs := make([]string, 0, len(syncUserConversationResps))
+	callChannelIDSet := make(map[string]struct{}, len(syncUserConversationResps))
+	for _, conversationResp := range syncUserConversationResps {
+		var callChannelID string
+		switch conversationResp.ChannelType {
+		case common.ChannelTypePerson.Uint8():
+			callChannelID = common.GetFakeChannelIDWith(conversationResp.ChannelID, loginUID)
+		case common.ChannelTypeGroup.Uint8():
+			callChannelID = conversationResp.ChannelID
 		}
-	}
-	// 好友
-	friends, err := co.userService.GetFriends(loginUID)
-	if err != nil {
-		co.Error("查询好友错误", zap.Error(err))
-		c.ResponseError(errors.New("查询好友错误"))
-		return
-	}
-	if len(friends) > 0 {
-		for _, f := range friends {
-			fakeChannelID := common.GetFakeChannelIDWith(f.UID, loginUID)
-			callChannelIDs = append(callChannelIDs, fakeChannelID)
+		if callChannelID == "" {
+			continue
 		}
+		if _, exists := callChannelIDSet[callChannelID]; exists {
+			continue
+		}
+		callChannelIDSet[callChannelID] = struct{}{}
+		callChannelIDs = append(callChannelIDs, callChannelID)
 	}
+
 	var callingChannels []*model.CallingChannelResp
-	modules := register.GetModules(co.ctx)
-	for _, m := range modules {
-		if m.BussDataSource.GetCallingChannel != nil {
-			callingChannels, _ = m.BussDataSource.GetCallingChannel(loginUID, callChannelIDs)
-			break
+	if len(callChannelIDs) > 0 {
+		modules := register.GetModules(co.ctx)
+		for _, m := range modules {
+			if m.BussDataSource.GetCallingChannel != nil {
+				callingChannels, _ = m.BussDataSource.GetCallingChannel(loginUID, callChannelIDs)
+				break
+			}
 		}
 	}
-	println("查询到通话中的频道", len(callingChannels))
 	channelStates := make([]*ChannelState, 0)
 	if len(callingChannels) > 0 {
 		for _, channel := range callingChannels {
@@ -1086,74 +1082,105 @@ type SyncUserConversationResp struct {
 	Extra           *conversationExtraResp `json:"extra,omitempty"`    // 扩展
 }
 
-func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *conversationExtraResp, loginUID string, messageExtraDB *messageExtraDB, messageReactionDB *messageReactionDB, messageUserExtraDB *messageUserExtraDB, mute int, stick int, channelOffsetM *channelOffsetModel, deviceOffsetM *deviceOffsetModel, channelOffsetMessageSeq uint32) *SyncUserConversationResp {
+const conversationMessageQueryBatchSize = 500
+
+func collectConversationMessageIDs(conversations []*config.SyncUserConversationResp) []string {
+	messageIDSet := make(map[string]struct{})
+	messageIDs := make([]string, 0)
+	for _, conversation := range conversations {
+		if conversation == nil {
+			continue
+		}
+		for _, message := range conversation.Recents {
+			if message == nil {
+				continue
+			}
+			messageID := strconv.FormatInt(message.MessageID, 10)
+			if _, exists := messageIDSet[messageID]; exists {
+				continue
+			}
+			messageIDSet[messageID] = struct{}{}
+			messageIDs = append(messageIDs, messageID)
+		}
+	}
+	return messageIDs
+}
+
+func (co *Conversation) queryConversationMessageDetails(messageIDs []string, loginUID string) (map[string]*messageExtraDetailModel, map[string][]*reactionModel, map[string]*messageUserExtraModel) {
+	messageExtraMap := make(map[string]*messageExtraDetailModel)
+	messageReactionMap := make(map[string][]*reactionModel)
+	messageUserExtraMap := make(map[string]*messageUserExtraModel)
+
+	for start := 0; start < len(messageIDs); start += conversationMessageQueryBatchSize {
+		end := start + conversationMessageQueryBatchSize
+		if end > len(messageIDs) {
+			end = len(messageIDs)
+		}
+		batch := messageIDs[start:end]
+
+		messageUserExtraModels, err := co.messageUserExtraDB.queryWithMessageIDsAndUID(batch, loginUID)
+		if err != nil {
+			co.Error("批量查询消息编辑字段失败！", zap.Error(err), zap.Int("messageCount", len(batch)))
+		} else {
+			for _, messageUserExtra := range messageUserExtraModels {
+				if messageUserExtra != nil {
+					messageUserExtraMap[messageUserExtra.MessageID] = messageUserExtra
+				}
+			}
+		}
+
+		messageExtras, err := co.messageExtraDB.queryWithMessageIDsAndUID(batch, loginUID)
+		if err != nil {
+			co.Error("批量查询消息扩展字段失败！", zap.Error(err), zap.Int("messageCount", len(batch)))
+		} else {
+			for _, messageExtra := range messageExtras {
+				if messageExtra != nil {
+					messageExtraMap[messageExtra.MessageID] = messageExtra
+				}
+			}
+		}
+
+		messageReactions, err := co.messageReactionDB.queryWithMessageIDs(batch)
+		if err != nil {
+			co.Error("批量查询消息回应失败！", zap.Error(err), zap.Int("messageCount", len(batch)))
+		} else {
+			for _, reaction := range messageReactions {
+				if reaction == nil {
+					continue
+				}
+				messageReactionMap[reaction.MessageID] = append(messageReactionMap[reaction.MessageID], reaction)
+			}
+		}
+	}
+
+	return messageExtraMap, messageReactionMap, messageUserExtraMap
+}
+
+func newSyncUserConversationResp(resp *config.SyncUserConversationResp, extra *conversationExtraResp, loginUID string, messageExtraMap map[string]*messageExtraDetailModel, messageReactionMap map[string][]*reactionModel, messageUserExtraMap map[string]*messageUserExtraModel, mute int, stick int, channelOffsetM *channelOffsetModel, deviceOffsetM *deviceOffsetModel, channelOffsetMessageSeq uint32) *SyncUserConversationResp {
 	recents := make([]*MsgSyncResp, 0, len(resp.Recents))
 	lastClientMsgNo := "" // 最新未被删除的消息的clientMsgNo
-	if len(resp.Recents) > 0 {
-		messageIDs := make([]string, 0, len(resp.Recents))
-		for _, message := range resp.Recents {
-			messageIDs = append(messageIDs, fmt.Sprintf("%d", message.MessageID))
+	for _, message := range resp.Recents {
+		if message == nil {
+			continue
 		}
-
-		// 查询用户个人修改的消息数据
-		messageUserExtraModels, err := messageUserExtraDB.queryWithMessageIDsAndUID(messageIDs, loginUID)
-		if err != nil {
-			log.Error("查询消息编辑字段失败！", zap.Error(err))
+		if channelOffsetM != nil && message.MessageSeq <= channelOffsetM.MessageSeq {
+			continue
 		}
-		messageUserExtraMap := map[string]*messageUserExtraModel{}
-		if len(messageUserExtraModels) > 0 {
-			for _, messageUserEditM := range messageUserExtraModels {
-				messageUserExtraMap[messageUserEditM.MessageID] = messageUserEditM
-			}
+		if deviceOffsetM != nil && message.MessageSeq <= uint32(deviceOffsetM.MessageSeq) {
+			continue
 		}
-
-		// 消息扩充数据
-		messageExtras, err := messageExtraDB.queryWithMessageIDsAndUID(messageIDs, loginUID)
-		if err != nil {
-			log.Error("查询消息扩展字段失败！", zap.Error(err))
+		messageIDStr := strconv.FormatInt(message.MessageID, 10)
+		messageExtra := messageExtraMap[messageIDStr]
+		messageUserExtra := messageUserExtraMap[messageIDStr]
+		msgResp := &MsgSyncResp{}
+		msgResp.from(message, loginUID, messageExtra, messageUserExtra, messageReactionMap[messageIDStr], channelOffsetMessageSeq)
+		msgResp.ExtraVersion = 0
+		if msgResp.MessageExtra != nil {
+			msgResp.MessageExtra.ExtraVersion = 0
 		}
-		messageExtraMap := map[string]*messageExtraDetailModel{}
-		if len(messageExtras) > 0 {
-			for _, messageExtra := range messageExtras {
-				messageExtraMap[messageExtra.MessageID] = messageExtra
-			}
-		}
-		// 消息回应
-		messageReaction, err := messageReactionDB.queryWithMessageIDs(messageIDs)
-		if err != nil {
-			log.Error("查询消息回应错误", zap.Error(err))
-		}
-		messageReactionMap := map[string][]*reactionModel{}
-		if len(messageReaction) > 0 {
-			for _, reaction := range messageReaction {
-				msgReactionList := messageReactionMap[reaction.MessageID]
-				if msgReactionList == nil {
-					msgReactionList = make([]*reactionModel, 0)
-				}
-				msgReactionList = append(msgReactionList, reaction)
-				messageReactionMap[reaction.MessageID] = msgReactionList
-			}
-		}
-		for _, message := range resp.Recents {
-			if channelOffsetM != nil && message.MessageSeq <= channelOffsetM.MessageSeq {
-				continue
-			}
-			if deviceOffsetM != nil && message.MessageSeq <= uint32(deviceOffsetM.MessageSeq) {
-				continue
-			}
-			messageIDStr := strconv.FormatInt(message.MessageID, 10)
-			messageExtra := messageExtraMap[messageIDStr]
-			messageUserExtra := messageUserExtraMap[messageIDStr]
-			msgResp := &MsgSyncResp{}
-			msgResp.from(message, loginUID, messageExtra, messageUserExtra, messageReactionMap[messageIDStr], channelOffsetMessageSeq)
-			msgResp.ExtraVersion = 0
-			if msgResp.MessageExtra != nil {
-				msgResp.MessageExtra.ExtraVersion = 0
-			}
-			recents = append(recents, msgResp)
-			if lastClientMsgNo == "" && msgResp.IsDeleted == 0 {
-				lastClientMsgNo = msgResp.ClientMsgNo
-			}
+		recents = append(recents, msgResp)
+		if lastClientMsgNo == "" && msgResp.IsDeleted == 0 {
+			lastClientMsgNo = msgResp.ClientMsgNo
 		}
 	}
 	if lastClientMsgNo == "" {
