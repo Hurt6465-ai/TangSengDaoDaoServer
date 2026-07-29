@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	appredis "github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/redisx"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
+	"go.uber.org/zap"
 )
 
 var (
@@ -19,19 +24,86 @@ var (
 	ErrRecommendationBusy = errors.New("语伴列表正在生成，请稍后重试")
 )
 
+const (
+	defaultActiveWriteWorkers = 8
+	defaultActiveWriteQueue   = 8192
+	defaultCandidateWorkers   = 8
+	imOnlineSnapshotFreshFor  = 15 * time.Second
+)
+
+var activeWriteSpillMax = int64(boundedEnvInt("TS_DD_PARTNER_ACTIVE_SPILL_MAX", 65536, 5000, 500000))
+
+type activeWriteTask struct {
+	uid   string
+	atMS  int64
+	token string
+}
+
+type activeWriteSpillPayload struct {
+	UID   string `json:"uid"`
+	AtMS  int64  `json:"at_ms"`
+	Token string `json:"token"`
+}
+
 type Service struct {
 	ctx    *config.Context
 	db     *db
 	pool   *poolService
 	redisx *appredis.Client
+	log.Log
+
+	jobMu      sync.Mutex
+	jobRunning map[string]bool
+
+	activeWriteQueue chan activeWriteTask
+	candidateSlots   chan struct{}
+	assignmentWake   chan struct{}
+
+	imOnlineMu        sync.RWMutex
+	imOnlineRefreshMu sync.Mutex
+	imOnlineSnapshot  map[string]struct{}
+	imOnlineLoadedAt  int64
+	imOnlineRetryAt   atomic.Int64
+
+	activeQueueSpilled atomic.Uint64
+	activeQueueDropped atomic.Uint64
+	activeWorkerErrors atomic.Uint64
+	jobLockErrors      atomic.Uint64
+	snapshotErrors     atomic.Uint64
+	presenceErrors     atomic.Uint64
+	lastPressureWarnAt atomic.Int64
 }
 
 func NewService(ctx *config.Context) *Service {
 	d := newDB(ctx)
 	rx := appredis.FromContext(ctx)
-	s := &Service{ctx: ctx, db: d, redisx: rx, pool: newPoolService(ctx, d, rx)}
+	activeWorkers := boundedEnvInt("TS_DD_PARTNER_ACTIVE_WORKERS", defaultActiveWriteWorkers, 1, 64)
+	activeQueueSize := boundedEnvInt("TS_DD_PARTNER_ACTIVE_QUEUE", defaultActiveWriteQueue, 512, 65536)
+	candidateWorkers := boundedEnvInt("TS_DD_PARTNER_CANDIDATE_WORKERS", defaultCandidateWorkers, 1, 64)
+	s := &Service{
+		ctx: ctx, db: d, redisx: rx, pool: newPoolService(ctx, d, rx), jobRunning: make(map[string]bool), Log: log.NewTLog("partnerlistService"),
+		activeWriteQueue: make(chan activeWriteTask, activeQueueSize),
+		candidateSlots:   make(chan struct{}, candidateWorkers),
+		assignmentWake:   make(chan struct{}, 1),
+		imOnlineSnapshot: make(map[string]struct{}),
+	}
+	_ = s.refreshIMOnlineSnapshot()
+	s.startActiveWriteWorkers(activeWorkers)
+	s.startRuntimeMetrics()
 	s.startPoolJobs()
 	return s
+}
+
+func boundedEnvInt(key string, fallback, minValue, maxValue int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < minValue || n > maxValue {
+		return fallback
+	}
+	return n
 }
 
 func (s *Service) Recommendations(uid string) (*RecommendationResp, error) {
@@ -55,7 +127,7 @@ func (s *Service) Recommendations(uid string) (*RecommendationResp, error) {
 	}
 	added, removed := []string{}, []string{}
 	updatedCount := 0
-	day, a, r, err := s.repairInvalid(day, nowMS)
+	day, a, r, validatedUsers, err := s.repairInvalid(day, nowMS)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +139,7 @@ func (s *Service) Recommendations(uid string) (*RecommendationResp, error) {
 		dueAt = day.RotationRetryAt
 	}
 	if day.RotationDone == 0 && nowMS >= dueAt && recommendationDayKey(now) == day.DayKey {
+		validatedUsers = nil // rotate reloads and may replace the current recommendation set.
 		day, a, r, err = s.rotate(day, nowMS)
 		if err != nil {
 			return nil, err
@@ -75,12 +148,17 @@ func (s *Service) Recommendations(uid string) (*RecommendationResp, error) {
 		removed = append(removed, r...)
 		updatedCount += len(a)
 	}
-	users, err := s.usersInOrder(uid, day.currentIDs(), nowMS)
+	var users []*ListUser
+	if validatedUsers != nil {
+		users, err = s.usersInOrderFromProfiles(day.currentIDs(), validatedUsers, nowMS)
+	} else {
+		users, err = s.usersInOrder(uid, day.currentIDs(), nowMS)
+	}
 	if err != nil {
 		return nil, err
 	}
 	used, remaining := s.greetingQuota(uid, dayKey)
-	return &RecommendationResp{DayKey: day.DayKey, AlgorithmVersion: day.AlgorithmVersion, ListVersion: day.ListVersion, FirstServedAt: day.FirstServedAt, RotateAt: day.RotateAt, RotationRetryAt: day.RotationRetryAt, RotationDone: day.RotationDone == 1, UpdatedCount: updatedCount, UniqueAssignedCount: day.UniqueAssignedCount, DailyCandidateLimit: DailyUniqueLimit, GreetingLimit: GreetingDailyLimit, GreetingUsed: used, GreetingRemaining: remaining, AddedUserIDs: uniqueIDs(added, 0), RemovedUserIDs: uniqueIDs(removed, 0), Users: users, ServerTime: nowMS}, nil
+	return &RecommendationResp{DayKey: day.DayKey, AlgorithmVersion: day.AlgorithmVersion, ListVersion: day.ListVersion, FirstServedAt: day.FirstServedAt, RotateAt: day.RotateAt, RotationRetryAt: day.RotationRetryAt, RotationDone: day.RotationDone == 1, UpdatedCount: updatedCount, UniqueAssignedCount: day.UniqueAssignedCount, DailyCandidateLimit: DailyUniqueLimit, GreetingLimit: GreetingDailyLimit, GreetingUsed: used, GreetingRemaining: remaining, AddedUserIDs: uniqueIDs(added, 0), RemovedUserIDs: uniqueIDs(removed, 0), Users: users, ServerTime: nowMS, OnlineAsOf: s.onlineSnapshotLoadedAt(), OnlineRefreshAfterMS: onlineRefreshAfterMS(uid, now)}, nil
 }
 
 func scoresFor(users []*ListUser) map[string]float64 {
@@ -142,18 +220,18 @@ func (s *Service) generateInitial(uid, dayKey string, nowMS int64) (*recommendat
 	}
 	s.recordViewerSeen(uid, ids, nowMS)
 	s.cacheDay(day)
-	go s.flushAssignmentOutbox()
+	s.signalAssignmentOutbox()
 	return day, nil
 }
 
-func (s *Service) repairInvalid(day *recommendationDay, nowMS int64) (*recommendationDay, []string, []string, error) {
+func (s *Service) repairInvalid(day *recommendationDay, nowMS int64) (*recommendationDay, []string, []string, []*ListUser, error) {
 	if day == nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	current := day.currentIDs()
 	validUsers, err := s.db.profilesByUIDs(day.ViewerUID, current)
 	if err != nil {
-		return day, nil, nil, err
+		return day, nil, nil, nil, err
 	}
 	valid := map[string]struct{}{}
 	for _, u := range validUsers {
@@ -168,7 +246,7 @@ func (s *Service) repairInvalid(day *recommendationDay, nowMS int64) (*recommend
 		}
 	}
 	if len(removed) == 0 {
-		return day, nil, nil, nil
+		return day, nil, nil, validUsers, nil
 	}
 	remaining := DailyUniqueLimit - day.UniqueAssignedCount
 	missing := InitialListLimit - len(kept)
@@ -184,11 +262,11 @@ func (s *Service) repairInvalid(day *recommendationDay, nowMS int64) (*recommend
 	if missing > 0 {
 		viewer, e := s.db.viewer(day.ViewerUID)
 		if e != nil {
-			return day, nil, nil, e
+			return day, nil, nil, nil, e
 		}
 		addedUsers, poolVersion, bucket, e = s.selectCandidates(viewer, day.DayKey, toSet(day.allAssignedIDs()), missing, nowMS)
 		if e != nil {
-			return day, nil, nil, e
+			return day, nil, nil, nil, e
 		}
 	}
 	added := userIDs(addedUsers)
@@ -203,16 +281,16 @@ func (s *Service) repairInvalid(day *recommendationDay, nowMS int64) (*recommend
 	day.ListVersion++
 	updated, err := s.db.updateDay(day, expected, bucket, added, nowMS)
 	if err != nil {
-		return day, nil, nil, err
+		return day, nil, nil, nil, err
 	}
 	if !updated {
 		d, e := s.db.loadDay(day.ViewerUID, day.DayKey)
-		return d, nil, nil, e
+		return d, nil, nil, nil, e
 	}
 	s.recordViewerSeen(day.ViewerUID, added, nowMS)
 	s.cacheDay(day)
-	go s.flushAssignmentOutbox()
-	return day, added, removed, nil
+	s.signalAssignmentOutbox()
+	return day, added, removed, append(validUsers, addedUsers...), nil
 }
 
 func (s *Service) rotate(day *recommendationDay, nowMS int64) (*recommendationDay, []string, []string, error) {
@@ -350,7 +428,7 @@ func (s *Service) rotate(day *recommendationDay, nowMS int64) (*recommendationDa
 	}
 	s.recordViewerSeen(day.ViewerUID, newIDs, nowMS)
 	s.cacheDay(day)
-	go s.flushAssignmentOutbox()
+	s.signalAssignmentOutbox()
 	return day, newIDs, removed, nil
 }
 
@@ -434,6 +512,10 @@ func (s *Service) selectCandidates(viewer *viewerProfile, dayKey string, exclude
 	if viewer == nil || limit <= 0 {
 		return []*ListUser{}, "", "", nil
 	}
+	if !s.acquireCandidateSlot(2 * time.Second) {
+		return nil, "", "", ErrRecommendationBusy
+	}
+	defer s.releaseCandidateSlot()
 	hot, version, err := s.pool.candidateUIDs(viewer, false)
 	if err != nil {
 		return nil, "", "", err
@@ -482,7 +564,7 @@ func (s *Service) selectCandidates(viewer *viewerProfile, dayKey string, exclude
 		return nil, "", "", err
 	}
 	foreground := s.pool.foregroundOnlineSet(ids, nowMS)
-	imOnline, err := s.db.imOnlineUIDs(ids)
+	imOnline, err := s.imOnlineUIDs(ids)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -509,33 +591,43 @@ func (s *Service) usersInOrder(viewerUID string, ids []string, nowMS int64) ([]*
 	if err != nil {
 		return nil, err
 	}
-	m := map[string]*ListUser{}
-	for _, p := range profiles {
-		m[p.UID] = p
+	return s.usersInOrderFromProfiles(ids, profiles, nowMS)
+}
+
+func (s *Service) usersInOrderFromProfiles(ids []string, profiles []*ListUser, nowMS int64) ([]*ListUser, error) {
+	ids = uniqueIDs(ids, InitialListLimit)
+	if len(ids) == 0 {
+		return []*ListUser{}, nil
+	}
+	m := make(map[string]*ListUser, len(profiles))
+	for _, profile := range profiles {
+		if profile != nil && profile.UID != "" {
+			m[profile.UID] = profile
+		}
 	}
 	foreground := s.pool.foregroundOnlineSet(ids, nowMS)
 	active := s.pool.lastActiveScores(ids)
-	im, err := s.db.imOnlineUIDs(ids)
+	im, err := s.imOnlineUIDs(ids)
 	if err != nil {
 		return nil, err
 	}
-	out := []*ListUser{}
+	out := make([]*ListUser, 0, len(ids))
 	for _, uid := range ids {
-		p := m[uid]
-		if p == nil {
+		profile := m[uid]
+		if profile == nil {
 			continue
 		}
-		if a := active[uid]; a > p.LastActiveAt {
-			p.LastActiveAt = a
+		if lastActive := active[uid]; lastActive > profile.LastActiveAt {
+			profile.LastActiveAt = lastActive
 		}
-		_, iok := im[uid]
-		_, fok := foreground[uid]
-		if iok && fok {
-			p.Online = 1
+		_, imOnline := im[uid]
+		_, foregroundOnline := foreground[uid]
+		if imOnline && foregroundOnline {
+			profile.Online = 1
 		} else {
-			p.Online = 0
+			profile.Online = 0
 		}
-		out = append(out, p)
+		out = append(out, profile)
 	}
 	return out, nil
 }
@@ -633,24 +725,68 @@ func (s *Service) assignmentContext(dayKey, bucket string, ids []string, bucketE
 }
 
 func (s *Service) recordViewerSeen(viewer string, ids []string, at int64) {
-	if s.ctx == nil || s.ctx.GetRedisConn() == nil {
+	viewer = strings.TrimSpace(viewer)
+	if s == nil || viewer == "" || s.ctx == nil || s.ctx.GetRedisConn() == nil {
 		return
 	}
-	pairs := []interface{}{}
+	pairs := make([]interface{}, 0, len(ids)*2)
 	for _, uid := range uniqueIDs(ids, 0) {
 		pairs = append(pairs, float64(at), uid)
 	}
-	if len(pairs) > 0 && s.redisx != nil {
-		_ = s.redisx.ZAdd(viewerSeenKey(viewer), pairs...)
-		_ = s.ctx.GetRedisConn().Expire(viewerSeenKey(viewer), viewerSeenTTL)
+	if len(pairs) == 0 {
+		return
+	}
+	key := viewerSeenKey(viewer)
+	var writeErr error
+	advancedWrite := false
+	if s.redisx != nil {
+		writeErr = s.redisx.ZAdd(key, pairs...)
+		advancedWrite = writeErr == nil
+	}
+	// TangSengDaoDaoServerLib's ZAdd wrapper has a multi-member indexing bug.
+	// Use one member per call only as a compatibility fallback when redisx is
+	// unavailable or temporarily unhealthy.
+	if s.redisx == nil || writeErr != nil {
+		writeErr = nil
+		for i := 0; i+1 < len(pairs); i += 2 {
+			if err := s.ctx.GetRedisConn().ZAdd(key, pairs[i], pairs[i+1]); err != nil {
+				writeErr = err
+				break
+			}
+		}
+	}
+	if writeErr != nil {
+		// A compatibility fallback can fail after writing some members. Keep even a
+		// partially written key bounded instead of leaving an accidental permanent
+		// de-duplication record.
+		if s.redisx != nil {
+			_ = s.redisx.Expire(key, viewerSeenTTL)
+		}
+		_ = s.ctx.GetRedisConn().Expire(key, viewerSeenTTL)
+		s.warnPressure("语伴列表已看记录写入Redis失败", zap.String("viewer_uid", viewer), zap.Int("candidate_count", len(pairs)/2), zap.Error(writeErr))
+		return
+	}
+	var expireErr error
+	if advancedWrite {
+		expireErr = s.redisx.Expire(key, viewerSeenTTL)
+	}
+	if !advancedWrite || expireErr != nil {
+		expireErr = s.ctx.GetRedisConn().Expire(key, viewerSeenTTL)
+	}
+	if expireErr != nil {
+		s.warnPressure("语伴列表已看记录设置过期时间失败", zap.String("viewer_uid", viewer), zap.Error(expireErr))
 	}
 }
 
 func (s *Service) flushAssignmentOutbox() {
+	s.runExclusiveJob(assignmentOutboxFlushLockKey, 5*time.Minute, s.flushAssignmentOutboxLocked)
+}
+
+func (s *Service) flushAssignmentOutboxLocked() {
 	if s.ctx == nil || s.ctx.GetRedisConn() == nil || s.redisx == nil {
 		return
 	}
-	rows, err := s.db.pendingAssignmentOutbox(time.Now().UnixMilli(), 500)
+	rows, err := s.db.pendingAssignmentOutbox(time.Now().UnixMilli(), 1000)
 	if err != nil || len(rows) == 0 {
 		return
 	}
@@ -672,15 +808,24 @@ redis.call('EXPIRE', global, ttl)
 redis.call('EXPIRE', bucket, ttl)
 return 1`
 	ttlSeconds := int64(recommendationTTL / time.Second)
+	doneIDs := make([]int64, 0, len(rows))
+	consecutiveRedisErrors := 0
 	for _, row := range rows {
 		_, err = s.redisx.EvalInt(script, []string{assignmentAppliedKey(row.DayKey), assignmentGlobalKey(row.DayKey), assignmentBucketKey(row.DayKey, row.Bucket)}, strconv.FormatInt(row.ID, 10), row.CandidateUID, ttlSeconds)
 		if err == nil {
-			err = s.db.markAssignmentOutboxDone(row.ID)
+			doneIDs = append(doneIDs, row.ID)
+			consecutiveRedisErrors = 0
+			continue
 		}
-		if err != nil {
-			_ = s.db.markAssignmentOutboxRetry(row.ID, row.Attempts, err.Error())
+		_ = s.db.markAssignmentOutboxRetry(row.ID, row.Attempts, err.Error())
+		consecutiveRedisErrors++
+		// A Redis outage is normally shared by the whole batch. Do not turn one
+		// failing connection into hundreds of sequential timeouts every two seconds.
+		if consecutiveRedisErrors >= 3 {
+			break
 		}
 	}
+	_ = s.db.markAssignmentOutboxDoneBatch(doneIDs)
 }
 
 func (s *Service) Heartbeat(uid string) (*HeartbeatResp, error) {
@@ -691,23 +836,60 @@ func (s *Service) Heartbeat(uid string) (*HeartbeatResp, error) {
 	now := time.Now()
 	nowMS := now.UnixMilli()
 	expire := now.Add(foregroundTTL).UnixMilli()
-	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		c := s.ctx.GetRedisConn()
-		_ = c.ZAdd(foregroundOnlineKey, float64(expire), uid)
-		_ = c.Expire(foregroundOnlineKey, 24*time.Hour)
-		_ = c.ZAdd(lastActiveKey, float64(nowMS), uid)
-		_ = c.Expire(lastActiveKey, 10*24*time.Hour)
-		write := false
-		var e error
-		if s.redisx != nil {
-			write, e = s.redisx.SetNX(activeWriteLockKey(uid), "1", activeWriteTTL)
-		}
-		if e == nil && write {
-			go func() { _ = s.db.touchActive(uid, nowMS); _ = s.pool.syncUserE(uid, nowMS) }()
+	presenceUpdated := false
+	if s.redisx != nil {
+		token := strconv.FormatInt(now.UnixNano(), 10)
+		write, err := s.redisx.TouchPresence(foregroundOnlineKey, lastActiveKey, activeWriteLockKey(uid), uid, expire, nowMS, activeWriteTTL, token)
+		if err == nil {
+			presenceUpdated = true
+			if write {
+				if !s.enqueueActiveWrite(activeWriteTask{uid: uid, atMS: nowMS, token: token}) {
+					_, _ = s.redisx.CompareAndDelete(activeWriteLockKey(uid), token)
+				}
+			}
+		} else {
+			s.presenceErrors.Add(1)
+			s.warnPressure("语伴高级Redis心跳更新失败，已尝试基础Redis降级", zap.String("uid", uid), zap.Error(err))
 		}
 	}
-	return &HeartbeatResp{UID: uid, LastActiveAt: nowMS, OnlineExpireAt: expire, NextHeartbeatIn: 60}, nil
+	if !presenceUpdated && s.ctx != nil && s.ctx.GetRedisConn() != nil {
+		// Keep foreground status alive even if the advanced client/pool is temporarily
+		// unhealthy. The ServerLib Redis wrapper has no SetNX method, so its compatible
+		// fallback uses INCR + EXPIRE and deletes the key if expiry setup fails.
+		c := s.ctx.GetRedisConn()
+		if err := c.ZAdd(foregroundOnlineKey, float64(expire), uid); err != nil {
+			s.presenceErrors.Add(1)
+		}
+		if err := c.Expire(foregroundOnlineKey, 24*time.Hour); err != nil {
+			s.presenceErrors.Add(1)
+		}
+		if err := c.ZAdd(lastActiveKey, float64(nowMS), uid); err != nil {
+			s.presenceErrors.Add(1)
+		}
+		if err := c.Expire(lastActiveKey, 10*24*time.Hour); err != nil {
+			s.presenceErrors.Add(1)
+		}
+		lockKey := activeWriteLockKey(uid)
+		count, lockErr := c.Incr(lockKey)
+		if lockErr != nil {
+			s.presenceErrors.Add(1)
+		} else if count == 1 {
+			task := activeWriteTask{uid: uid, atMS: nowMS, token: "1"}
+			if expireErr := c.Expire(lockKey, activeWriteTTL); expireErr != nil {
+				// Keep the original fail-open persistence behavior. The bounded queue
+				// protects MySQL even though this one write no longer has a Redis guard.
+				s.presenceErrors.Add(1)
+				_ = c.Del(lockKey)
+				task.token = ""
+			}
+			if !s.enqueueActiveWrite(task) && task.token == "1" {
+				_ = c.Del(lockKey)
+			}
+		}
+	}
+	return &HeartbeatResp{UID: uid, LastActiveAt: nowMS, OnlineExpireAt: expire, NextHeartbeatIn: heartbeatIntervalSeconds(uid, now)}, nil
 }
+
 func (s *Service) SetEnabled(uid string, enabled int) (*PartnerSettingsResp, error) {
 	if strings.TrimSpace(uid) == "" {
 		return nil, errors.New("请先登录")
@@ -725,17 +907,67 @@ func (s *Service) SetEnabled(uid string, enabled int) (*PartnerSettingsResp, err
 func (s *Service) OnlineBatch(uids []string) (*OnlineBatchResp, error) {
 	uids = uniqueIDs(uids, 50)
 	now := time.Now().UnixMilli()
-	im, err := s.db.imOnlineUIDs(uids)
-	if err != nil {
-		return nil, err
+	im, onlineAsOf := s.imOnlineUIDsFromSnapshot(uids)
+	realtime := onlineAsOf > 0 && now-onlineAsOf <= int64(imOnlineSnapshotFreshFor/time.Millisecond)
+	imUnavailable := false
+	if onlineAsOf <= 0 {
+		// Build one complete snapshot under a single-flight mutex. A partial per-request
+		// query must never mark the global snapshot as loaded, otherwise users omitted
+		// from that request would be reported offline until the next full refresh.
+		if err := s.ensureIMOnlineSnapshot(); err != nil {
+			// Do not make every waiting request retry the same failing MySQL query. During
+			// the short retry window, foreground heartbeats below become the online proxy.
+			imUnavailable = true
+			realtime = false
+			s.warnPressure("语伴IM在线快照暂不可用，已降级为前台心跳状态", zap.Error(err))
+		} else {
+			im, onlineAsOf = s.imOnlineUIDsFromSnapshot(uids)
+			now = time.Now().UnixMilli()
+			realtime = onlineAsOf > 0 && now-onlineAsOf <= int64(imOnlineSnapshotFreshFor/time.Millisecond)
+		}
 	}
-	dbActive, err := s.db.activityByUIDs(uids)
-	if err != nil {
-		return nil, err
+	fg, ra, presenceErr := s.onlinePresenceScores(uids, now)
+	allowDBFallback := presenceErr == nil && !imUnavailable
+	if presenceErr != nil {
+		s.presenceErrors.Add(1)
+		s.warnPressure("语伴在线批量读取Redis前台状态失败，已降级为IM在线快照", zap.Error(presenceErr))
+		realtime = false
+		// Prefer a temporary false-positive (IM connected but app may be backgrounded)
+		// over marking every user offline during a Redis outage. The response is
+		// explicitly non-realtime so clients retry with jitter.
+		fg = make(map[string]struct{}, len(im))
+		for uid := range im {
+			fg[uid] = struct{}{}
+		}
+		ra = map[string]int64{}
+	} else if imUnavailable {
+		// A recent authenticated foreground heartbeat is the safest available proxy
+		// when the very first IM/MySQL snapshot cannot be built.
+		im = make(map[string]struct{}, len(fg))
+		for uid := range fg {
+			im[uid] = struct{}{}
+		}
 	}
-	fg := s.pool.foregroundOnlineSet(uids, now)
-	ra := s.pool.lastActiveScores(uids)
-	states := []OnlineState{}
+	missing := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		if _, ok := ra[uid]; !ok {
+			missing = append(missing, uid)
+		}
+	}
+	dbActive := map[string]int64{}
+	// When Redis itself is unhealthy, querying partner_profiles for every online-batch
+	// request would turn a cache outage into a MySQL outage. Keep the IM snapshot
+	// result and temporarily omit last-active enrichment instead.
+	if allowDBFallback && len(missing) > 0 {
+		var activityErr error
+		dbActive, activityErr = s.db.activityByUIDs(missing)
+		if activityErr != nil {
+			s.snapshotErrors.Add(1)
+			s.warnPressure("语伴在线批量补查最后活跃失败，保留已有在线状态", zap.Error(activityErr))
+			dbActive = map[string]int64{}
+		}
+	}
+	states := make([]OnlineState, 0, len(uids))
 	for _, uid := range uids {
 		online := 0
 		if _, a := im[uid]; a {
@@ -743,14 +975,52 @@ func (s *Service) OnlineBatch(uids []string) (*OnlineBatchResp, error) {
 				online = 1
 			}
 		}
-		last := dbActive[uid]
-		if ra[uid] > last {
-			last = ra[uid]
+		last := ra[uid]
+		if dbActive[uid] > last {
+			last = dbActive[uid]
 		}
 		states = append(states, OnlineState{UID: uid, Online: online, LastActiveAt: last})
 	}
-	return &OnlineBatchResp{Users: states, ServerTime: now}, nil
+	return &OnlineBatchResp{Users: states, ServerTime: now, OnlineAsOf: onlineAsOf, Realtime: realtime}, nil
 }
+
+func (s *Service) onlinePresenceScores(uids []string, nowMS int64) (map[string]struct{}, map[string]int64, error) {
+	uids = uniqueIDs(uids, 50)
+	foreground := make(map[string]struct{}, len(uids))
+	lastActive := make(map[string]int64, len(uids))
+	if len(uids) == 0 {
+		return foreground, lastActive, nil
+	}
+	read := func(scoresOnline, scoresActive map[string]float64) {
+		for uid, score := range scoresOnline {
+			if int64(score) > nowMS {
+				foreground[uid] = struct{}{}
+			}
+		}
+		for uid, score := range scoresActive {
+			lastActive[uid] = int64(score)
+		}
+	}
+	var advancedErr error
+	if s.redisx != nil {
+		onlineScores, errOnline := s.redisx.ZScores(foregroundOnlineKey, uids)
+		activeScores, errActive := s.redisx.ZScores(lastActiveKey, uids)
+		if errOnline == nil && errActive == nil {
+			read(onlineScores, activeScores)
+			return foreground, lastActive, nil
+		}
+		if errOnline != nil {
+			advancedErr = errOnline
+		} else {
+			advancedErr = errActive
+		}
+	}
+	if advancedErr != nil {
+		return foreground, lastActive, advancedErr
+	}
+	return foreground, lastActive, errors.New("Redis在线状态连接不可用")
+}
+
 func (s *Service) greetingQuota(uid, dayKey string) (int, int) {
 	if _, e := time.ParseInLocation("2006-01-02", dayKey, businessLocation); e != nil {
 		return 0, GreetingDailyLimit
@@ -808,6 +1078,400 @@ func (s *Service) releaseLock(key, token string) {
 	}
 }
 
+func (s *Service) acquireCandidateSlot(wait time.Duration) bool {
+	if s == nil || s.candidateSlots == nil {
+		return true
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case s.candidateSlots <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Service) releaseCandidateSlot() {
+	if s == nil || s.candidateSlots == nil {
+		return
+	}
+	select {
+	case <-s.candidateSlots:
+	default:
+	}
+}
+
+func onlineRefreshAfterMS(uid string, now time.Time) int64 {
+	// The IM snapshot is refreshed every five seconds. A fixed three-second client
+	// interval creates synchronized request spikes without improving freshness.
+	// Spread each user across a deterministic 5-9 second window instead.
+	h := uint32(2166136261)
+	seed := uid + ":" + strconv.FormatInt(now.Unix()/30, 10)
+	for i := 0; i < len(seed); i++ {
+		h ^= uint32(seed[i])
+		h *= 16777619
+	}
+	return 5000 + int64(h%4001)
+}
+
+func heartbeatIntervalSeconds(uid string, now time.Time) int {
+	// Fixed intervals synchronize thousands of clients into periodic request spikes.
+	// A deterministic 50-70 second interval spreads heartbeats while staying safely
+	// below the 120-second foreground TTL.
+	h := uint32(2166136261)
+	seed := uid + ":" + strconv.FormatInt(now.Unix()/300, 10)
+	for i := 0; i < len(seed); i++ {
+		h ^= uint32(seed[i])
+		h *= 16777619
+	}
+	return 50 + int(h%21)
+}
+
+func (s *Service) startActiveWriteWorkers(count int) {
+	if s == nil || s.activeWriteQueue == nil || count <= 0 {
+		return
+	}
+	for i := 0; i < count; i++ {
+		go func() {
+			for task := range s.activeWriteQueue {
+				if err := s.processActiveWrite(task); err != nil && !s.spillActiveWrite(task) {
+					s.releaseActiveWriteGuard(task)
+					s.activeQueueDropped.Add(1)
+					s.warnPressure("语伴活跃写库执行失败且无法进入Redis溢出队列", zap.String("uid", task.uid), zap.Error(err))
+				}
+			}
+		}()
+	}
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			s.drainActiveWriteSpill(100)
+			<-t.C
+		}
+	}()
+}
+
+func (s *Service) processActiveWrite(task activeWriteTask) error {
+	dbErr := s.db.touchActive(task.uid, task.atMS)
+	poolErr := s.pool.syncUserE(task.uid, task.atMS)
+	if dbErr != nil || poolErr != nil {
+		s.activeWorkerErrors.Add(1)
+		if dbErr != nil {
+			return dbErr
+		}
+		return poolErr
+	}
+	return nil
+}
+
+func (s *Service) releaseActiveWriteGuard(task activeWriteTask) {
+	if s == nil || task.token == "" || task.uid == "" {
+		return
+	}
+	key := activeWriteLockKey(task.uid)
+	// Token "1" is reserved for the ServerLib INCR+EXPIRE fallback path.
+	if task.token == "1" {
+		if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+			_ = s.ctx.GetRedisConn().Del(key)
+		}
+		return
+	}
+	if s.redisx != nil {
+		_, _ = s.redisx.CompareAndDelete(key, task.token)
+	}
+}
+
+func (s *Service) enqueueActiveWrite(task activeWriteTask) bool {
+	if s == nil || s.activeWriteQueue == nil || task.uid == "" {
+		return false
+	}
+	select {
+	case s.activeWriteQueue <- task:
+		return true
+	default:
+	}
+	if s.spillActiveWrite(task) {
+		return true
+	}
+	s.activeQueueDropped.Add(1)
+	s.warnPressure("语伴活跃写库队列已满且无法写入Redis溢出队列", zap.String("uid", task.uid), zap.Int("queue_len", len(s.activeWriteQueue)), zap.Int("queue_cap", cap(s.activeWriteQueue)))
+	return false
+}
+
+func (s *Service) spillActiveWrite(task activeWriteTask) bool {
+	if s == nil || s.redisx == nil || strings.TrimSpace(task.uid) == "" {
+		return false
+	}
+	payload, err := json.Marshal(activeWriteSpillPayload{UID: task.uid, AtMS: task.atMS, Token: task.token})
+	if err != nil {
+		return false
+	}
+	size, dropped, err := s.redisx.PushBoundedDetailed(activeWriteSpillKey, activeWriteSpillMax, string(payload))
+	if err != nil {
+		return false
+	}
+	s.activeQueueSpilled.Add(1)
+	if dropped > 0 {
+		s.activeQueueDropped.Add(uint64(dropped))
+		s.warnPressure("语伴活跃写库溢出队列达到上限，最旧任务已被裁剪", zap.Int64("spill_size", size), zap.Int64("trimmed", dropped))
+	}
+	return true
+}
+
+func (s *Service) drainActiveWriteSpill(limit int) {
+	if s == nil || s.redisx == nil || limit <= 0 {
+		return
+	}
+	raws, err := s.redisx.PopBatch(activeWriteSpillKey, limit)
+	if err != nil {
+		s.activeWorkerErrors.Add(1)
+		s.warnPressure("读取语伴活跃Redis溢出队列失败", zap.Error(err))
+		return
+	}
+	if len(raws) == 0 {
+		return
+	}
+	for i, raw := range raws {
+		var payload activeWriteSpillPayload
+		if json.Unmarshal([]byte(raw), &payload) != nil || strings.TrimSpace(payload.UID) == "" {
+			s.activeQueueDropped.Add(1)
+			continue
+		}
+		task := activeWriteTask{uid: payload.UID, atMS: payload.AtMS, token: payload.Token}
+		if err = s.processActiveWrite(task); err != nil {
+			remaining := make([]interface{}, 0, len(raws)-i)
+			remaining = append(remaining, raw)
+			for _, value := range raws[i+1:] {
+				remaining = append(remaining, value)
+			}
+			_, trimmed, pushErr := s.redisx.PushBoundedDetailed(activeWriteSpillKey, activeWriteSpillMax, remaining...)
+			if pushErr != nil {
+				s.releaseActiveWriteGuard(task)
+				s.activeQueueDropped.Add(uint64(len(remaining)))
+				s.warnPressure("语伴活跃溢出任务处理失败后无法重新入队", zap.Int("lost_count", len(remaining)), zap.Error(pushErr))
+			} else if trimmed > 0 {
+				s.activeQueueDropped.Add(uint64(trimmed))
+				s.warnPressure("语伴活跃溢出任务重新入队时发生裁剪", zap.Int64("trimmed", trimmed))
+			}
+			return
+		}
+	}
+}
+
+func (s *Service) warnPressure(message string, fields ...zap.Field) {
+	if s == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	last := s.lastPressureWarnAt.Load()
+	if last > 0 && now-last < int64(30*time.Second/time.Millisecond) {
+		return
+	}
+	if s.lastPressureWarnAt.CompareAndSwap(last, now) {
+		s.Warn(message, fields...)
+	}
+}
+
+func (s *Service) startRuntimeMetrics() {
+	if s == nil {
+		return
+	}
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			spilled := s.activeQueueSpilled.Swap(0)
+			dropped := s.activeQueueDropped.Swap(0)
+			workerErrors := s.activeWorkerErrors.Swap(0)
+			lockErrors := s.jobLockErrors.Swap(0)
+			snapshotErrors := s.snapshotErrors.Swap(0)
+			presenceErrors := s.presenceErrors.Swap(0)
+			spillLen := int64(0)
+			if s.redisx != nil {
+				spillLen, _ = s.redisx.LLen(activeWriteSpillKey)
+			}
+			if spilled+dropped+workerErrors+lockErrors+snapshotErrors+presenceErrors > 0 || spillLen > 0 || len(s.activeWriteQueue)*4 >= cap(s.activeWriteQueue)*3 {
+				s.Warn("语伴列表运行压力指标",
+					zap.Uint64("active_spilled", spilled), zap.Uint64("active_dropped", dropped),
+					zap.Uint64("active_worker_errors", workerErrors), zap.Uint64("job_lock_errors", lockErrors),
+					zap.Uint64("snapshot_errors", snapshotErrors), zap.Uint64("presence_errors", presenceErrors), zap.Int64("active_spill_len", spillLen),
+					zap.Int("active_queue_len", len(s.activeWriteQueue)), zap.Int("active_queue_cap", cap(s.activeWriteQueue)))
+			}
+		}
+	}()
+}
+
+func (s *Service) signalAssignmentOutbox() {
+	if s == nil || s.assignmentWake == nil {
+		return
+	}
+	select {
+	case s.assignmentWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) refreshIMOnlineSnapshot() error {
+	if s == nil || s.db == nil {
+		return errors.New("语伴在线快照服务未初始化")
+	}
+	s.imOnlineRefreshMu.Lock()
+	defer s.imOnlineRefreshMu.Unlock()
+	return s.refreshIMOnlineSnapshotLocked()
+}
+
+func (s *Service) ensureIMOnlineSnapshot() error {
+	if s == nil || s.db == nil {
+		return errors.New("语伴在线快照服务未初始化")
+	}
+	now := time.Now().UnixMilli()
+	if retryAt := s.imOnlineRetryAt.Load(); retryAt > now {
+		return fmt.Errorf("语伴在线快照等待重试: %dms", retryAt-now)
+	}
+	s.imOnlineMu.RLock()
+	loadedAt := s.imOnlineLoadedAt
+	s.imOnlineMu.RUnlock()
+	if loadedAt > 0 {
+		return nil
+	}
+	s.imOnlineRefreshMu.Lock()
+	defer s.imOnlineRefreshMu.Unlock()
+	// Another request may have completed the first full snapshot or failed and
+	// entered backoff while this one was waiting for the single-flight mutex.
+	s.imOnlineMu.RLock()
+	loadedAt = s.imOnlineLoadedAt
+	s.imOnlineMu.RUnlock()
+	if loadedAt > 0 {
+		return nil
+	}
+	now = time.Now().UnixMilli()
+	if retryAt := s.imOnlineRetryAt.Load(); retryAt > now {
+		return fmt.Errorf("语伴在线快照等待重试: %dms", retryAt-now)
+	}
+	return s.refreshIMOnlineSnapshotLocked()
+}
+
+func (s *Service) refreshIMOnlineSnapshotLocked() error {
+	online, err := s.db.allIMOnlineUIDs()
+	if err != nil {
+		s.snapshotErrors.Add(1)
+		// Negative-cache the failure for one refresh period. Without this, thousands
+		// of first-load requests queue behind the mutex and each retries MySQL.
+		s.imOnlineRetryAt.Store(time.Now().Add(5 * time.Second).UnixMilli())
+		return err
+	}
+	s.imOnlineMu.Lock()
+	s.imOnlineSnapshot = online
+	s.imOnlineLoadedAt = time.Now().UnixMilli()
+	s.imOnlineMu.Unlock()
+	s.imOnlineRetryAt.Store(0)
+	return nil
+}
+
+func (s *Service) imOnlineUIDsFromSnapshot(uids []string) (map[string]struct{}, int64) {
+	out := make(map[string]struct{}, len(uids))
+	if s == nil {
+		return out, 0
+	}
+	s.imOnlineMu.RLock()
+	loadedAt := s.imOnlineLoadedAt
+	for _, uid := range uniqueIDs(uids, 0) {
+		if _, ok := s.imOnlineSnapshot[uid]; ok {
+			out[uid] = struct{}{}
+		}
+	}
+	s.imOnlineMu.RUnlock()
+	return out, loadedAt
+}
+
+func (s *Service) imOnlineUIDs(uids []string) (map[string]struct{}, error) {
+	uids = uniqueIDs(uids, 0)
+	out := make(map[string]struct{}, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+	s.imOnlineMu.RLock()
+	loadedAt := s.imOnlineLoadedAt
+	if loadedAt > 0 {
+		for _, uid := range uids {
+			if _, ok := s.imOnlineSnapshot[uid]; ok {
+				out[uid] = struct{}{}
+			}
+		}
+		s.imOnlineMu.RUnlock()
+		return out, nil
+	}
+	s.imOnlineMu.RUnlock()
+	if err := s.ensureIMOnlineSnapshot(); err != nil {
+		return nil, err
+	}
+	s.imOnlineMu.RLock()
+	for _, uid := range uids {
+		if _, ok := s.imOnlineSnapshot[uid]; ok {
+			out[uid] = struct{}{}
+		}
+	}
+	s.imOnlineMu.RUnlock()
+	return out, nil
+}
+
+func (s *Service) onlineSnapshotLoadedAt() int64 {
+	if s == nil {
+		return 0
+	}
+	s.imOnlineMu.RLock()
+	at := s.imOnlineLoadedAt
+	s.imOnlineMu.RUnlock()
+	return at
+}
+
+func (s *Service) runExclusiveJob(key string, ttl time.Duration, action func()) {
+	if s == nil || action == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	// Always acquire the in-process guard first. If Redis goes down while another
+	// local worker still owns a distributed lock, a fallback worker must not overlap it.
+	s.jobMu.Lock()
+	if s.jobRunning[key] {
+		s.jobMu.Unlock()
+		return
+	}
+	s.jobRunning[key] = true
+	s.jobMu.Unlock()
+	defer func() {
+		s.jobMu.Lock()
+		delete(s.jobRunning, key)
+		s.jobMu.Unlock()
+	}()
+
+	token := fmt.Sprintf("%d:%p", time.Now().UnixNano(), s)
+	if s.redisx != nil {
+		locked, err := s.redisx.SetNX(key, token, ttl)
+		if err != nil {
+			s.jobLockErrors.Add(1)
+			s.warnPressure("语伴后台任务获取Redis锁失败，本轮已跳过", zap.String("lock_key", key), zap.Error(err))
+			return
+		}
+		if !locked {
+			return
+		}
+		defer func() { _, _ = s.redisx.CompareAndDelete(key, token) }()
+	}
+	action()
+}
+
+func (s *Service) cleanupPresenceIndexes() {
+	if s == nil || s.redisx == nil {
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	_, _ = s.redisx.ZRemRangeByScore(foregroundOnlineKey, "-inf", strconv.FormatInt(nowMS, 10))
+	lastActiveCutoff := nowMS - int64(10*24*time.Hour/time.Millisecond)
+	_, _ = s.redisx.ZRemRangeByScore(lastActiveKey, "-inf", strconv.FormatInt(lastActiveCutoff, 10))
+}
+
 func (s *Service) startPoolJobs() {
 	go func() {
 		time.Sleep(5 * time.Second)
@@ -850,7 +1514,16 @@ func (s *Service) startPoolJobs() {
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
 		for {
-			s.foldChangedProfiles()
+			s.runExclusiveJob(profileFoldLockKey, 10*time.Minute, s.foldChangedProfiles)
+			<-t.C
+		}
+	}()
+	go func() {
+		time.Sleep(30 * time.Second)
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			s.runExclusiveJob(presenceCleanupLockKey, 2*time.Minute, s.cleanupPresenceIndexes)
 			<-t.C
 		}
 	}()
@@ -860,6 +1533,29 @@ func (s *Service) startPoolJobs() {
 		defer t.Stop()
 		for {
 			s.flushAssignmentOutbox()
+			select {
+			case <-t.C:
+			case <-s.assignmentWake:
+			}
+		}
+	}()
+	go func() {
+		time.Sleep(time.Second)
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			_ = s.refreshIMOnlineSnapshot()
+			<-t.C
+		}
+	}()
+	go func() {
+		time.Sleep(2 * time.Minute)
+		t := time.NewTicker(15 * time.Minute)
+		defer t.Stop()
+		for {
+			s.runExclusiveJob(maintenanceCleanupLockKey, 10*time.Minute, func() {
+				_ = s.db.cleanupOperationalRows(time.Now().UnixMilli())
+			})
 			<-t.C
 		}
 	}()

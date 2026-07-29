@@ -3,13 +3,18 @@ package partnerlist
 import "fmt"
 
 const (
-	poolCurrentVersionKey  = "partnerlist:pool:current_version"
-	poolBuildLockKey       = "partnerlist:pool:build_lock"
-	poolBuildingVersionKey = "partnerlist:pool:building_version"
-	lastActiveKey          = "partnerlist:last_active"
-	foregroundOnlineKey    = "partnerlist:foreground_online"
-	poolDirtyQueueKey      = "partnerlist:pool:dirty_queue"
-	poolChangeCursorKey    = "partnerlist:pool:change_cursor"
+	poolCurrentVersionKey        = "partnerlist:pool:current_version"
+	poolBuildLockKey             = "partnerlist:pool:build_lock"
+	poolBuildingVersionKey       = "partnerlist:pool:building_version"
+	lastActiveKey                = "partnerlist:last_active"
+	foregroundOnlineKey          = "partnerlist:foreground_online"
+	poolDirtyQueueKey            = "partnerlist:pool:dirty_queue"
+	poolChangeCursorKey          = "partnerlist:pool:change_cursor"
+	assignmentOutboxFlushLockKey = "partnerlist:assignment:outbox_flush_lock"
+	profileFoldLockKey           = "partnerlist:pool:profile_fold_lock"
+	presenceCleanupLockKey       = "partnerlist:presence:cleanup_lock"
+	maintenanceCleanupLockKey    = "partnerlist:maintenance:cleanup_lock"
+	activeWriteSpillKey          = "partnerlist:active_write:spill"
 )
 
 func poolEligibleKey(version string) string {

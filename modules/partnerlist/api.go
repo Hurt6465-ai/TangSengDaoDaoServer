@@ -3,6 +3,8 @@ package partnerlist
 import (
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
@@ -34,7 +36,16 @@ func (p *PartnerList) Route(r *wkhttp.WKHttp) {
 func (p *PartnerList) recommendations(c *wkhttp.Context) {
 	resp, err := p.service.Recommendations(c.GetLoginUID())
 	if err != nil {
-		p.Warn("查询列表语伴失败", zap.Error(err), zap.String("uid", c.GetLoginUID()))
+		uid := c.GetLoginUID()
+		if errors.Is(err, ErrRecommendationBusy) {
+			retryAfterMS := recommendationRetryAfterMS(uid, time.Now())
+			c.Header("Retry-After", strconv.FormatInt((retryAfterMS+999)/1000, 10))
+			c.JSON(http.StatusTooManyRequests, map[string]interface{}{
+				"msg": err.Error(), "status": http.StatusTooManyRequests, "retry_after_ms": retryAfterMS,
+			})
+			return
+		}
+		p.Warn("查询列表语伴失败", zap.Error(err), zap.String("uid", uid))
 		c.ResponseError(err)
 		return
 	}
@@ -77,4 +88,14 @@ func (p *PartnerList) settings(c *wkhttp.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func recommendationRetryAfterMS(uid string, now time.Time) int64 {
+	h := uint32(2166136261)
+	seed := uid + ":" + strconv.FormatInt(now.Unix()/10, 10)
+	for i := 0; i < len(seed); i++ {
+		h ^= uint32(seed[i])
+		h *= 16777619
+	}
+	return 3000 + int64(h%5001)
 }

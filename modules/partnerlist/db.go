@@ -16,6 +16,17 @@ type db struct {
 
 func newDB(ctx *config.Context) *db { return &db{session: ctx.DB(), ctx: ctx} }
 
+func truncatePartnerListRunes(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
+}
+
 const eligibleSQL = `pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1
  AND pp.status=1 AND pp.has_photo=1
  AND u.status=1 AND IFNULL(u.is_destroy,0)=0 AND IFNULL(u.bench_no,'')=''
@@ -114,36 +125,39 @@ func (d *db) excludedUIDs(viewerUID string, uids []string) (map[string]struct{},
 	if viewerUID == "" || len(uids) == 0 {
 		return out, nil
 	}
-	add := func(values []string) {
-		for _, uid := range values {
-			if uid = strings.TrimSpace(uid); uid != "" {
-				out[uid] = struct{}{}
-			}
-		}
-	}
 	for start := 0; start < len(uids); start += CandidateChunkSize {
 		end := start + CandidateChunkSize
 		if end > len(uids) {
 			end = len(uids)
 		}
 		chunk := uids[start:end]
-		queries := []struct {
-			sql  string
-			args []interface{}
-		}{
-			{`SELECT to_uid FROM friend WHERE uid=? AND is_deleted=0 AND to_uid IN ?`, []interface{}{viewerUID, chunk}},
-			{`SELECT CASE WHEN uid=? THEN to_uid ELSE uid END target_uid FROM user_setting WHERE blacklist=1 AND ((uid=? AND to_uid IN ?) OR (to_uid=? AND uid IN ?))`, []interface{}{viewerUID, viewerUID, chunk, viewerUID, chunk}},
-			{`SELECT to_uid FROM partner_greetings WHERE uid=? AND to_uid IN ? AND IFNULL(send_status,1)<>2`, []interface{}{viewerUID, chunk}},
-			{`SELECT to_uid FROM partner_contacts WHERE uid=? AND to_uid IN ? AND status IN (0,1,2,3)`, []interface{}{viewerUID, chunk}},
-			{`SELECT channel_id FROM report WHERE uid=? AND channel_type=1 AND channel_id IN ?`, []interface{}{viewerUID, chunk}},
-			{`SELECT uid FROM report WHERE uid IN ? AND channel_type=1 AND channel_id=?`, []interface{}{chunk, viewerUID}},
+		var rows []string
+		_, err := d.session.SelectBySql(`SELECT target_uid FROM (
+ SELECT to_uid AS target_uid FROM friend WHERE uid=? AND is_deleted=0 AND to_uid IN ?
+ UNION ALL
+ SELECT CASE WHEN uid=? THEN to_uid ELSE uid END AS target_uid FROM user_setting
+   WHERE blacklist=1 AND ((uid=? AND to_uid IN ?) OR (to_uid=? AND uid IN ?))
+ UNION ALL
+ SELECT to_uid AS target_uid FROM partner_greetings WHERE uid=? AND to_uid IN ? AND IFNULL(send_status,1)<>2
+ UNION ALL
+ SELECT to_uid AS target_uid FROM partner_contacts WHERE uid=? AND to_uid IN ? AND status IN (0,1,2,3)
+ UNION ALL
+ SELECT channel_id AS target_uid FROM report WHERE uid=? AND channel_type=1 AND channel_id IN ?
+ UNION ALL
+ SELECT uid AS target_uid FROM report WHERE uid IN ? AND channel_type=1 AND channel_id=?
+) excluded`, viewerUID, chunk,
+			viewerUID, viewerUID, chunk, viewerUID, chunk,
+			viewerUID, chunk,
+			viewerUID, chunk,
+			viewerUID, chunk,
+			chunk, viewerUID).Load(&rows)
+		if err != nil {
+			return nil, err // safety exclusions fail closed
 		}
-		for _, query := range queries {
-			var rows []string
-			if _, err := d.session.SelectBySql(query.sql, query.args...).Load(&rows); err != nil {
-				return nil, err // safety exclusions fail closed
+		for _, uid := range rows {
+			if uid = strings.TrimSpace(uid); uid != "" {
+				out[uid] = struct{}{}
 			}
-			add(rows)
 		}
 	}
 	return out, nil
@@ -161,14 +175,22 @@ func (d *db) loadDay(viewerUID, dayKey string) (*recommendationDay, error) {
 }
 
 func enqueueAssignments(tx *dbr.Tx, day *recommendationDay, bucket string, ids []string, atMS int64) error {
-	for _, candidateUID := range uniqueIDs(ids, 0) {
-		_, err := tx.InsertBySql(`INSERT IGNORE INTO partner_list_assignment_outbox(viewer_uid,candidate_uid,day_key,bucket,assigned_at,status,attempts,next_retry_at,last_error,created_at,updated_at)
- VALUES(?,?,?,?,?,0,0,0,'',?,?)`, day.ViewerUID, candidateUID, day.DayKey, bucket, atMS, atMS, atMS).Exec()
-		if err != nil {
-			return err
-		}
+	ids = uniqueIDs(ids, 0)
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
+	var sql strings.Builder
+	sql.WriteString(`INSERT IGNORE INTO partner_list_assignment_outbox(viewer_uid,candidate_uid,day_key,bucket,assigned_at,status,attempts,next_retry_at,last_error,created_at,updated_at) VALUES `)
+	args := make([]interface{}, 0, len(ids)*7)
+	for i, candidateUID := range ids {
+		if i > 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("(?,?,?,?,?,0,0,0,'',?,?)")
+		args = append(args, day.ViewerUID, candidateUID, day.DayKey, bucket, atMS, atMS, atMS)
+	}
+	_, err := tx.InsertBySql(sql.String(), args...).Exec()
+	return err
 }
 
 func (d *db) insertDay(day *recommendationDay, bucket string, assigned []string, atMS int64) error {
@@ -290,6 +312,22 @@ func (d *db) imOnlineUIDs(uids []string) (map[string]struct{}, error) {
 	return out, nil
 }
 
+func (d *db) allIMOnlineUIDs() (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	var rows []string
+	_, err := d.session.SelectBySql(`SELECT DISTINCT uid FROM user_online WHERE online=1`).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, uid := range rows {
+		uid = strings.TrimSpace(uid)
+		if uid != "" {
+			out[uid] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 type activityRow struct {
 	UID          string `db:"uid"`
 	LastActiveAt int64  `db:"last_active_at"`
@@ -367,15 +405,16 @@ func (d *db) pendingAssignmentOutbox(nowMS int64, limit int) ([]assignmentOutbox
 	_, err := d.session.SelectBySql(`SELECT id,viewer_uid,candidate_uid,day_key,bucket,assigned_at,attempts FROM partner_list_assignment_outbox WHERE status IN (0,2) AND next_retry_at<=? ORDER BY id ASC LIMIT ?`, nowMS, limit).Load(&rows)
 	return rows, err
 }
-func (d *db) markAssignmentOutboxDone(id int64) error {
-	_, err := d.session.Update("partner_list_assignment_outbox").Set("status", 1).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
+func (d *db) markAssignmentOutboxDoneBatch(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := d.session.Update("partner_list_assignment_outbox").Set("status", 1).Set("updated_at", time.Now().UnixMilli()).Where("id IN ?", ids).Exec()
 	return err
 }
 func (d *db) markAssignmentOutboxRetry(id int64, attempts int, reason string) error {
-	if len(reason) > 500 {
-		reason = reason[:500]
-	}
-	delay := time.Duration(1<<minInt(attempts, 6)) * time.Second
+	reason = truncatePartnerListRunes(reason, 500)
+	delay := time.Duration(1<<minInt(attempts, 10)) * time.Second
 	_, err := d.session.Update("partner_list_assignment_outbox").Set("status", 2).Set("attempts", attempts+1).Set("next_retry_at", time.Now().Add(delay).UnixMilli()).Set("last_error", reason).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
 	return err
 }
@@ -384,6 +423,19 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (d *db) cleanupOperationalRows(nowMS int64) error {
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	outboxCutoff := nowMS - int64(24*time.Hour/time.Millisecond)
+	if _, err := d.session.DeleteBySql(`DELETE FROM partner_list_assignment_outbox WHERE status=1 AND updated_at<? ORDER BY updated_at ASC,id ASC LIMIT 10000`, outboxCutoff).Exec(); err != nil {
+		return err
+	}
+	dayCutoff := recommendationDayKey(time.UnixMilli(nowMS).Add(-45 * 24 * time.Hour))
+	_, err := d.session.DeleteBySql(`DELETE FROM partner_list_recommendation_day WHERE day_key<? ORDER BY day_key ASC,id ASC LIMIT 5000`, dayCutoff).Exec()
+	return err
 }
 
 func (d *db) setPartnerEnabled(uid string, enabled int) error {

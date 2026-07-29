@@ -33,23 +33,25 @@ var (
 )
 
 type RecommendationResp struct {
-	DayKey              string      `json:"day_key"`
-	AlgorithmVersion    int         `json:"algorithm_version"`
-	ListVersion         int         `json:"list_version"`
-	FirstServedAt       int64       `json:"first_served_at"`
-	RotateAt            int64       `json:"rotate_at"`
-	RotationDone        bool        `json:"rotation_done"`
-	RotationRetryAt     int64       `json:"rotation_retry_at"`
-	UpdatedCount        int         `json:"updated_count"`
-	UniqueAssignedCount int         `json:"unique_assigned_count"`
-	DailyCandidateLimit int         `json:"daily_candidate_limit"`
-	GreetingLimit       int         `json:"greeting_limit"`
-	GreetingUsed        int         `json:"greeting_used"`
-	GreetingRemaining   int         `json:"greeting_remaining"`
-	AddedUserIDs        []string    `json:"added_user_ids"`
-	RemovedUserIDs      []string    `json:"removed_user_ids"`
-	Users               []*ListUser `json:"users"`
-	ServerTime          int64       `json:"server_time"`
+	DayKey               string      `json:"day_key"`
+	AlgorithmVersion     int         `json:"algorithm_version"`
+	ListVersion          int         `json:"list_version"`
+	FirstServedAt        int64       `json:"first_served_at"`
+	RotateAt             int64       `json:"rotate_at"`
+	RotationDone         bool        `json:"rotation_done"`
+	RotationRetryAt      int64       `json:"rotation_retry_at"`
+	UpdatedCount         int         `json:"updated_count"`
+	UniqueAssignedCount  int         `json:"unique_assigned_count"`
+	DailyCandidateLimit  int         `json:"daily_candidate_limit"`
+	GreetingLimit        int         `json:"greeting_limit"`
+	GreetingUsed         int         `json:"greeting_used"`
+	GreetingRemaining    int         `json:"greeting_remaining"`
+	AddedUserIDs         []string    `json:"added_user_ids"`
+	RemovedUserIDs       []string    `json:"removed_user_ids"`
+	Users                []*ListUser `json:"users"`
+	ServerTime           int64       `json:"server_time"`
+	OnlineAsOf           int64       `json:"online_as_of"`
+	OnlineRefreshAfterMS int64       `json:"online_refresh_after_ms"`
 }
 
 type ListUser struct {
@@ -187,6 +189,8 @@ type OnlineState struct {
 type OnlineBatchResp struct {
 	Users      []OnlineState `json:"users"`
 	ServerTime int64         `json:"server_time"`
+	OnlineAsOf int64         `json:"online_as_of"`
+	Realtime   bool          `json:"realtime"`
 }
 
 type HeartbeatResp struct {
