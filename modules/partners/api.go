@@ -135,6 +135,13 @@ func (p *Partners) greeting(c *wkhttp.Context) {
 	resp, err := p.service.RecordGreeting(c.GetLoginUID(), req)
 	if err != nil {
 		p.Warn("语伴打招呼失败", zap.Error(err), zap.String("to_uid", req.Target()))
+		// Existing Android clients parse the business status from a successful HTTP
+		// response. Preserve that contract while returning the retryable 503 payload
+		// instead of replacing it with the generic ResponseError HTTP 400 body.
+		if resp != nil && resp.Status == http.StatusServiceUnavailable {
+			c.JSON(http.StatusOK, resp)
+			return
+		}
 		if errors.Is(err, ErrGreetingDuplicate) && resp != nil {
 			c.JSON(http.StatusOK, resp)
 			return

@@ -9,17 +9,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	appredis "github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/redisx"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
+	"go.uber.org/zap"
 )
 
 var (
@@ -32,28 +36,435 @@ var (
 	ErrPendingMessageLimit = errors.New("对方还没回复，最多只能发送3条消息")
 )
 
+const (
+	defaultPartnerActiveWorkers = 4
+	defaultPartnerActiveQueue   = 8192
+	defaultProfileSyncWorkers   = 4
+	defaultProfileSyncQueue     = 4096
+	defaultExposureWorkers      = 4
+	defaultExposureQueue        = 8192
+	partnerActiveSpillKey       = "partners:active:spill"
+	partnerProfileSpillKey      = "partners:profile:spill"
+	partnerExposureSpillKey     = "partners:exposure:spill"
+)
+
+var (
+	partnerActiveSpillMax   = int64(partnerBoundedEnvInt("TS_DD_PARTNERS_ACTIVE_SPILL_MAX", 65536, 5000, 500000))
+	partnerProfileSpillMax  = int64(partnerBoundedEnvInt("TS_DD_PARTNERS_PROFILE_SPILL_MAX", 32768, 5000, 250000))
+	partnerExposureSpillMax = int64(partnerBoundedEnvInt("TS_DD_PARTNERS_EXPOSURE_SPILL_MAX", 20000, 5000, 500000))
+)
+
+type partnerActiveTask struct {
+	uid        string
+	atMS       int64
+	online     int
+	key        string
+	token      string
+	basicGuard bool
+}
+
+type partnerProfileSyncTask struct {
+	uid         string
+	key         string
+	token       string
+	distributed bool
+}
+
+type partnerExposureTask struct {
+	uid   string
+	items []ExposureItem
+}
+
+type partnerActiveSpillPayload struct {
+	UID        string `json:"uid"`
+	AtMS       int64  `json:"at_ms"`
+	Online     int    `json:"online"`
+	Key        string `json:"key"`
+	Token      string `json:"token"`
+	BasicGuard bool   `json:"basic_guard,omitempty"`
+}
+
+type partnerProfileSpillPayload struct {
+	UID         string `json:"uid"`
+	Key         string `json:"key"`
+	Token       string `json:"token"`
+	Distributed bool   `json:"distributed"`
+}
+
+type partnerExposureSpillPayload struct {
+	UID   string         `json:"uid"`
+	Items []ExposureItem `json:"items"`
+}
+
 type Service struct {
 	ctx    *config.Context
 	db     *db
 	redisx *appredis.Client
+	log.Log
 
 	// candidateMu is kept as a fallback for very old callers, but normal candidate rebuilds
 	// use candidateLocks so different users do not block each other.
 	candidateMu    sync.Mutex
 	candidateLocks sync.Map
+
+	jobMu       sync.Mutex
+	jobRunning  map[string]bool
+	profileMu   sync.Mutex
+	profileSync map[string]int64
+
+	activeTouchQueue chan partnerActiveTask
+	profileSyncQueue chan partnerProfileSyncTask
+	exposureQueue    chan partnerExposureTask
+	permissionWake   chan struct{}
+
+	activeSpilled      atomic.Uint64
+	activeDropped      atomic.Uint64
+	profileSpilled     atomic.Uint64
+	profileDropped     atomic.Uint64
+	exposureSpilled    atomic.Uint64
+	exposureDropped    atomic.Uint64
+	workerErrors       atomic.Uint64
+	jobLockErrors      atomic.Uint64
+	lastPressureWarnAt atomic.Int64
 }
 
 func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx), redisx: appredis.FromContext(ctx)}
+	activeWorkers := partnerBoundedEnvInt("TS_DD_PARTNERS_ACTIVE_WORKERS", defaultPartnerActiveWorkers, 1, 32)
+	activeQueueSize := partnerBoundedEnvInt("TS_DD_PARTNERS_ACTIVE_QUEUE", defaultPartnerActiveQueue, 512, 65536)
+	profileWorkers := partnerBoundedEnvInt("TS_DD_PARTNERS_PROFILE_WORKERS", defaultProfileSyncWorkers, 1, 16)
+	profileQueueSize := partnerBoundedEnvInt("TS_DD_PARTNERS_PROFILE_QUEUE", defaultProfileSyncQueue, 256, 32768)
+	exposureWorkers := partnerBoundedEnvInt("TS_DD_PARTNERS_EXPOSURE_WORKERS", defaultExposureWorkers, 1, 16)
+	exposureQueueSize := partnerBoundedEnvInt("TS_DD_PARTNERS_EXPOSURE_QUEUE", defaultExposureQueue, 512, 65536)
+	svc := &Service{
+		ctx:              ctx,
+		db:               newDB(ctx),
+		redisx:           appredis.FromContext(ctx),
+		Log:              log.NewTLog("partnersService"),
+		jobRunning:       make(map[string]bool),
+		profileSync:      make(map[string]int64),
+		activeTouchQueue: make(chan partnerActiveTask, activeQueueSize),
+		profileSyncQueue: make(chan partnerProfileSyncTask, profileQueueSize),
+		exposureQueue:    make(chan partnerExposureTask, exposureQueueSize),
+		permissionWake:   make(chan struct{}, 1),
+	}
 	ctx.AddMessagesListener(svc.listenerMessages)
+	svc.startPartnerWorkers(activeWorkers, profileWorkers, exposureWorkers)
+	svc.startRuntimeMetrics()
 	svc.startBackgroundJobs()
 	return svc
 }
 
+func partnerBoundedEnvInt(key string, fallback, minValue, maxValue int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < minValue || n > maxValue {
+		return fallback
+	}
+	return n
+}
+
+func (s *Service) startPartnerWorkers(activeWorkers, profileWorkers, exposureWorkers int) {
+	for i := 0; i < activeWorkers; i++ {
+		go func() {
+			for task := range s.activeTouchQueue {
+				if err := s.processPartnerActiveTask(task); err != nil && !s.spillActiveTask(task) {
+					s.releasePartnerActiveGuard(task)
+					s.activeDropped.Add(1)
+					s.warnPressure("语伴活跃同步执行失败且无法进入Redis溢出队列", zap.String("uid", task.uid), zap.Error(err))
+				}
+			}
+		}()
+	}
+	for i := 0; i < profileWorkers; i++ {
+		go func() {
+			for task := range s.profileSyncQueue {
+				if err := s.processPartnerProfileTask(task); err != nil && !s.spillProfileTask(task) {
+					s.releasePartnerProfileGuard(task)
+					s.profileDropped.Add(1)
+					s.warnPressure("语伴资料同步执行失败且无法进入Redis溢出队列", zap.String("uid", task.uid), zap.Error(err))
+				}
+			}
+		}()
+	}
+	for i := 0; i < exposureWorkers; i++ {
+		go func() {
+			for task := range s.exposureQueue {
+				if err := s.processPartnerExposureTask(task); err != nil && !s.spillExposureTask(task) {
+					s.exposureDropped.Add(1)
+					s.warnPressure("语伴曝光写库执行失败且无法进入Redis溢出队列", zap.String("uid", task.uid), zap.Int("item_count", len(task.items)), zap.Error(err))
+				}
+			}
+		}()
+	}
+	go s.runPartnerSpillWorker(partnerActiveSpillKey, 100, s.processActiveSpillPayload)
+	go s.runPartnerSpillWorker(partnerProfileSpillKey, 50, s.processProfileSpillPayload)
+	go s.runPartnerSpillWorker(partnerExposureSpillKey, 100, s.processExposureSpillPayload)
+}
+
+func (s *Service) processPartnerActiveTask(task partnerActiveTask) error {
+	if err := s.db.touchPartnerActive(task.uid, task.atMS, task.online); err != nil {
+		s.workerErrors.Add(1)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) releasePartnerActiveGuard(task partnerActiveTask) {
+	if task.token == "" || task.key == "" {
+		return
+	}
+	if task.basicGuard {
+		if s != nil && s.ctx != nil && s.ctx.GetRedisConn() != nil {
+			_ = s.ctx.GetRedisConn().Del(task.key)
+		}
+		return
+	}
+	if s != nil && s.redisx != nil {
+		_, _ = s.redisx.CompareAndDelete(task.key, task.token)
+	}
+}
+
+func (s *Service) processPartnerProfileTask(task partnerProfileSyncTask) error {
+	if err := s.db.syncPartnerProfileFromUser(task.uid); err != nil {
+		s.workerErrors.Add(1)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) releasePartnerProfileGuard(task partnerProfileSyncTask) {
+	s.profileMu.Lock()
+	delete(s.profileSync, task.uid)
+	s.profileMu.Unlock()
+	if task.distributed && s.redisx != nil {
+		_, _ = s.redisx.CompareAndDelete(task.key, task.token)
+	}
+}
+
+func (s *Service) processPartnerExposureTask(task partnerExposureTask) error {
+	if err := s.db.recordExposureItems(task.uid, task.items); err != nil {
+		s.workerErrors.Add(1)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) runPartnerSpillWorker(key string, limit int, processor func(string) error) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		if s.redisx != nil {
+			raws, err := s.redisx.PopBatch(key, limit)
+			if err != nil {
+				s.workerErrors.Add(1)
+				s.warnPressure("读取语伴Redis溢出队列失败", zap.String("spill_key", key), zap.Error(err))
+			} else {
+				for i, raw := range raws {
+					if err = processor(raw); err != nil {
+						remaining := make([]interface{}, 0, len(raws)-i)
+						for _, value := range raws[i:] {
+							remaining = append(remaining, value)
+						}
+						maxLen := partnerExposureSpillMax
+						if key == partnerActiveSpillKey {
+							maxLen = partnerActiveSpillMax
+						} else if key == partnerProfileSpillKey {
+							maxLen = partnerProfileSpillMax
+						}
+						_, trimmed, pushErr := s.redisx.PushBoundedDetailed(key, maxLen, remaining...)
+						if pushErr != nil {
+							lost := uint64(len(remaining))
+							s.releaseLostSpillGuards(key, raws[i:])
+							if key == partnerActiveSpillKey {
+								s.activeDropped.Add(lost)
+							} else if key == partnerProfileSpillKey {
+								s.profileDropped.Add(lost)
+							} else {
+								s.exposureDropped.Add(lost)
+							}
+							s.warnPressure("语伴溢出任务处理失败后无法重新入队", zap.String("spill_key", key), zap.Uint64("lost_count", lost), zap.Error(pushErr))
+						} else if trimmed > 0 {
+							if key == partnerActiveSpillKey {
+								s.activeDropped.Add(uint64(trimmed))
+							} else if key == partnerProfileSpillKey {
+								s.profileDropped.Add(uint64(trimmed))
+							} else {
+								s.exposureDropped.Add(uint64(trimmed))
+							}
+							s.warnPressure("语伴溢出任务重新入队时发生裁剪", zap.String("spill_key", key), zap.Int64("trimmed", trimmed))
+						}
+						break
+					}
+				}
+			}
+		}
+		<-t.C
+	}
+}
+
+func (s *Service) releaseLostSpillGuards(key string, raws []string) {
+	for _, raw := range raws {
+		if key == partnerActiveSpillKey {
+			var payload partnerActiveSpillPayload
+			if json.Unmarshal([]byte(raw), &payload) == nil {
+				s.releasePartnerActiveGuard(partnerActiveTask{uid: payload.UID, key: payload.Key, token: payload.Token, basicGuard: payload.BasicGuard})
+			}
+		} else if key == partnerProfileSpillKey {
+			var payload partnerProfileSpillPayload
+			if json.Unmarshal([]byte(raw), &payload) == nil {
+				s.releasePartnerProfileGuard(partnerProfileSyncTask{uid: payload.UID, key: payload.Key, token: payload.Token, distributed: payload.Distributed})
+			}
+		}
+	}
+}
+
+func (s *Service) processActiveSpillPayload(raw string) error {
+	var payload partnerActiveSpillPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil || strings.TrimSpace(payload.UID) == "" {
+		s.activeDropped.Add(1)
+		return nil
+	}
+	return s.processPartnerActiveTask(partnerActiveTask{uid: payload.UID, atMS: payload.AtMS, online: payload.Online, key: payload.Key, token: payload.Token, basicGuard: payload.BasicGuard})
+}
+
+func (s *Service) processProfileSpillPayload(raw string) error {
+	var payload partnerProfileSpillPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil || strings.TrimSpace(payload.UID) == "" {
+		s.profileDropped.Add(1)
+		return nil
+	}
+	return s.processPartnerProfileTask(partnerProfileSyncTask{uid: payload.UID, key: payload.Key, token: payload.Token, distributed: payload.Distributed})
+}
+
+func (s *Service) processExposureSpillPayload(raw string) error {
+	var payload partnerExposureSpillPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil || strings.TrimSpace(payload.UID) == "" || len(payload.Items) == 0 {
+		s.exposureDropped.Add(1)
+		return nil
+	}
+	return s.processPartnerExposureTask(partnerExposureTask{uid: payload.UID, items: payload.Items})
+}
+
+func (s *Service) spillActiveTask(task partnerActiveTask) bool {
+	if s.redisx == nil {
+		return false
+	}
+	payload, err := json.Marshal(partnerActiveSpillPayload{UID: task.uid, AtMS: task.atMS, Online: task.online, Key: task.key, Token: task.token, BasicGuard: task.basicGuard})
+	if err != nil {
+		return false
+	}
+	size, dropped, err := s.redisx.PushBoundedDetailed(partnerActiveSpillKey, partnerActiveSpillMax, string(payload))
+	if err != nil {
+		return false
+	}
+	s.activeSpilled.Add(1)
+	if dropped > 0 {
+		s.activeDropped.Add(uint64(dropped))
+		s.warnPressure("语伴活跃溢出队列达到上限，最旧任务已被裁剪", zap.Int64("spill_size", size), zap.Int64("trimmed", dropped))
+	}
+	return true
+}
+
+func (s *Service) spillProfileTask(task partnerProfileSyncTask) bool {
+	if s.redisx == nil {
+		return false
+	}
+	payload, err := json.Marshal(partnerProfileSpillPayload{UID: task.uid, Key: task.key, Token: task.token, Distributed: task.distributed})
+	if err != nil {
+		return false
+	}
+	size, dropped, err := s.redisx.PushBoundedDetailed(partnerProfileSpillKey, partnerProfileSpillMax, string(payload))
+	if err != nil {
+		return false
+	}
+	s.profileSpilled.Add(1)
+	if dropped > 0 {
+		s.profileDropped.Add(uint64(dropped))
+		s.warnPressure("语伴资料溢出队列达到上限，最旧任务已被裁剪", zap.Int64("spill_size", size), zap.Int64("trimmed", dropped))
+	}
+	return true
+}
+
+func (s *Service) spillExposureTask(task partnerExposureTask) bool {
+	if s.redisx == nil {
+		return false
+	}
+	payload, err := json.Marshal(partnerExposureSpillPayload{UID: task.uid, Items: task.items})
+	if err != nil {
+		return false
+	}
+	size, dropped, err := s.redisx.PushBoundedDetailed(partnerExposureSpillKey, partnerExposureSpillMax, string(payload))
+	if err != nil {
+		return false
+	}
+	s.exposureSpilled.Add(1)
+	if dropped > 0 {
+		s.exposureDropped.Add(uint64(dropped))
+		s.warnPressure("语伴曝光溢出队列达到上限，最旧分析记录已被裁剪", zap.Int64("spill_size", size), zap.Int64("trimmed", dropped))
+	}
+	return true
+}
+
+func (s *Service) warnPressure(message string, fields ...zap.Field) {
+	if s == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	last := s.lastPressureWarnAt.Load()
+	if last > 0 && now-last < int64(30*time.Second/time.Millisecond) {
+		return
+	}
+	if s.lastPressureWarnAt.CompareAndSwap(last, now) {
+		s.Warn(message, fields...)
+	}
+}
+
+func (s *Service) startRuntimeMetrics() {
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			activeSpilled, activeDropped := s.activeSpilled.Swap(0), s.activeDropped.Swap(0)
+			profileSpilled, profileDropped := s.profileSpilled.Swap(0), s.profileDropped.Swap(0)
+			exposureSpilled, exposureDropped := s.exposureSpilled.Swap(0), s.exposureDropped.Swap(0)
+			workerErrors, lockErrors := s.workerErrors.Swap(0), s.jobLockErrors.Swap(0)
+			activeSpill, profileSpill, exposureSpill := int64(0), int64(0), int64(0)
+			if s.redisx != nil {
+				activeSpill, _ = s.redisx.LLen(partnerActiveSpillKey)
+				profileSpill, _ = s.redisx.LLen(partnerProfileSpillKey)
+				exposureSpill, _ = s.redisx.LLen(partnerExposureSpillKey)
+			}
+			if activeSpilled+activeDropped+profileSpilled+profileDropped+exposureSpilled+exposureDropped+workerErrors+lockErrors > 0 || activeSpill+profileSpill+exposureSpill > 0 || len(s.activeTouchQueue)*4 >= cap(s.activeTouchQueue)*3 || len(s.profileSyncQueue)*4 >= cap(s.profileSyncQueue)*3 || len(s.exposureQueue)*4 >= cap(s.exposureQueue)*3 {
+				s.Warn("语伴服务运行压力指标",
+					zap.Uint64("active_spilled", activeSpilled), zap.Uint64("active_dropped", activeDropped),
+					zap.Uint64("profile_spilled", profileSpilled), zap.Uint64("profile_dropped", profileDropped),
+					zap.Uint64("exposure_spilled", exposureSpilled), zap.Uint64("exposure_dropped", exposureDropped),
+					zap.Uint64("worker_errors", workerErrors), zap.Uint64("job_lock_errors", lockErrors),
+					zap.Int64("active_spill_len", activeSpill), zap.Int64("profile_spill_len", profileSpill), zap.Int64("exposure_spill_len", exposureSpill),
+					zap.Int("active_queue_len", len(s.activeTouchQueue)), zap.Int("profile_queue_len", len(s.profileSyncQueue)), zap.Int("exposure_queue_len", len(s.exposureQueue)))
+			}
+		}
+	}()
+}
+
+func (s *Service) signalPartnerIMPermissionOutbox() {
+	if s == nil || s.permissionWake == nil {
+		return
+	}
+	select {
+	case s.permissionWake <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Service) List(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 	s.touchActive(loginUID, time.Now().UnixMilli(), 1)
-	// 用户刚改过资料但还没上传定位时，也要尽快同步到 partner_profiles，避免“不进语伴池”。
-	go func() { _ = s.db.syncPartnerProfileFromUser(loginUID) }()
+	// 用户刚改过资料但还没上传定位时，也要尽快同步到 partner_profiles。
+	// 翻页和重复进入不能每次都执行一次 MySQL UPSERT。
+	s.syncPartnerProfileIfDue(loginUID)
 	if req.NearbyOnly {
 		return s.listRealtime(loginUID, req)
 	}
@@ -62,6 +473,60 @@ func (s *Service) List(loginUID string, req listReq) ([]*PartnerUser, int, error
 		return list, hasMore, nil
 	}
 	return s.listRealtime(loginUID, req)
+}
+
+func (s *Service) syncPartnerProfileIfDue(uid string) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" || s == nil || s.db == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	s.profileMu.Lock()
+	if last := s.profileSync[uid]; last > 0 && now-last < int64(10*time.Minute/time.Millisecond) {
+		s.profileMu.Unlock()
+		return
+	}
+	if len(s.profileSync) > 10000 {
+		cutoff := now - int64(20*time.Minute/time.Millisecond)
+		for key, at := range s.profileSync {
+			if at < cutoff {
+				delete(s.profileSync, key)
+			}
+		}
+	}
+	s.profileSync[uid] = now
+	s.profileMu.Unlock()
+
+	key := "partner:profile:sync:" + uid
+	token := strconv.FormatInt(now, 10)
+	distributed := false
+	if s.redisx != nil {
+		locked, err := s.redisx.SetNX(key, token, 10*time.Minute)
+		if err == nil {
+			if !locked {
+				return
+			}
+			distributed = true
+		}
+	}
+	task := partnerProfileSyncTask{uid: uid, key: key, token: token, distributed: distributed}
+	select {
+	case s.profileSyncQueue <- task:
+		return
+	default:
+	}
+	if s.spillProfileTask(task) {
+		return
+	}
+	s.profileDropped.Add(1)
+	s.warnPressure("语伴资料同步队列已满且无法写入Redis溢出队列", zap.String("uid", uid), zap.Int("queue_len", len(s.profileSyncQueue)), zap.Int("queue_cap", cap(s.profileSyncQueue)))
+	// Release both guards so a later list request can retry this profile sync.
+	s.profileMu.Lock()
+	delete(s.profileSync, uid)
+	s.profileMu.Unlock()
+	if distributed && s.redisx != nil {
+		_, _ = s.redisx.CompareAndDelete(key, token)
+	}
 }
 
 func (s *Service) listRealtime(loginUID string, req listReq) ([]*PartnerUser, int, error) {
@@ -516,22 +981,74 @@ func (s *Service) RecordExposures(uid string, req ExposureReq) (*ExposureResp, e
 	}
 	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
 		members := make([]interface{}, 0, len(items))
+		zPairs := make([]interface{}, 0, len(items)*2)
+		redisSeenFailed := false
 		for _, item := range items {
 			if !shouldCountExposureEvent(item.EventType, item.DurationMS) {
 				continue
 			}
 			members = append(members, item.ToUID)
-			_ = s.ctx.GetRedisConn().ZAdd(s.seenZSetKey(uid), float64(item.SeenAt), item.ToUID)
+			zPairs = append(zPairs, float64(item.SeenAt), item.ToUID)
+		}
+		zAddAdvanced := false
+		if len(zPairs) > 0 {
+			var zAddErr error
+			if s.redisx != nil {
+				zAddErr = s.redisx.ZAdd(s.seenZSetKey(uid), zPairs...)
+				zAddAdvanced = zAddErr == nil
+			}
+			// The ServerLib wrapper used by this project is only safe here one member
+			// at a time. Use it as a compatibility fallback when redisx is unavailable
+			// or its connection is temporarily unhealthy.
+			if s.redisx == nil || zAddErr != nil {
+				zAddErr = nil
+				for i := 0; i+1 < len(zPairs); i += 2 {
+					if err := s.ctx.GetRedisConn().ZAdd(s.seenZSetKey(uid), zPairs[i], zPairs[i+1]); err != nil {
+						zAddErr = err
+						break
+					}
+				}
+			}
+			if zAddErr != nil {
+				redisSeenFailed = true
+			}
 		}
 		if len(members) > 0 {
-			_ = s.ctx.GetRedisConn().SAdd(s.seenDayKey(uid), members...)
-			_ = s.ctx.GetRedisConn().Expire(s.seenDayKey(uid), PartnerSeenTTL)
-			_ = s.ctx.GetRedisConn().Expire(s.seenZSetKey(uid), PartnerSeenHistoryTTL)
+			if err := s.ctx.GetRedisConn().SAdd(s.seenDayKey(uid), members...); err != nil {
+				redisSeenFailed = true
+			}
+			if err := s.ctx.GetRedisConn().Expire(s.seenDayKey(uid), PartnerSeenTTL); err != nil {
+				redisSeenFailed = true
+			}
+			var historyExpireErr error
+			if zAddAdvanced {
+				historyExpireErr = s.redisx.Expire(s.seenZSetKey(uid), PartnerSeenHistoryTTL)
+			}
+			if !zAddAdvanced || historyExpireErr != nil {
+				historyExpireErr = s.ctx.GetRedisConn().Expire(s.seenZSetKey(uid), PartnerSeenHistoryTTL)
+			}
+			if historyExpireErr != nil {
+				redisSeenFailed = true
+			}
+		}
+		if redisSeenFailed {
+			s.workerErrors.Add(1)
+			s.warnPressure("语伴曝光Redis即时排除状态写入失败", zap.String("uid", uid), zap.Int("item_count", len(items)))
 		}
 	}
-	go func(items []ExposureItem) {
-		_ = s.db.recordExposureItems(uid, items)
-	}(items)
+	// Exposure persistence is best-effort analytics/history. Redis seen state above is
+	// authoritative for immediate recommendation de-duplication. A bounded queue avoids
+	// creating thousands of goroutines when 5,000 clients report exposure together.
+	queuedItems := append([]ExposureItem(nil), items...)
+	exposureTask := partnerExposureTask{uid: uid, items: queuedItems}
+	select {
+	case s.exposureQueue <- exposureTask:
+	default:
+		if !s.spillExposureTask(exposureTask) {
+			s.exposureDropped.Add(1)
+			s.warnPressure("语伴曝光写库队列已满且无法写入Redis溢出队列", zap.String("uid", uid), zap.Int("item_count", len(queuedItems)), zap.Int("queue_len", len(s.exposureQueue)), zap.Int("queue_cap", cap(s.exposureQueue)))
+		}
+	}
 	return &ExposureResp{Status: 200, Count: len(items), Msg: "ok"}, nil
 }
 
@@ -610,6 +1127,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	}
 
 	now := time.Now().UnixMilli()
+	recoveredFailedGreeting := false
 	contact, err := s.db.getPartnerContact(uid, toUID)
 	if err != nil {
 		return nil, err
@@ -625,28 +1143,39 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 			if contact.RequesterUID != uid {
 				return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}), nil
 			}
-			// If the first greeting had an unknown/failed HTTP result, reconcile and
-			// retry it with the same WuKong client_msg_no. This cannot create a second
-			// visible message because both attempts use the same stable identifier.
+			// Unknown results (status=0) are retried with the same stable WuKong
+			// client_msg_no. Definite failures (status=2) must be rolled back instead;
+			// resending them here can loop forever on a permanent IM 4xx.
 			if contact.RequesterMsgCount <= 1 {
 				if delivery, deliveryErr := s.db.greetingDelivery(uid, toUID); deliveryErr != nil {
 					return nil, deliveryErr
-				} else if delivery != nil && delivery.SendStatus != 1 {
+				} else if delivery != nil && delivery.SendStatus == 2 {
+					if rollbackErr := s.db.rollbackPendingGreetingSend(uid, toUID, delivery.LastGreetAt); rollbackErr != nil {
+						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "上次招呼发送失败，状态恢复中，请稍后重试"}), rollbackErr
+					}
+					s.signalPartnerIMPermissionOutbox()
+					// The rollback transaction removed the stale pending contact and daily
+					// reservation. Continue below and treat this request as a fresh greeting.
+					contact = nil
+					recoveredFailedGreeting = true
+				} else if delivery != nil && delivery.SendStatus == 0 {
 					if retryErr := s.deliverGreetingRow(delivery); retryErr != nil {
 						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "招呼消息投递确认中，请稍后重试"}), retryErr
 					}
 				}
 			}
-			// Existing pending relationships must never send the second or third message
-			// through this endpoint. They go exclusively through /v1/message/send so
-			// client_msg_no, payload hash and pre-delivery counting share one state machine.
-			status := 200
-			msg := "请在聊天窗口继续发送，等待对方回复前最多3条消息"
-			if contact.RequesterMsgCount >= MaxPendingGreetingMessages {
-				status = 429
-				msg = ErrPendingMessageLimit.Error()
+			if contact != nil {
+				// Existing pending relationships must never send the second or third message
+				// through this endpoint. They go exclusively through /v1/message/send so
+				// client_msg_no, payload hash and pre-delivery counting share one state machine.
+				status := 200
+				msg := "请在聊天窗口继续发送，等待对方回复前最多3条消息"
+				if contact.RequesterMsgCount >= MaxPendingGreetingMessages {
+					status = 429
+					msg = ErrPendingMessageLimit.Error()
+				}
+				return s.fillGreetingQuota(uid, &GreetingResp{Status: status, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), nil
 			}
-			return s.fillGreetingQuota(uid, &GreetingResp{Status: status, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), nil
 		}
 	}
 
@@ -662,7 +1191,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
 		return s.fillGreetingQuota(uid, resp), ErrGreetingDuplicate
 	}
-	if !s.allowNewGreetingRate(uid, now) {
+	if !recoveredFailedGreeting && !s.allowNewGreetingRate(uid, now) {
 		return nil, ErrGreetingHourLimit
 	}
 	reservedDaily, _, err := s.db.reserveGreetingDailyTarget(uid, toUID, now, GreetingDayLimit)
@@ -695,22 +1224,23 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	resp.RequesterMsgCount = 1
 	resp.MaxGreetingCount = MaxPendingGreetingMessages
 	// Permission changes are committed to partner_im_permission_outbox together with
-	// the pending relationship. Try immediately for low latency; the background worker
-	// retries any transient WuKongIM failure.
-	s.flushPartnerIMPermissionOutbox()
+	// the pending relationship. deliverGreetingRow applies this exact pair immediately;
+	// do not drain up to 50 unrelated outbox rows on the user request path.
 	delivery := &greetingDeliveryRow{UID: uid, ToUID: toUID, Text: resp.Text, Source: source, LastGreetAt: resp.LastGreetAt, SendStatus: 0}
 	if err := s.deliverGreetingRow(delivery); err != nil {
-		if isUncertainGreetingSendError(err) {
-			// Unknown delivery results keep the relation and daily quota reserved. A
-			// retry/background reconciliation uses the same stable IM client_msg_no.
+		// Permission, search, timeout and post-send database errors are all retryable.
+		// Keep the pending relation and daily reservation; retries use the same stable
+		// IM client_msg_no, so this cannot create a second visible greeting.
+		if !isDefiniteGreetingSendError(err) {
 			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼消息投递确认中，请稍后重试"}), err
 		}
-		// Permission setup errors are retryable and must keep the pending relation;
-		// a definite IM 4xx is safe to roll back.
-		if isDefiniteGreetingSendError(err) {
-			_ = s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt)
-			releaseDaily()
+		// A definite IM 4xx means the message was not accepted and is safe to roll back.
+		// Contact counters, permission cleanup and the daily reservation are committed
+		// atomically so a retry cannot decrement any of them twice.
+		if rollbackErr := s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt); rollbackErr != nil {
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼发送失败，状态回滚处理中，请稍后重试"}), rollbackErr
 		}
+		s.signalPartnerIMPermissionOutbox()
 		return nil, err
 	}
 	return s.fillGreetingQuota(uid, resp), nil
@@ -894,10 +1424,9 @@ func (s *Service) deliverGreetingRow(row *greetingDeliveryRow) error {
 	if row == nil || row.UID == "" || row.ToUID == "" || row.LastGreetAt <= 0 {
 		return errors.New("无效的招呼投递记录")
 	}
-	if err := s.ensurePendingPermissionsNow(row.UID, row.ToUID); err != nil {
-		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 0, err.Error())
-		return err
-	}
+	// Search first. A message may already be visible while the final status update
+	// failed. Reapplying pending permissions before this check can remove one side of
+	// an already-active conversation when the receiver replied in the meantime.
 	delivered, searchErr := s.greetingAlreadyDelivered(row.UID, row.ToUID, row.LastGreetAt)
 	if searchErr != nil {
 		err := &greetingSendError{uncertain: true, err: searchErr}
@@ -907,28 +1436,88 @@ func (s *Service) deliverGreetingRow(row *greetingDeliveryRow) error {
 	if delivered {
 		return s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 1, "")
 	}
+
+	pending, stateErr := s.db.hasPendingGreetingContact(row.UID, row.ToUID)
+	if stateErr != nil {
+		err := &greetingSendError{uncertain: true, err: stateErr}
+		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 0, err.Error())
+		return err
+	}
+	if !pending {
+		err := &greetingSendError{uncertain: false, err: errors.New("招呼临时会话不存在或状态已变化")}
+		if markErr := s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 2, err.Error()); markErr != nil {
+			return &greetingSendError{uncertain: true, err: fmt.Errorf("记录招呼会话状态失败: %w", markErr)}
+		}
+		return err
+	}
+
+	if err := s.ensurePendingPermissionsNow(row.UID, row.ToUID); err != nil {
+		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 0, err.Error())
+		return err
+	}
+	// The exact pending-transition permissions have just been applied synchronously.
+	// Mark their durable tasks done to avoid two redundant WuKongIM calls per greeting.
+	_ = s.db.markIMPermissionDoneByKeys([]string{
+		permissionTransitionKey("pending:add", row.UID, row.ToUID, row.LastGreetAt),
+		permissionTransitionKey("pending:remove", row.ToUID, row.UID, row.LastGreetAt),
+	})
 	if err := s.sendGreetingMessage(row.UID, row.ToUID, row.Text, row.Source, row.LastGreetAt, 1); err != nil {
 		status := 2
 		if isUncertainGreetingSendError(err) {
 			status = 0
 		}
-		_ = s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, status, err.Error())
+		if markErr := s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, status, err.Error()); markErr != nil {
+			// The IM result may be definite, but without a durable status transition the
+			// rollback worker cannot safely claim it. Keep the delivery retryable with
+			// the same client_msg_no until the database accepts the state update.
+			return &greetingSendError{uncertain: true, err: fmt.Errorf("记录招呼发送状态失败: %w; IM结果: %v", markErr, err)}
+		}
 		return err
 	}
 	return s.db.markGreetingSendStatus(row.UID, row.ToUID, row.LastGreetAt, 1, "")
 }
 
 func (s *Service) reconcileGreetingDeliveries() {
-	rows, err := s.db.pendingGreetingDeliveries(100)
-	if err != nil {
-		return
-	}
-	for _, row := range rows {
-		if err := s.deliverGreetingRow(row); err != nil && isDefiniteGreetingSendError(err) {
-			_ = s.db.rollbackPendingGreetingSend(row.UID, row.ToUID, row.LastGreetAt)
-			_ = s.db.releaseGreetingDailyTarget(row.UID, row.ToUID, row.LastGreetAt)
+	s.runExclusiveJob("partner:job:greeting_delivery", 5*time.Minute, func() {
+		// A definite IM rejection is not resendable. Finish any rollback that failed
+		// on the request path before processing new delivery retries.
+		failedRows, err := s.db.failedGreetingRollbacks(100)
+		if err != nil {
+			return
 		}
-	}
+		for _, row := range failedRows {
+			if rollbackErr := s.db.rollbackPendingGreetingSend(row.UID, row.ToUID, row.LastGreetAt); rollbackErr != nil {
+				break
+			}
+			s.signalPartnerIMPermissionOutbox()
+		}
+
+		rows, err := s.db.pendingGreetingDeliveries(20)
+		if err != nil {
+			return
+		}
+		consecutiveUncertainErrors := 0
+		for _, row := range rows {
+			deliveryErr := s.deliverGreetingRow(row)
+			if deliveryErr == nil {
+				consecutiveUncertainErrors = 0
+				continue
+			}
+			if isDefiniteGreetingSendError(deliveryErr) {
+				if rollbackErr := s.db.rollbackPendingGreetingSend(row.UID, row.ToUID, row.LastGreetAt); rollbackErr == nil {
+					s.signalPartnerIMPermissionOutbox()
+				}
+				consecutiveUncertainErrors = 0
+				continue
+			}
+			// Permission setup and network errors may be plain errors rather than a
+			// greetingSendError. Any non-definite failure is treated as transient here.
+			consecutiveUncertainErrors++
+			if consecutiveUncertainErrors >= 3 {
+				break
+			}
+		}
+	})
 }
 
 func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64, requesterMsgCount int) error {
@@ -967,9 +1556,7 @@ func (s *Service) sendGreetingMessage(uid, toUID, text, source string, at int64,
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		message := strings.TrimSpace(string(data))
-		if len(message) > 300 {
-			message = message[:300]
-		}
+		message = truncatePartnerRunes(message, 300)
 		lower := strings.ToLower(message)
 		uncertain := resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooManyRequests || strings.Contains(lower, "duplicate") || strings.Contains(lower, "client_msg_no") || strings.Contains(message, "重复") || strings.Contains(message, "已存在")
 		return &greetingSendError{uncertain: uncertain, err: fmt.Errorf("IM服务返回状态[%d]: %s", resp.StatusCode, message)}
@@ -1019,7 +1606,7 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 
 		activated, _ := s.db.activateContactOnReply(msg.FromUID, msg.ChannelID, createdAt)
 		if activated {
-			s.flushPartnerIMPermissionOutbox()
+			s.signalPartnerIMPermissionOutbox()
 		}
 	}
 }
@@ -1063,88 +1650,169 @@ func (s *Service) globalCandidatePoolKey() string {
 func (s *Service) startBackgroundJobs() {
 	go func() {
 		time.Sleep(3 * time.Second)
-		s.reconcilePendingWhitelists()
-		s.flushPartnerIMPermissionOutbox()
-		s.runCandidateWarmupOnce()
-		warmup := time.NewTicker(PartnerGlobalPoolRefresh)
-		permissions := time.NewTicker(2 * time.Second)
-		greetingDelivery := time.NewTicker(5 * time.Second)
-		defer warmup.Stop()
-		defer permissions.Stop()
-		defer greetingDelivery.Stop()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
 		for {
+			s.reconcilePendingWhitelists()
+			<-ticker.C
+		}
+	}()
+	go func() {
+		time.Sleep(3 * time.Second)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			s.flushPartnerIMPermissionOutbox()
 			select {
-			case <-warmup.C:
-				s.runCandidateWarmupOnce()
-			case <-permissions.C:
-				s.flushPartnerIMPermissionOutbox()
-			case <-greetingDelivery.C:
-				s.reconcileGreetingDeliveries()
+			case <-ticker.C:
+			case <-s.permissionWake:
 			}
+		}
+	}()
+	go func() {
+		time.Sleep(5 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			s.reconcileGreetingDeliveries()
+			<-ticker.C
+		}
+	}()
+	go func() {
+		time.Sleep(5 * time.Second)
+		ticker := time.NewTicker(PartnerGlobalPoolRefresh)
+		defer ticker.Stop()
+		for {
+			s.runCandidateWarmupOnce()
+			<-ticker.C
+		}
+	}()
+	go func() {
+		time.Sleep(2 * time.Minute)
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			s.runExclusiveJob("partner:job:operational_cleanup", 8*time.Minute, func() {
+				_ = s.db.cleanupPartnerOperationalRows(time.Now().UnixMilli())
+			})
+			<-ticker.C
 		}
 	}()
 }
 
 func (s *Service) reconcilePendingWhitelists() {
-	if s == nil || s.db == nil {
-		return
-	}
-	afterRequester, afterReceiver := "", ""
-	for {
-		pairs, err := s.db.pendingContactPairsAfter(afterRequester, afterReceiver, 500)
-		if err != nil || len(pairs) == 0 {
+	s.runExclusiveJob("partner:job:pending_whitelist_reconcile", 30*time.Minute, func() {
+		if s == nil || s.db == nil {
 			return
 		}
-		for _, pair := range pairs {
-			if pair.RequesterUID == "" || pair.ReceiverUID == "" || pair.RequesterUID == pair.ReceiverUID {
-				continue
+		afterRequester, afterReceiver := "", ""
+		for {
+			pairs, err := s.db.pendingContactPairsAfter(afterRequester, afterReceiver, 500)
+			if err != nil || len(pairs) == 0 {
+				return
 			}
-			_ = s.db.enqueuePendingPermissionRepair(pair.RequesterUID, pair.ReceiverUID, time.Now().UnixMilli())
-			afterRequester, afterReceiver = pair.RequesterUID, pair.ReceiverUID
+			valid := make([]pendingContactPair, 0, len(pairs))
+			for _, pair := range pairs {
+				// The cursor must advance even across malformed legacy rows, otherwise one
+				// bad tail row can make every subsequent repair pass read the same page.
+				afterRequester, afterReceiver = pair.RequesterUID, pair.ReceiverUID
+				if pair.RequesterUID == "" || pair.ReceiverUID == "" || pair.RequesterUID == pair.ReceiverUID {
+					continue
+				}
+				valid = append(valid, pair)
+			}
+			if err = s.db.enqueuePendingPermissionRepairs(valid, time.Now().UnixMilli()); err != nil {
+				return
+			}
+			if len(pairs) < 500 {
+				break
+			}
 		}
-		if len(pairs) < 500 {
-			break
-		}
-	}
-	s.flushPartnerIMPermissionOutbox()
+		s.signalPartnerIMPermissionOutbox()
+	})
 }
 
 func (s *Service) flushPartnerIMPermissionOutbox() {
-	if s == nil || s.db == nil || s.ctx == nil {
-		return
-	}
-	rows, err := s.db.pendingIMPermissionTasks(time.Now().UnixMilli(), 200)
-	if err != nil {
-		return
-	}
-	for _, row := range rows {
-		var applyErr error
-		desired, desiredErr := s.db.desiredPartnerIMPermission(row.ChannelUID, row.MemberUID)
-		if desiredErr != nil {
-			_ = s.db.markIMPermissionRetry(row.ID, row.Attempts, desiredErr.Error())
-			continue
+	s.runExclusiveJob("partner:job:im_permission_outbox", 15*time.Minute, func() {
+		if s == nil || s.db == nil || s.ctx == nil {
+			return
 		}
-		req := config.ChannelWhitelistReq{ChannelReq: config.ChannelReq{ChannelID: row.ChannelUID, ChannelType: common.ChannelTypePerson.Uint8()}, UIDs: []string{row.MemberUID}}
-		if desired == "remove" {
-			applyErr = s.ctx.IMWhitelistRemove(req)
-		} else {
-			applyErr = s.ctx.IMWhitelistAdd(req)
+		rows, err := s.db.pendingIMPermissionTasks(time.Now().UnixMilli(), 50)
+		if err != nil {
+			return
 		}
-		if applyErr == nil {
-			_ = s.db.markIMPermissionDone(row.ID)
-		} else {
+		consecutiveApplyErrors := 0
+		for _, row := range rows {
+			desired, desiredErr := s.db.desiredPartnerIMPermission(row.ChannelUID, row.MemberUID)
+			if desiredErr != nil {
+				_ = s.db.markIMPermissionRetry(row.ID, row.Attempts, desiredErr.Error())
+				// A database error is normally shared by all rows in this batch.
+				break
+			}
+			req := config.ChannelWhitelistReq{ChannelReq: config.ChannelReq{ChannelID: row.ChannelUID, ChannelType: common.ChannelTypePerson.Uint8()}, UIDs: []string{row.MemberUID}}
+			var applyErr error
+			if desired == "remove" {
+				applyErr = s.ctx.IMWhitelistRemove(req)
+			} else {
+				applyErr = s.ctx.IMWhitelistAdd(req)
+			}
+			if applyErr == nil {
+				_ = s.db.markIMPermissionDone(row.ID)
+				consecutiveApplyErrors = 0
+				continue
+			}
 			_ = s.db.markIMPermissionRetry(row.ID, row.Attempts, applyErr.Error())
+			consecutiveApplyErrors++
+			// During a shared WuKongIM outage, avoid issuing the remaining 47 calls.
+			if consecutiveApplyErrors >= 3 {
+				break
+			}
 		}
-	}
+	})
 }
 
 func (s *Service) runCandidateWarmupOnce() {
-	if s == nil || s.db == nil {
+	s.runExclusiveJob("partner:job:candidate_warmup", 15*time.Minute, func() {
+		if s == nil || s.db == nil {
+			return
+		}
+		_, _ = s.db.syncRecentPartnerProfiles(PartnerGlobalCandidateSQLLimit)
+		_ = s.db.syncOnlineProfiles()
+		_, _ = s.rebuildGlobalCandidatePool()
+	})
+}
+
+func (s *Service) runExclusiveJob(key string, ttl time.Duration, action func()) {
+	if s == nil || action == nil || strings.TrimSpace(key) == "" {
 		return
 	}
-	_, _ = s.db.syncRecentPartnerProfiles(PartnerGlobalCandidateSQLLimit)
-	_ = s.db.syncOnlineProfiles()
-	_, _ = s.rebuildGlobalCandidatePool()
+	s.jobMu.Lock()
+	if s.jobRunning[key] {
+		s.jobMu.Unlock()
+		return
+	}
+	s.jobRunning[key] = true
+	s.jobMu.Unlock()
+	defer func() {
+		s.jobMu.Lock()
+		delete(s.jobRunning, key)
+		s.jobMu.Unlock()
+	}()
+
+	token := fmt.Sprintf("%d", time.Now().UnixNano())
+	if s.redisx != nil {
+		locked, err := s.redisx.SetNX(key, token, ttl)
+		if err != nil {
+			s.jobLockErrors.Add(1)
+			s.warnPressure("语伴后台任务获取Redis锁失败，本轮已跳过", zap.String("lock_key", key), zap.Error(err))
+			return
+		}
+		if !locked {
+			return
+		}
+		defer func() { _, _ = s.redisx.CompareAndDelete(key, token) }()
+	}
+	action()
 }
 
 func (s *Service) touchActive(uid string, at int64, online int) {
@@ -1152,27 +1820,59 @@ func (s *Service) touchActive(uid string, at int64, online int) {
 	if uid == "" || s == nil || s.db == nil {
 		return
 	}
-	// partner_profiles.last_active_at is used for recommendation freshness, not for
-	// message permission. It is safe to write at most once per user per 10 minutes.
-	// This keeps high-frequency 1v1 chat from creating one MySQL UPDATE per message.
-	if s.ctx != nil && s.ctx.GetRedisConn() != nil {
-		// ServerLib 的 Redis Conn 没有 SetNX。使用原子 INCR + EXPIRE
-		// 实现十分钟去重：第一个请求负责更新，后续请求直接返回。
-		// Redis 异常时采用 fail-open，仍允许本次 MySQL 活跃时间更新。
-		conn := s.ctx.GetRedisConn()
-		key := "partner:active:touch:" + uid
-		count, err := conn.Incr(key)
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	// partner_profiles.last_active_at is used for recommendation freshness, not message
+	// permission. Use one atomic SETNX and a bounded worker queue so a synchronized
+	// 5,000-user foreground/message burst cannot create 5,000 MySQL goroutines.
+	key := "partner:active:touch:" + uid
+	token := strconv.FormatInt(at, 10)
+	lockedByAdvanced := false
+	if s.redisx != nil {
+		locked, err := s.redisx.SetNX(key, token, 10*time.Minute)
 		if err == nil {
-			if count > 1 {
+			if !locked {
 				return
 			}
-			if err = conn.Expire(key, 10*time.Minute); err != nil {
-				// 避免 INCR 成功但 EXPIRE 失败后形成永久 key。
-				_ = conn.Del(key)
+			lockedByAdvanced = true
+		}
+	}
+	basicGuard := false
+	if !lockedByAdvanced {
+		token = ""
+		// Preserve the original ServerLib-compatible Redis throttle when the
+		// advanced pool is unavailable. This prevents a Redis pool incident from
+		// turning every chat/list event into a MySQL UPDATE.
+		if s.ctx != nil && s.ctx.GetRedisConn() != nil {
+			conn := s.ctx.GetRedisConn()
+			count, err := conn.Incr(key)
+			if err == nil {
+				if count > 1 {
+					return
+				}
+				if err = conn.Expire(key, 10*time.Minute); err != nil {
+					_ = conn.Del(key)
+				} else {
+					token = "1"
+					basicGuard = true
+				}
 			}
 		}
 	}
-	go func() { _ = s.db.touchPartnerActive(uid, at, online) }()
+	task := partnerActiveTask{uid: uid, atMS: at, online: online, key: key, token: token, basicGuard: basicGuard}
+	select {
+	case s.activeTouchQueue <- task:
+		return
+	default:
+	}
+	if s.spillActiveTask(task) {
+		return
+	}
+	s.activeDropped.Add(1)
+	s.warnPressure("语伴活跃同步队列已满且无法写入Redis溢出队列", zap.String("uid", uid), zap.Int("queue_len", len(s.activeTouchQueue)), zap.Int("queue_cap", cap(s.activeTouchQueue)))
+	// Release the dedupe key so a later event can retry once capacity recovers.
+	s.releasePartnerActiveGuard(task)
 }
 
 func cursorToken() string {

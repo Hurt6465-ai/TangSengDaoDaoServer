@@ -20,6 +20,19 @@ func newDB(ctx *config.Context) *db {
 	return &db{session: ctx.DB(), ctx: ctx}
 }
 
+const greetingRollbackMarker = "__rollback_done__:"
+
+func truncatePartnerRunes(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
+}
+
 type partnerContactModel struct {
 	UID               string `db:"uid"`
 	ToUID             string `db:"to_uid"`
@@ -57,9 +70,7 @@ func (d *db) upsertLocation(uid string, req LocationReq) (*locationModel, error)
 	if source == "" {
 		source = "network"
 	}
-	if len(source) > 16 {
-		source = source[:16]
-	}
+	source = truncatePartnerRunes(source, 16)
 	_, err := d.session.InsertBySql(`INSERT INTO partner_locations(uid,lat,lng,accuracy,radius_meters,geohash,source,updated_at_ms,expires_at,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,NOW(),NOW())
         ON DUPLICATE KEY UPDATE lat=VALUES(lat),lng=VALUES(lng),accuracy=VALUES(accuracy),radius_meters=VALUES(radius_meters),geohash=VALUES(geohash),source=VALUES(source),updated_at_ms=VALUES(updated_at_ms),expires_at=VALUES(expires_at),updated_at=NOW()`,
@@ -163,6 +174,14 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
 		WHERE pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r1
+			WHERE r1.uid=? AND r1.channel_type=1 AND r1.channel_id=pp.uid
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r2
+			WHERE r2.channel_id=? AND r2.channel_type=1 AND r2.uid=pp.uid
+		  )
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
 		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
@@ -172,9 +191,9 @@ func (d *db) list(loginUID string, req listReq) ([]*PartnerUser, int, error) {
 		ORDER BY IFNULL(pe.last_seen_at,0) ASC, IFNULL(pp.online,0) DESC, IFNULL(pp.last_active_at,0) DESC, pp.updated_at DESC
 		LIMIT ? OFFSET ?`
 
-	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+len(whereDistanceArgs)+9)
+	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+len(whereDistanceArgs)+11)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
-	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
+	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
 	orderedArgs = append(orderedArgs, whereDistanceArgs...)
 	orderedArgs = append(orderedArgs, limit+1, offset)
 
@@ -330,6 +349,14 @@ func (d *db) candidateUIDsForUser(loginUID, extraWhere string, extraArgs []inter
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
 		WHERE pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r1
+			WHERE r1.uid=? AND r1.channel_type=1 AND r1.channel_id=pp.uid
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r2
+			WHERE r2.channel_id=? AND r2.channel_type=1 AND r2.uid=pp.uid
+		  )
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
 		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
@@ -337,8 +364,8 @@ func (d *db) candidateUIDsForUser(loginUID, extraWhere string, extraArgs []inter
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''` + extraWhere + `
 		ORDER BY ` + orderBy + `
 		LIMIT ?`
-	args := make([]interface{}, 0, 6+len(extraArgs)+1)
-	args = append(args, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
+	args := make([]interface{}, 0, 8+len(extraArgs)+1)
+	args = append(args, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID)
 	args = append(args, extraArgs...)
 	args = append(args, limit)
 	var uids []string
@@ -408,15 +435,23 @@ func (d *db) listByUIDs(loginUID string, req listReq, uids []string) ([]*Partner
 		LEFT JOIN user_setting bs2 ON bs2.uid=pp.uid AND bs2.to_uid=?
 		WHERE pp.uid IN ? AND pp.uid<>? AND pp.status=1 AND pp.account_eligible=1 AND pp.partner_enabled=1 AND pp.profile_completed=1 AND pp.review_status=1 AND pp.has_photo=1
 		  AND IFNULL(bs1.blacklist,0)=0 AND IFNULL(bs2.blacklist,0)=0
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r1
+			WHERE r1.uid=? AND r1.channel_type=1 AND r1.channel_id=pp.uid
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM report r2
+			WHERE r2.channel_id=? AND r2.channel_type=1 AND r2.uid=pp.uid
+		  )
 		  AND IFNULL(fr.follow,0)=0
 		  AND IFNULL(pg.last_greet_at,0)=0
 		  AND IFNULL(pc.status,-1) NOT IN (0,1,2,3)
 		  AND IFNULL(pp.profile_images,'')<>'' AND IFNULL(pp.profile_images,'')<>'[]'
 		  AND IFNULL(pp.native_languages,'')<>'' AND IFNULL(pp.learning_languages,'')<>''`
 
-	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+8)
+	orderedArgs := make([]interface{}, 0, len(selectDistanceArgs)+10)
 	orderedArgs = append(orderedArgs, selectDistanceArgs...)
-	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, uids, loginUID)
+	orderedArgs = append(orderedArgs, loginUID, loginUID, loginUID, loginUID, loginUID, loginUID, uids, loginUID, loginUID, loginUID)
 	var list []*PartnerUser
 	_, err := d.session.SelectBySql(sql, orderedArgs...).Load(&list)
 	if err != nil {
@@ -486,9 +521,7 @@ func normalizeExposureSource(source string) string {
 	if source == "" {
 		source = "partner_browse"
 	}
-	if len(source) > 32 {
-		source = source[:32]
-	}
+	source = truncatePartnerRunes(source, 32)
 	return source
 }
 
@@ -539,12 +572,7 @@ func greetingDayKey(nowMS int64) string {
 
 func (d *db) greetingStats(uid, toUID string, now int64) (*greetingStats, error) {
 	stats := &greetingStats{}
-	hourStart := now - int64(time.Hour/time.Millisecond)
-	err := d.session.Select("COUNT(*)").From("partner_greetings").Where("uid=? AND last_greet_at>=? AND IFNULL(send_status,1)<>2", uid, hourStart).LoadOne(&stats.HourCount)
-	if err != nil {
-		return nil, err
-	}
-	err = d.session.Select("IFNULL(MAX(used_count),0)").From("partner_greeting_daily_usage").Where("sender_uid=? AND day_key=?", uid, greetingDayKey(now)).LoadOne(&stats.DayCount)
+	err := d.session.Select("IFNULL(MAX(used_count),0)").From("partner_greeting_daily_usage").Where("sender_uid=? AND day_key=?", uid, greetingDayKey(now)).LoadOne(&stats.DayCount)
 	if err != nil {
 		return nil, err
 	}
@@ -661,6 +689,17 @@ type greetingDeliveryRow struct {
 	FailedReason string `db:"failed_reason"`
 }
 
+func (d *db) hasPendingGreetingContact(uid, toUID string) (bool, error) {
+	if uid == "" || toUID == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.Select("COUNT(*)").From("partner_contacts").
+		Where("uid=? AND to_uid=? AND status=? AND requester_uid=?", uid, toUID, PartnerContactStatusPending, uid).
+		LoadOne(&count)
+	return count > 0, err
+}
+
 func (d *db) greetingDelivery(uid, toUID string) (*greetingDeliveryRow, error) {
 	if uid == "" || toUID == "" {
 		return nil, nil
@@ -673,11 +712,24 @@ func (d *db) greetingDelivery(uid, toUID string) (*greetingDeliveryRow, error) {
 
 func (d *db) pendingGreetingDeliveries(limit int) ([]*greetingDeliveryRow, error) {
 	if limit <= 0 || limit > 500 {
+		limit = 20
+	}
+	retryBefore := time.Now().Add(-30 * time.Second).UnixMilli()
+	var rows []*greetingDeliveryRow
+	_, err := d.session.Select("uid", "to_uid", "text", "source", "IFNULL(last_greet_at,0) last_greet_at", "IFNULL(send_status,0) send_status", "IFNULL(failed_reason,'') failed_reason").
+		From("partner_greetings").Where("send_status=0 AND last_greet_at>0 AND last_send_at<=?", retryBefore).OrderAsc("last_send_at").Limit(uint64(limit)).Load(&rows)
+	return rows, err
+}
+
+func (d *db) failedGreetingRollbacks(limit int) ([]*greetingDeliveryRow, error) {
+	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	var rows []*greetingDeliveryRow
 	_, err := d.session.Select("uid", "to_uid", "text", "source", "IFNULL(last_greet_at,0) last_greet_at", "IFNULL(send_status,0) send_status", "IFNULL(failed_reason,'') failed_reason").
-		From("partner_greetings").Where("send_status=0 AND last_greet_at>0").OrderAsc("last_send_at").Limit(uint64(limit)).Load(&rows)
+		From("partner_greetings").
+		Where("send_status=2 AND last_greet_at>0 AND LEFT(IFNULL(failed_reason,''),?)<>?", len([]rune(greetingRollbackMarker)), greetingRollbackMarker).
+		OrderAsc("last_send_at").Limit(uint64(limit)).Load(&rows)
 	return rows, err
 }
 func (d *db) recordGreeting(uid, toUID, text, source string) (*GreetingResp, error) {
@@ -692,7 +744,6 @@ func (d *db) recordGreeting(uid, toUID, text, source string) (*GreetingResp, err
 }
 
 type greetingStats struct {
-	HourCount         int
 	DayCount          int
 	LastTargetGreetAt int64
 }
@@ -889,10 +940,10 @@ func (d *db) ensurePendingContact(uid, toUID string, now int64) error {
 	}
 	// Receiver may reply to requester's personal channel; requester must not be able
 	// to bypass the pending gateway in the opposite direction.
-	if err = enqueuePartnerIMPermissionTx(tx, "pending:add:"+uid+":"+toUID, uid, toUID, "add", now); err != nil {
+	if err = enqueuePartnerIMPermissionTx(tx, permissionTransitionKey("pending:add", uid, toUID, now), uid, toUID, "add", now); err != nil {
 		return err
 	}
-	if err = enqueuePartnerIMPermissionTx(tx, "pending:remove:"+toUID+":"+uid, toUID, uid, "remove", now); err != nil {
+	if err = enqueuePartnerIMPermissionTx(tx, permissionTransitionKey("pending:remove", toUID, uid, now), toUID, uid, "remove", now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -945,7 +996,7 @@ func (d *db) activateContactOnReply(fromUID, toUID string, at int64) (bool, erro
 		return false, tx.Commit()
 	}
 	for _, pair := range [][2]string{{fromUID, toUID}, {toUID, fromUID}} {
-		if err = enqueuePartnerIMPermissionTx(tx, "active:add:"+pair[0]+":"+pair[1], pair[0], pair[1], "add", at); err != nil {
+		if err = enqueuePartnerIMPermissionTx(tx, permissionTransitionKey("active:add", pair[0], pair[1], at), pair[0], pair[1], "add", at); err != nil {
 			return false, err
 		}
 	}
@@ -955,9 +1006,7 @@ func (d *db) markGreetingSendStatus(uid, toUID string, at int64, status int, rea
 	if uid == "" || toUID == "" {
 		return nil
 	}
-	if len(reason) > 200 {
-		reason = reason[:200]
-	}
+	reason = truncatePartnerRunes(reason, 200)
 	_, err := d.session.Update("partner_greetings").
 		Set("send_status", status).
 		Set("last_send_at", time.Now().UnixMilli()).
@@ -972,15 +1021,71 @@ func (d *db) rollbackPendingGreetingSend(uid, toUID string, at int64) error {
 	if uid == "" || toUID == "" {
 		return nil
 	}
-	_, _ = d.session.Update("partner_contacts").
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Claim this failed delivery inside the same transaction as every rollback side
+	// effect. The marker makes retries idempotent: a timeout after COMMIT cannot
+	// decrement requester_msg_count or the daily quota a second time.
+	claim, err := tx.Update("partner_greetings").
+		Set("failed_reason", dbr.Expr("CONCAT('__rollback_done__:',LEFT(IFNULL(failed_reason,''),182))")).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("uid=? AND to_uid=? AND last_greet_at=? AND send_status=2 AND LEFT(IFNULL(failed_reason,''),?)<>?", uid, toUID, at, len([]rune(greetingRollbackMarker)), greetingRollbackMarker).
+		Exec()
+	if err != nil {
+		return err
+	}
+	claimed, _ := claim.RowsAffected()
+	if claimed == 0 {
+		return tx.Commit()
+	}
+
+	if _, err = tx.Update("partner_contacts").
 		Set("requester_msg_count", dbr.Expr("GREATEST(IFNULL(requester_msg_count,1)-1,0)")).
 		Set("updated_at", at).
 		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=?", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
-		Exec()
-	_, err := d.session.DeleteFrom("partner_contacts").
+		Exec(); err != nil {
+		return err
+	}
+	result, err := tx.DeleteFrom("partner_contacts").
 		Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=? AND IFNULL(requester_msg_count,0)<=0", uid, toUID, toUID, uid, PartnerContactStatusPending, uid).
 		Exec()
-	return err
+	if err != nil {
+		return err
+	}
+	deleted, _ := result.RowsAffected()
+	if deleted > 0 {
+		// Permission changes may already have been applied synchronously before the IM
+		// send failed. Persist both removals so no stale personal-channel whitelist remains.
+		for _, pair := range [][2]string{{uid, toUID}, {toUID, uid}} {
+			if err = enqueuePartnerIMPermissionTx(tx, permissionTransitionKey("rollback:remove", pair[0], pair[1], at), pair[0], pair[1], "remove", at); err != nil {
+				return err
+			}
+		}
+	}
+
+	dayKey := greetingDayKey(at)
+	dailyResult, err := tx.DeleteFrom("partner_greeting_daily_target").
+		Where("sender_uid=? AND receiver_uid=? AND day_key=?", uid, toUID, dayKey).Exec()
+	if err != nil {
+		return err
+	}
+	dailyDeleted, _ := dailyResult.RowsAffected()
+	if dailyDeleted > 0 {
+		if _, err = tx.Update("partner_greeting_daily_usage").
+			Set("used_count", dbr.Expr("GREATEST(used_count-1,0)")).
+			Set("updated_at", at).
+			Where("sender_uid=? AND day_key=?", uid, dayKey).Exec(); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *db) touchPartnerActive(uid string, at int64, online int) error {
@@ -1004,7 +1109,10 @@ func (d *db) syncOnlineProfiles() error {
 			SELECT uid,MAX(online) AS online,MAX(last_offline) AS last_offline,MAX(GREATEST(last_online,last_offline))*1000 AS last_active_at
 			FROM user_online GROUP BY uid
 		) onl ON onl.uid=pp.uid
-		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0))`).Exec()
+		SET pp.online=IFNULL(onl.online,0),pp.last_offline=IFNULL(onl.last_offline,pp.last_offline),pp.last_active_at=GREATEST(IFNULL(pp.last_active_at,0),IFNULL(onl.last_active_at,0))
+		WHERE IFNULL(pp.online,0)<>IFNULL(onl.online,0)
+		   OR IFNULL(onl.last_offline,0)>IFNULL(pp.last_offline,0)
+		   OR IFNULL(onl.last_active_at,0)>IFNULL(pp.last_active_at,0)`).Exec()
 	return err
 }
 
@@ -1060,10 +1168,11 @@ func (d *db) pendingContactPairsAfter(afterRequester, afterReceiver string, limi
 		limit = 500
 	}
 	var rows []pendingContactPair
-	_, err := d.session.SelectBySql(`SELECT requester_uid,CASE WHEN uid=requester_uid THEN to_uid ELSE uid END receiver_uid
- FROM partner_contacts WHERE status=? AND requester_uid<>'' AND uid=requester_uid
- AND (requester_uid>? OR (requester_uid=? AND (CASE WHEN uid=requester_uid THEN to_uid ELSE uid END)>?))
- ORDER BY requester_uid ASC,receiver_uid ASC LIMIT ?`, PartnerContactStatusPending, afterRequester, afterRequester, afterReceiver, limit).Load(&rows)
+	_, err := d.session.SelectBySql(`SELECT requester_uid,to_uid AS receiver_uid
+ FROM partner_contacts WHERE status=? AND requester_uid<>'' AND to_uid<>''
+ AND uid=requester_uid AND requester_uid<>to_uid
+ AND (requester_uid>? OR (requester_uid=? AND to_uid>?))
+ ORDER BY requester_uid ASC,to_uid ASC LIMIT ?`, PartnerContactStatusPending, afterRequester, afterRequester, afterReceiver, limit).Load(&rows)
 	return rows, err
 }
 
@@ -1112,9 +1221,16 @@ type partnerIMPermissionTask struct {
 	Attempts   int    `db:"attempts"`
 }
 
+func permissionTransitionKey(prefix, channelUID, memberUID string, at int64) string {
+	if at <= 0 {
+		at = time.Now().UnixMilli()
+	}
+	return prefix + ":" + channelUID + ":" + memberUID + ":" + strconv.FormatInt(at, 10)
+}
+
 func enqueuePartnerIMPermissionTx(tx *dbr.Tx, key, channelUID, memberUID, action string, now int64) error {
 	_, err := tx.InsertBySql(`INSERT INTO partner_im_permission_outbox(idempotency_key,channel_uid,member_uid,action,status,attempts,next_retry_at,last_error,created_at,updated_at)
- VALUES(?,?,?,?,0,0,0,'',?,?) ON DUPLICATE KEY UPDATE action=VALUES(action),status=IF(status=1,1,0),next_retry_at=0,updated_at=VALUES(updated_at)`, key, channelUID, memberUID, action, now, now).Exec()
+ VALUES(?,?,?,?,0,0,0,'',?,?) ON DUPLICATE KEY UPDATE channel_uid=VALUES(channel_uid),member_uid=VALUES(member_uid),action=VALUES(action),status=IF(status=1,1,0),next_retry_at=0,updated_at=VALUES(updated_at)`, key, channelUID, memberUID, action, now, now).Exec()
 	return err
 }
 func (d *db) pendingIMPermissionTasks(now int64, limit int) ([]partnerIMPermissionTask, error) {
@@ -1125,15 +1241,26 @@ func (d *db) pendingIMPermissionTasks(now int64, limit int) ([]partnerIMPermissi
 	_, err := d.session.SelectBySql(`SELECT id,channel_uid,member_uid,action,attempts FROM partner_im_permission_outbox WHERE status IN (0,2) AND next_retry_at<=? ORDER BY id ASC LIMIT ?`, now, limit).Load(&rows)
 	return rows, err
 }
+func (d *db) markIMPermissionDoneByKeys(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	_, err := d.session.Update("partner_im_permission_outbox").
+		Set("status", 1).
+		Set("last_error", "").
+		Set("updated_at", time.Now().UnixMilli()).
+		Where("idempotency_key IN ?", keys).
+		Exec()
+	return err
+}
+
 func (d *db) markIMPermissionDone(id int64) error {
 	_, err := d.session.Update("partner_im_permission_outbox").Set("status", 1).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
 	return err
 }
 func (d *db) markIMPermissionRetry(id int64, attempts int, reason string) error {
-	if len(reason) > 500 {
-		reason = reason[:500]
-	}
-	delay := time.Duration(1<<uint(minPartnerInt(attempts, 6))) * time.Second
+	reason = truncatePartnerRunes(reason, 500)
+	delay := time.Duration(1<<uint(minPartnerInt(attempts, 10))) * time.Second
 	_, err := d.session.Update("partner_im_permission_outbox").Set("status", 2).Set("attempts", attempts+1).Set("next_retry_at", time.Now().Add(delay).UnixMilli()).Set("last_error", reason).Set("updated_at", time.Now().UnixMilli()).Where("id=?", id).Exec()
 	return err
 }
@@ -1144,17 +1271,75 @@ func minPartnerInt(a, b int) int {
 	return b
 }
 
-func (d *db) enqueuePendingPermissionRepair(requesterUID, receiverUID string, now int64) error {
-	tx, err := d.session.Begin()
-	if err != nil {
+func (d *db) enqueuePendingPermissionRepairs(pairs []pendingContactPair, now int64) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	var sql strings.Builder
+	sql.WriteString(`INSERT INTO partner_im_permission_outbox(idempotency_key,channel_uid,member_uid,action,status,attempts,next_retry_at,last_error,created_at,updated_at) VALUES `)
+	args := make([]interface{}, 0, len(pairs)*12)
+	rowCount := 0
+	appendRow := func(key, channelUID, memberUID, action string) {
+		if rowCount > 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("(?,?,?,?,0,0,0,'',?,?)")
+		args = append(args, key, channelUID, memberUID, action, now, now)
+		rowCount++
+	}
+	for _, pair := range pairs {
+		requesterUID := strings.TrimSpace(pair.RequesterUID)
+		receiverUID := strings.TrimSpace(pair.ReceiverUID)
+		if requesterUID == "" || receiverUID == "" || requesterUID == receiverUID {
+			continue
+		}
+		appendRow("repair:pending:add:"+requesterUID+":"+receiverUID, requesterUID, receiverUID, "add")
+		appendRow("repair:pending:remove:"+receiverUID+":"+requesterUID, receiverUID, requesterUID, "remove")
+	}
+	if rowCount == 0 {
+		return nil
+	}
+	sql.WriteString(` ON DUPLICATE KEY UPDATE channel_uid=VALUES(channel_uid),member_uid=VALUES(member_uid),action=VALUES(action),status=0,attempts=0,next_retry_at=0,last_error='',updated_at=VALUES(updated_at)`)
+	_, err := d.session.InsertBySql(sql.String(), args...).Exec()
+	return err
+}
+
+func (d *db) cleanupPartnerOperationalRows(now int64) error {
+	if now <= 0 {
+		now = time.Now().UnixMilli()
+	}
+	permissionCutoff := now - int64(30*24*time.Hour/time.Millisecond)
+	if _, err := d.session.DeleteBySql(`DELETE FROM partner_im_permission_outbox WHERE status=1 AND updated_at<? ORDER BY updated_at ASC,id ASC LIMIT 10000`, permissionCutoff).Exec(); err != nil {
 		return err
 	}
-	defer tx.RollbackUnlessCommitted()
-	if err = enqueuePartnerIMPermissionTx(tx, "pending:add:"+requesterUID+":"+receiverUID, requesterUID, receiverUID, "add", now); err != nil {
+	messageCutoff := now - int64(30*24*time.Hour/time.Millisecond)
+	if _, err := d.session.DeleteBySql(`DELETE FROM partner_pending_message WHERE status IN (1,2) AND updated_at<? ORDER BY updated_at ASC,id ASC LIMIT 10000`, messageCutoff).Exec(); err != nil {
 		return err
 	}
-	if err = enqueuePartnerIMPermissionTx(tx, "pending:remove:"+receiverUID+":"+requesterUID, receiverUID, requesterUID, "remove", now); err != nil {
+	// partner_exposures retains the durable aggregate; raw interaction events are
+	// bounded to 30 days so high-volume swipes do not grow this table forever.
+	// At 5,000 concurrent users, 200,000 deletions per hour can be slower than the
+	// insert rate. Run many small indexed batches but stop after a short time budget
+	// so maintenance keeps pace without one oversized transaction monopolizing MySQL.
+	cleanupDeadline := time.Now().Add(20 * time.Second)
+	for batch := 0; batch < 50 && time.Now().Before(cleanupDeadline); batch++ {
+		result, err := d.session.DeleteBySql(`DELETE FROM partner_exposure_events WHERE event_at<? ORDER BY event_at ASC,id ASC LIMIT 20000`, messageCutoff).Exec()
+		if err != nil {
+			return err
+		}
+		affected, _ := result.RowsAffected()
+		if affected < 20000 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	dayCutoff := greetingDayKey(now - int64(30*24*time.Hour/time.Millisecond))
+	if _, err := d.session.DeleteBySql(`DELETE FROM partner_greeting_daily_target WHERE day_key<? ORDER BY day_key ASC,id ASC LIMIT 10000`, dayCutoff).Exec(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	_, err := d.session.DeleteBySql(`DELETE FROM partner_greeting_daily_usage WHERE day_key<? ORDER BY day_key ASC,id ASC LIMIT 10000`, dayCutoff).Exec()
+	return err
 }
