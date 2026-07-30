@@ -1,7 +1,9 @@
 package user
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
@@ -10,6 +12,8 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
+
+const maxOnlineStatusUIDs = 1000
 
 // 退出pc登录
 func (u *User) pcQuit(c *wkhttp.Context) {
@@ -43,27 +47,85 @@ func (u *User) pcQuit(c *wkhttp.Context) {
 }
 
 func (u *User) onlinelistWithUIDs(c *wkhttp.Context) {
-	var uids []string
-	if err := c.BindJSON(&uids); err != nil {
+	var rawUIDs []string
+	if err := c.BindJSON(&rawUIDs); err != nil {
 		c.ResponseError(err)
 		return
 	}
-	onlineResps := make([]*userOnlineResp, 0)
-	if len(uids) > 0 {
-		onlines, err := u.onlineDB.queryUserOnlineRecets(uids)
-		if err != nil {
-			u.Error("查询用户在线状态失败！", zap.Error(err))
-			c.ResponseError(errors.New("查询用户在线状态失败！"))
-			return
-		}
-		if len(onlines) > 0 {
-			for _, online := range onlines {
-				onlineResps = append(onlineResps, newUserOnlineResp(online))
-			}
-		}
-	}
-	c.JSON(http.StatusOK, onlineResps)
 
+	uids, overflow := normalizeOnlineUIDs(rawUIDs, maxOnlineStatusUIDs)
+	if overflow {
+		c.ResponseError(fmt.Errorf("一次最多查询%d个用户的在线状态", maxOnlineStatusUIDs))
+		return
+	}
+	if len(uids) == 0 {
+		c.JSON(http.StatusOK, make([]*userOnlineResp, 0))
+		return
+	}
+
+	// 在线状态功能关闭时也返回完整UID集合，避免客户端沿用旧的在线缓存。
+	if !u.ctx.GetConfig().OnlineStatusOn {
+		c.JSON(http.StatusOK, buildCompleteOnlineResponses(uids, nil))
+		return
+	}
+
+	onlines, err := u.onlineDB.queryUserOnlineRecets(uids)
+	if err != nil {
+		u.Error("查询用户在线状态失败！", zap.Error(err))
+		c.ResponseError(errors.New("查询用户在线状态失败！"))
+		return
+	}
+
+	// 保持请求顺序并补齐所有UID。数据库没有返回的用户明确视为离线，
+	// 防止离线超过24小时的用户在客户端继续显示旧的在线状态。
+	c.JSON(http.StatusOK, buildCompleteOnlineResponses(uids, onlines))
+}
+
+func normalizeOnlineUIDs(rawUIDs []string, limit int) ([]string, bool) {
+	if len(rawUIDs) == 0 {
+		return make([]string, 0), false
+	}
+
+	uids := make([]string, 0, len(rawUIDs))
+	seen := make(map[string]struct{}, len(rawUIDs))
+	for _, rawUID := range rawUIDs {
+		uid := strings.TrimSpace(rawUID)
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		if len(uids) >= limit {
+			return uids, true
+		}
+		uids = append(uids, uid)
+	}
+	return uids, false
+}
+
+func buildCompleteOnlineResponses(uids []string, onlines []*onlineStatusWeightModel) []*userOnlineResp {
+	onlineMap := make(map[string]*onlineStatusWeightModel, len(onlines))
+	for _, online := range onlines {
+		if online == nil || online.UID == "" {
+			continue
+		}
+		onlineMap[online.UID] = online
+	}
+
+	resps := make([]*userOnlineResp, 0, len(uids))
+	for _, uid := range uids {
+		if online := onlineMap[uid]; online != nil {
+			resps = append(resps, newUserOnlineResp(online))
+			continue
+		}
+		resps = append(resps, &userOnlineResp{
+			UID:    uid,
+			Online: 0,
+		})
+	}
+	return resps
 }
 
 // onlineList 查询在线用户 包含我的pc设备
@@ -82,8 +144,17 @@ func (u *User) onlineList(c *wkhttp.Context) {
 		return
 	}
 	uids := make([]string, 0, len(friends))
+	uidSet := make(map[string]struct{}, len(friends))
 	for _, friend := range friends {
-		uids = append(uids, friend.ToUID)
+		uid := strings.TrimSpace(friend.ToUID)
+		if uid == "" {
+			continue
+		}
+		if _, ok := uidSet[uid]; ok {
+			continue
+		}
+		uidSet[uid] = struct{}{}
+		uids = append(uids, uid)
 	}
 	resps, err := u.onlineService.GetUserLastOnlineStatus(uids)
 	if err != nil {
@@ -145,10 +216,21 @@ func (u *User) onlineStatusCheck() {
 	u.Debug("检查到需要矫正的在线数量", zap.Int("onlines", len(onlines)))
 
 	onlineUIDs := make([]string, 0, len(onlines))
+	uidSet := make(map[string]struct{}, len(onlines))
 	for _, online := range onlines {
+		if online == nil || online.UID == "" {
+			continue
+		}
+		if _, ok := uidSet[online.UID]; ok {
+			continue
+		}
+		uidSet[online.UID] = struct{}{}
 		onlineUIDs = append(onlineUIDs, online.UID)
 	}
-	makeOfflines := make([]*onlineStatusModel, 0, len(onlines)) // 需要离线的id
+	if len(onlineUIDs) == 0 {
+		return
+	}
+
 	onlineStatusResps, err := u.ctx.IMSOnlineStatus(onlineUIDs)
 	if err != nil {
 		u.Error("【在线状态检查】获取在线状态失败！", zap.Error(err))
@@ -156,20 +238,23 @@ func (u *User) onlineStatusCheck() {
 	}
 	u.Debug("检查到需要矫正的在线数量-->", zap.Int("onlineStatusResps", len(onlineStatusResps)))
 
-	if len(onlines) > 0 {
-		for _, online := range onlines {
-			var exist bool
-			for _, onlineStatusResp := range onlineStatusResps {
-				if online.UID == onlineStatusResp.UID && onlineStatusResp.DeviceFlag == online.DeviceFlag {
-					exist = true
-					break
-				}
-			}
-			if !exist {
-				makeOfflines = append(makeOfflines, online)
-			}
+	// 使用集合比较，避免原先候选设备数 × IM返回设备数的双重循环。
+	actualOnlineSet := make(map[string]struct{}, len(onlineStatusResps))
+	for _, onlineStatusResp := range onlineStatusResps {
+		key := onlineStatusDeviceKey(onlineStatusResp.UID, onlineStatusResp.DeviceFlag)
+		actualOnlineSet[key] = struct{}{}
+	}
+
+	makeOfflines := make([]*onlineStatusModel, 0, len(onlines))
+	for _, online := range onlines {
+		if online == nil {
+			continue
+		}
+		if _, ok := actualOnlineSet[onlineStatusDeviceKey(online.UID, online.DeviceFlag)]; !ok {
+			makeOfflines = append(makeOfflines, online)
 		}
 	}
+
 	if len(makeOfflines) > 0 {
 		u.Debug("改变在线状态！", zap.Int("offlineCount", len(makeOfflines)))
 		tx, err := u.ctx.DB().Begin()
@@ -183,14 +268,18 @@ func (u *User) onlineStatusCheck() {
 				panic(err)
 			}
 		}()
-		for _, onlineStatusResp := range makeOfflines {
+
+		now := time.Now()
+		nowUnix := int(now.Unix())
+		versionBase := now.UnixNano() / 1000
+		for index, onlineStatusResp := range makeOfflines {
 			err := u.onlineDB.insertOrUpdateUserOnlineTx(&onlineStatusModel{
 				UID:         onlineStatusResp.UID,
 				DeviceFlag:  onlineStatusResp.DeviceFlag,
-				LastOffline: int(time.Now().Unix()),
-				LastOnline:  int(time.Now().Unix()),
+				LastOffline: nowUnix,
+				LastOnline:  nowUnix,
 				Online:      0,
-				Version:     time.Now().UnixNano() / 1000,
+				Version:     versionBase + int64(index),
 			}, tx)
 			if err != nil {
 				tx.Rollback()
@@ -205,6 +294,10 @@ func (u *User) onlineStatusCheck() {
 		}
 	}
 
+}
+
+func onlineStatusDeviceKey(uid string, deviceFlag uint8) string {
+	return fmt.Sprintf("%s:%d", uid, deviceFlag)
 }
 
 type onlineFriendAndDeviceResp struct {

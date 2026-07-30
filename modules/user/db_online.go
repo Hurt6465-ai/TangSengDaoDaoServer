@@ -53,84 +53,105 @@ func (o *onlineDB) insertOrUpdateUserOnlineTx(m *onlineStatusModel, tx *dbr.Tx) 
 	return nil
 }
 
-// queryUserOnlineRecets 查询最近在线的用户(最近是指一小时内在线的,最多查询到1000条)
+// queryUserOnlineRecets 查询最近在线的用户（最近24小时离线或当前在线）。
+// 未返回的UID由API层明确补为离线，避免客户端保留旧状态。
 func (o *onlineDB) queryUserOnlineRecets(uids []string) ([]*onlineStatusWeightModel, error) {
 	if len(uids) == 0 {
-		return nil, nil
+		return make([]*onlineStatusWeightModel, 0), nil
 	}
-	var models []*onlineStatusWeightModel
-	_, err := o.session.Select("user_online.*,IFNULL(device_flag.weight,0) weight").From("user_online").LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").Where("user_online.uid in ? and ( unix_timestamp(now())-user_online.last_offline<3600*24 or user_online.online=1)", uids).OrderDir("user_online.online", false).OrderDir("user_online.last_offline", false).Load(&models)
-	onlineStatusMap := map[string]*onlineStatusWeightModel{}
-	if len(models) > 0 {
-		for _, m := range models {
-			oldOnline := onlineStatusMap[m.UID]
-			if oldOnline == nil {
-				onlineStatusMap[m.UID] = m
-				continue
-			}
-			replace := false
-			if m.Online == 1 && oldOnline.Online == 0 {
-				replace = true
-			}
-			if m.Online == 1 && oldOnline.Online == 1 && m.Weight > oldOnline.Weight {
-				replace = true
-			}
-			if m.Online != 1 && oldOnline.Online != 1 && m.LastOffline > oldOnline.LastOffline {
-				replace = true
-			}
-			if replace {
-				onlineStatusMap[m.UID] = m
-			}
 
-		}
+	var models []*onlineStatusWeightModel
+	_, err := o.session.
+		Select("user_online.uid,user_online.device_flag,user_online.last_online,user_online.last_offline,user_online.online,IFNULL(device_flag.weight,0) weight").
+		From("user_online").
+		LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").
+		Where("user_online.uid in ? and (user_online.online=1 or user_online.last_offline>unix_timestamp(now())-?)", uids, int64((24 * time.Hour).Seconds())).
+		Load(&models)
+	if err != nil {
+		return nil, err
 	}
-	newModels := make([]*onlineStatusWeightModel, 0, len(onlineStatusMap))
-	for _, value := range onlineStatusMap {
-		newModels = append(newModels, value)
-	}
-	return newModels, err
+	return selectBestOnlineStatusByUID(models), nil
 }
 
 func (o *onlineDB) queryUserLastNewOnlines(uids []string) ([]*onlineStatusWeightModel, error) {
 	if len(uids) == 0 {
-		return nil, nil
+		return make([]*onlineStatusWeightModel, 0), nil
 	}
-	var models []*onlineStatusWeightModel
-	_, err := o.session.Select("user_online.*,IFNULL(device_flag.weight,0) weight").From("user_online").LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").Where("user_online.uid in ?", uids).OrderDir("user_online.online", false).OrderDir("user_online.last_offline", false).Load(&models)
-	onlineStatusMap := map[string]*onlineStatusWeightModel{}
-	if len(models) > 0 {
-		for _, m := range models {
-			oldOnline := onlineStatusMap[m.UID]
-			if oldOnline == nil {
-				onlineStatusMap[m.UID] = m
-				continue
-			}
-			replace := false
-			if m.Online == 1 && oldOnline.Online == 0 {
-				replace = true
-			}
-			if m.Online == 1 && oldOnline.Online == 1 && m.Weight > oldOnline.Weight {
-				replace = true
-			}
-			if m.Online != 1 && oldOnline.Online != 1 && m.LastOffline > oldOnline.LastOffline {
-				replace = true
-			}
-			if replace {
-				onlineStatusMap[m.UID] = m
-			}
 
+	var models []*onlineStatusWeightModel
+	_, err := o.session.
+		Select("user_online.uid,user_online.device_flag,user_online.last_online,user_online.last_offline,user_online.online,IFNULL(device_flag.weight,0) weight").
+		From("user_online").
+		LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").
+		Where("user_online.uid in ?", uids).
+		Load(&models)
+	if err != nil {
+		return nil, err
+	}
+	return selectBestOnlineStatusByUID(models), nil
+}
+
+// selectBestOnlineStatusByUID 为每个用户选择最适合客户端展示的一台设备：
+// 在线优先；多台在线时设备权重高者优先；全部离线时最近离线者优先。
+func selectBestOnlineStatusByUID(models []*onlineStatusWeightModel) []*onlineStatusWeightModel {
+	if len(models) == 0 {
+		return make([]*onlineStatusWeightModel, 0)
+	}
+
+	onlineStatusMap := make(map[string]*onlineStatusWeightModel, len(models))
+	uidOrder := make([]string, 0, len(models))
+	for _, model := range models {
+		if model == nil || model.UID == "" {
+			continue
+		}
+		oldOnline := onlineStatusMap[model.UID]
+		if oldOnline == nil {
+			onlineStatusMap[model.UID] = model
+			uidOrder = append(uidOrder, model.UID)
+			continue
+		}
+		if shouldReplaceOnlineStatus(oldOnline, model) {
+			onlineStatusMap[model.UID] = model
 		}
 	}
+
 	newModels := make([]*onlineStatusWeightModel, 0, len(onlineStatusMap))
-	for _, value := range onlineStatusMap {
-		newModels = append(newModels, value)
+	for _, uid := range uidOrder {
+		if model := onlineStatusMap[uid]; model != nil {
+			newModels = append(newModels, model)
+		}
 	}
-	return newModels, err
+	return newModels
+}
+
+func shouldReplaceOnlineStatus(current, candidate *onlineStatusWeightModel) bool {
+	if current == nil {
+		return true
+	}
+	if candidate == nil {
+		return false
+	}
+	if candidate.Online == 1 && current.Online == 0 {
+		return true
+	}
+	if candidate.Online == 0 && current.Online == 1 {
+		return false
+	}
+	if candidate.Online == 1 {
+		if candidate.Weight != current.Weight {
+			return candidate.Weight > current.Weight
+		}
+		return candidate.LastOnline > current.LastOnline
+	}
+	if candidate.LastOffline != current.LastOffline {
+		return candidate.LastOffline > current.LastOffline
+	}
+	return candidate.Weight > current.Weight
 }
 
 func (o *onlineDB) queryOnlinesMoreThan(t time.Duration, limit uint64) ([]*onlineStatusModel, error) {
 	var models []*onlineStatusModel
-	_, err := o.session.Select("*").From("user_online").Where("`online`=1 and unix_timestamp(now()) - last_online>?", t.Seconds()).Limit(limit).Load(&models)
+	_, err := o.session.Select("uid,device_flag,last_online,last_offline,online,version").From("user_online").Where("`online`=1 and last_online<?", time.Now().Add(-t).Unix()).OrderAsc("last_online").Limit(limit).Load(&models)
 	return models, err
 }
 
@@ -156,7 +177,7 @@ func (o *onlineDB) exist(uid string, deviceFlag uint8, online int) (bool, error)
 // 查询用户在线设备里最大权重的在线状态
 func (o *onlineDB) queryOnlineMaxWeightWithUID(uid string) (*onlineStatusModel, error) {
 	var onlineStatusModel *onlineStatusModel
-	_, err := o.session.Select("user_online.*").From("user_online").LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").Where("uid=? and online=1", uid).OrderDesc("device_flag.weight").Limit(1).Load(&onlineStatusModel)
+	_, err := o.session.Select("user_online.*").From("user_online").LeftJoin("device_flag", "user_online.device_flag=device_flag.device_flag").Where("user_online.uid=? and user_online.online=1", uid).OrderDesc("device_flag.weight").Limit(1).Load(&onlineStatusModel)
 	return onlineStatusModel, err
 }
 
