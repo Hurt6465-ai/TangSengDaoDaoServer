@@ -1,26 +1,18 @@
-# Chatrooms 模块
+# 开放式话题聊天室
 
-开放式话题聊天室：
+后端路由：
 
-- 发布话题：`POST /v1/chatrooms/create`
-- 话题列表：`GET /v1/chatrooms/list`
-- 进入房间：`POST /v1/chatrooms/enter`
-- 置顶/取消置顶：`POST /v1/chatrooms/pin`
-- 删除：`POST /v1/chatrooms/delete`
-- 消息回调更新最后回复：`POST /v1/chatrooms/message-hook`
+- 列表：`GET /v1/chatrooms/list?limit=30&cursor=...`
+- 创建：`POST /v1/chatrooms/create`，支持 `create_request_no` 幂等号
+- 进入并标记已读：`POST /v1/chatrooms/enter`
+- 再次标记已读：`POST /v1/chatrooms/read`（客户端离开聊天页或回到前台时调用）
+- 全局置顶：`POST /v1/chatrooms/pin`，仅管理员可用
+- 删除：`POST /v1/chatrooms/delete`，仅创建者或管理员可用
 
-不走普通 `group/create`，所以不会触发好友关系校验。
+最后回复、参与人数和过期时间由服务端真实 IM 消息监听更新。普通登录用户不再拥有可伪造回复数据的 `message-hook` 接口。
 
-房间底层仍用 WuKongIM group channel_type=2，但 channel datasource 由本模块优先处理。`internal/modules.go` 里 `chatrooms` 必须位于 `group` 之前。
+房间默认在最后一条回复后 3 小时过期。清理任务每分钟运行，使用 Redis 分布式锁防止多实例重复清理。
 
-过期规则：
+标签统一使用：练口语、找搭子、工作、影视、游戏、学习、交友、闲谈。历史“音乐”标签由迁移自动转换为“游戏”。
 
-- 没回复：`created_at + 3h` 过期
-- 有回复：每次消息回调更新 `expire_at = last_reply_at + 3h`
-
-卡片数据：
-
-- 发布者大头像：`creator_avatar`
-- 最后 6 个去重回复者：`reply_users`
-- 最后一条预览：`last_reply_name + last_reply_text`
-- 热议：`hot/hot_until`
+二次复查补充：发送者自己的消息会同步推进 last_read_at；过期清理保留 10 秒合并缓冲，避免临界消息尚未落库就先删除房间。

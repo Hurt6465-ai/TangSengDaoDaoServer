@@ -34,12 +34,12 @@ func (d *db) create(room *TopicRoom) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 	_, err = tx.InsertInto("topic_rooms").Columns(
-		"room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+		"room_id", "create_request_no", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json",
 		"pinned", "hot", "hot_until", "status", "created_at", "expire_at",
 	).Values(
-		room.RoomID, room.Title, room.Tag, room.Language, room.BackgroundURL, room.BackgroundIndex, room.ChannelID, room.ChannelType,
+		room.RoomID, nullableString(room.CreateRequestNo), room.Title, room.Tag, room.Language, room.BackgroundURL, room.BackgroundIndex, room.ChannelID, room.ChannelType,
 		room.CreatorUID, room.CreatorName, room.CreatorAvatar, room.LastReplyUID, room.LastReplyName, room.LastReplyAvatar,
 		room.LastReplyText, room.LastReplyType, room.LastReplyAt, room.ReplyCount, room.ParticipantCount, string(users),
 		room.Pinned, room.Hot, room.HotUntil, 1, room.CreatedAt, room.ExpireAt,
@@ -51,6 +51,9 @@ func (d *db) create(room *TopicRoom) error {
 		return err
 	}
 	if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, room.CreatorUID, room.CreatorName, room.CreatorAvatar, 1, false); err != nil {
+		return err
+	}
+	if err = d.markReadTx(tx, room.RoomID, room.CreatorUID, room.CreatedAt); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -127,6 +130,48 @@ func (d *db) addMemberTx(tx *dbr.Tx, roomID, channelID, uid, name, avatar string
 	return err
 }
 
+func (d *db) markRead(roomID, uid string, readAt int64) error {
+	if roomID == "" || uid == "" {
+		return nil
+	}
+	if readAt <= 0 {
+		readAt = time.Now().UnixMilli()
+	}
+	result, err := d.session.Update("topic_room_members").
+		Set("last_read_at", dbr.Expr("GREATEST(last_read_at, ?)", readAt)).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("room_id=? AND uid=?", roomID, uid).
+		Exec()
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		var count int
+		if err := d.session.Select("count(*)").From("topic_room_members").Where("room_id=? AND uid=?", roomID, uid).LoadOne(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
+func (d *db) markReadTx(tx *dbr.Tx, roomID, uid string, readAt int64) error {
+	if roomID == "" || uid == "" {
+		return nil
+	}
+	if readAt <= 0 {
+		readAt = time.Now().UnixMilli()
+	}
+	_, err := tx.Update("topic_room_members").
+		Set("last_read_at", dbr.Expr("GREATEST(last_read_at, ?)", readAt)).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("room_id=? AND uid=?", roomID, uid).
+		Exec()
+	return err
+}
+
 func (d *db) memberUIDs(channelID string) ([]string, error) {
 	var uids []string
 	_, err := d.session.Select("uid").From("topic_room_members").Where("channel_id=?", channelID).OrderBy("updated_at DESC").Load(&uids)
@@ -144,7 +189,7 @@ func (d *db) list(loginUID string, req RoomListReq) ([]*TopicRoom, string, int, 
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").
-		Where("status=1")
+		Where("status=1 AND expire_at>?", now)
 
 	if cursor, ok := parseRoomListCursor(req.Cursor); ok {
 		q = q.Where(`(pinned < ?
@@ -175,6 +220,7 @@ func (d *db) list(loginUID string, req RoomListReq) ([]*TopicRoom, string, int, 
 	}
 	for _, r := range rooms {
 		decodeReplyUsers(r)
+		r.Tag = normalizeRoomTag(r.Tag)
 	}
 	d.enrichRoomsUserCountries(rooms)
 	if loginUID != "" {
@@ -204,7 +250,82 @@ func (d *db) get(roomID string) (*TopicRoom, error) {
 		return nil, ErrNotFound
 	}
 	decodeReplyUsers(rooms[0])
+	rooms[0].Tag = normalizeRoomTag(rooms[0].Tag)
 	d.enrichRoomUserCountries(rooms[0])
+	return rooms[0], nil
+}
+
+func (d *db) getActiveRoomRaw(roomID string) (*TopicRoom, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return nil, ErrNotFound
+	}
+	rooms := make([]*TopicRoom, 0, 1)
+	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
+		From("topic_rooms").
+		Where("status=1 AND expire_at>? AND (room_id=? OR channel_id=?)", time.Now().UnixMilli(), roomID, roomID).
+		Limit(1).
+		Load(&rooms)
+	if err != nil {
+		return nil, err
+	}
+	if len(rooms) == 0 {
+		return nil, ErrNotFound
+	}
+	decodeReplyUsers(rooms[0])
+	rooms[0].Tag = normalizeRoomTag(rooms[0].Tag)
+	return rooms[0], nil
+}
+
+func (d *db) getByCreateRequest(creatorUID, requestNo string) (*TopicRoom, error) {
+	creatorUID = strings.TrimSpace(creatorUID)
+	requestNo = strings.TrimSpace(requestNo)
+	if creatorUID == "" || requestNo == "" {
+		return nil, ErrNotFound
+	}
+	rooms := make([]*TopicRoom, 0, 1)
+	_, err := d.session.Select("room_id", "create_request_no", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
+		From("topic_rooms").
+		Where("creator_uid=? AND create_request_no=?", creatorUID, requestNo).
+		Limit(1).
+		Load(&rooms)
+	if err != nil {
+		return nil, err
+	}
+	if len(rooms) == 0 {
+		return nil, ErrNotFound
+	}
+	decodeReplyUsers(rooms[0])
+	rooms[0].Tag = normalizeRoomTag(rooms[0].Tag)
+	d.enrichRoomUserCountries(rooms[0])
+	return rooms[0], nil
+}
+
+func (d *db) getAny(roomID string) (*TopicRoom, error) {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return nil, ErrNotFound
+	}
+	rooms := make([]*TopicRoom, 0, 1)
+	_, err := d.session.Select("room_id", "create_request_no", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
+		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
+		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
+		From("topic_rooms").
+		Where("room_id=? OR channel_id=?", roomID, roomID).
+		Limit(1).
+		Load(&rooms)
+	if err != nil {
+		return nil, err
+	}
+	if len(rooms) == 0 {
+		return nil, ErrNotFound
+	}
+	decodeReplyUsers(rooms[0])
+	rooms[0].Tag = normalizeRoomTag(rooms[0].Tag)
 	return rooms[0], nil
 }
 
@@ -213,7 +334,7 @@ func (d *db) isTopicChannel(channelID string) bool {
 		return false
 	}
 	var count int
-	err := d.session.Select("count(*)").From("topic_rooms").Where("status=1 AND channel_id=?", channelID).LoadOne(&count)
+	err := d.session.Select("count(*)").From("topic_rooms").Where("status=1 AND expire_at>? AND channel_id=?", time.Now().UnixMilli(), channelID).LoadOne(&count)
 	return err == nil && count > 0
 }
 
@@ -221,48 +342,124 @@ func (d *db) updatePin(roomID string, pinned int) (*TopicRoom, error) {
 	if pinned != 0 {
 		pinned = 1
 	}
-	_, err := d.session.Update("topic_rooms").Set("pinned", pinned).Set("updated_at", dbr.Expr("NOW()")).Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).Exec()
+	result, err := d.session.Update("topic_rooms").
+		Set("pinned", pinned).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("status=1 AND expire_at>? AND (room_id=? OR channel_id=?)", time.Now().UnixMilli(), roomID, roomID).
+		Exec()
 	if err != nil {
 		return nil, err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		room, getErr := d.get(roomID)
+		if getErr != nil {
+			return nil, getErr
+		}
+		return room, nil
 	}
 	return d.get(roomID)
 }
 
-func (d *db) softDelete(roomID string) error {
-	room, _ := d.get(roomID)
-	channelID := roomID
-	if room != nil && room.ChannelID != "" {
-		channelID = room.ChannelID
+func (d *db) deleteFailedCreate(roomID string) error {
+	room, err := d.getAny(roomID)
+	if err != nil {
+		return err
 	}
 	tx, err := d.session.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.RollbackUnlessCommitted()
-	if _, err = tx.Update("topic_rooms").Set("status", 0).Set("updated_at", dbr.Expr("NOW()")).Where("room_id=? OR channel_id=?", roomID, roomID).Exec(); err != nil {
+	if _, err = tx.DeleteFrom("topic_room_members").Where("room_id=?", room.RoomID).Exec(); err != nil {
 		return err
 	}
-	// 解散原生群并删除成员。客户端下一次同步会话时不再把该公开话题当成有效群。
-	_, _ = tx.Update("group_member").Set("is_deleted", 1).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
-	_, _ = tx.Update("group").Set("status", 2).Set("updated_at", dbr.Expr("NOW()")).Where("group_no=?", channelID).Exec()
+	if _, err = tx.DeleteFrom("topic_rooms").Where("room_id=?", room.RoomID).Exec(); err != nil {
+		return err
+	}
+	if _, err = tx.Update("group_member").
+		Set("is_deleted", 1).
+		Set("status", 0).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("group_no=?", room.ChannelID).
+		Exec(); err != nil {
+		return err
+	}
+	if _, err = tx.Update("group").
+		Set("status", 2).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("group_no=?", room.ChannelID).
+		Exec(); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
-func (d *db) updateLastReply(roomID string, update *MessageWebhookReq) (*TopicRoom, error) {
-	return d.updateLastReplyWithCount(roomID, update, 1)
+func (d *db) softDelete(roomID string) error {
+	room, err := d.getAny(roomID)
+	if err != nil {
+		return err
+	}
+	channelID := room.ChannelID
+	if channelID == "" {
+		channelID = roomID
+	}
+
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	result, err := tx.Update("topic_rooms").
+		Set("status", 0).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).
+		Exec()
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrNotFound
+	}
+	if _, err = tx.Update("group_member").
+		Set("is_deleted", 1).
+		Set("status", 0).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("group_no=?", channelID).
+		Exec(); err != nil {
+		return err
+	}
+	if _, err = tx.Update("group").
+		Set("status", 2).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("group_no=?", channelID).
+		Exec(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (d *db) updateLastReplyWithCount(roomID string, update *MessageWebhookReq, increment int) (*TopicRoom, error) {
+func (d *db) updateLastReplyBatch(roomID string, update *MessageWebhookReq, increment int, participants []*MessageWebhookReq, ttl time.Duration) (*TopicRoom, error) {
+	if update == nil {
+		return nil, errors.New("最后回复数据为空")
+	}
 	if increment <= 0 {
 		increment = 1
 	}
-	room, err := d.get(roomID)
+	room, err := d.getActiveRoomRaw(roomID)
 	if err != nil {
 		return nil, err
 	}
+
 	ts := update.CreatedAt
 	if ts <= 0 {
 		ts = time.Now().UnixMilli()
+	}
+	if ts > room.ExpireAt {
+		return nil, ErrRoomExpired
+	}
+	if ttl <= 0 {
+		ttl = DefaultTTL
 	}
 	text := strings.TrimSpace(update.Text)
 	if text == "" {
@@ -271,54 +468,93 @@ func (d *db) updateLastReplyWithCount(roomID string, update *MessageWebhookReq, 
 	if text == "" {
 		text = previewText(update.MessageType)
 	}
-	fromCountryCode := strings.TrimSpace(update.FromCountryCode)
-	fromCountry := strings.TrimSpace(update.FromCountry)
-	if update.FromUID != "" {
-		if update.FromName == "" || update.FromAvatar == "" || fromCountryCode == "" || fromCountry == "" {
-			if userMeta, err := d.queryUserMeta(update.FromUID); err == nil {
-				if update.FromName == "" {
-					update.FromName = userMeta.Name
-				}
-				if update.FromAvatar == "" {
-					update.FromAvatar = userMeta.Avatar
-				}
-				if fromCountryCode == "" {
-					fromCountryCode = userMeta.CountryCode
-				}
-				if fromCountry == "" {
-					fromCountry = userMeta.Country
-				}
-			}
-		}
-		_ = d.addMemberToRoom(room, update.FromUID, update.FromName, update.FromAvatar)
+	messageType := strings.TrimSpace(update.MessageType)
+	if messageType == "" {
+		messageType = "message"
 	}
-	users := dedupReplyUsers("", append([]ReplyAvatar{{UID: update.FromUID, Name: update.FromName, Avatar: update.FromAvatar, CountryCode: fromCountryCode, Country: fromCountry}}, room.ReplyUsers...), DefaultMaxReplyAvatars)
-	usersJSON, _ := json.Marshal(users)
-	expireAt := ts + int64(DefaultTTL/time.Millisecond)
-	hotUntil := ts + int64(10*time.Minute/time.Millisecond)
-	_, err = d.session.Update("topic_rooms").
-		Set("last_reply_uid", update.FromUID).
-		Set("last_reply_name", update.FromName).
-		Set("last_reply_avatar", update.FromAvatar).
-		Set("last_reply_text", text).
-		Set("last_reply_type", update.MessageType).
-		Set("last_reply_at", ts).
-		Set("reply_count", dbr.Expr("reply_count+?", increment)).
-		Set("reply_users_json", string(usersJSON)).
-		Set("expire_at", expireAt).
-		Set("hot", dbr.Expr("IF(reply_count+?>=10,1,hot)", increment)).
-		Set("hot_until", dbr.Expr("IF(reply_count+?>=10,?,hot_until)", increment, hotUntil)).
-		Set("updated_at", dbr.Expr("NOW()")).
-		Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).Exec()
+
+	tx, err := d.session.Begin()
 	if err != nil {
 		return nil, err
 	}
-	return d.get(roomID)
+	defer tx.RollbackUnlessCommitted()
+
+	participantAvatars := make([]ReplyAvatar, 0, len(participants))
+	seenParticipants := make(map[string]struct{}, len(participants))
+	for _, participant := range participants {
+		if participant == nil {
+			continue
+		}
+		uid := strings.TrimSpace(participant.FromUID)
+		if uid == "" {
+			continue
+		}
+		if _, exists := seenParticipants[uid]; exists {
+			continue
+		}
+		seenParticipants[uid] = struct{}{}
+		name := strings.TrimSpace(participant.FromName)
+		avatar := strings.TrimSpace(participant.FromAvatar)
+		if avatar == "" {
+			avatar = fmt.Sprintf("users/%s/avatar", uid)
+		}
+		role := 0
+		if uid == room.CreatorUID {
+			role = 1
+		}
+		if err = d.addMemberTx(tx, room.RoomID, room.ChannelID, uid, name, avatar, role, true); err != nil {
+			return nil, err
+		}
+		if err = d.markReadTx(tx, room.RoomID, uid, participant.CreatedAt); err != nil {
+			return nil, err
+		}
+		participantAvatars = append(participantAvatars, ReplyAvatar{
+			UID:         uid,
+			Name:        name,
+			Avatar:      avatar,
+			CountryCode: strings.TrimSpace(participant.FromCountryCode),
+			Country:     strings.TrimSpace(participant.FromCountry),
+		})
+	}
+
+	users := dedupReplyUsers(room.CreatorUID, append(participantAvatars, room.ReplyUsers...), DefaultMaxReplyAvatars)
+	usersJSON, err := json.Marshal(users)
+	if err != nil {
+		return nil, err
+	}
+	expireAt := ts + int64(ttl/time.Millisecond)
+	hotUntil := ts + int64(10*time.Minute/time.Millisecond)
+
+	result, err := tx.Update("topic_rooms").
+		Set("last_reply_uid", dbr.Expr("IF(last_reply_at<=?, ?, last_reply_uid)", ts, update.FromUID)).
+		Set("last_reply_name", dbr.Expr("IF(last_reply_at<=?, ?, last_reply_name)", ts, update.FromName)).
+		Set("last_reply_avatar", dbr.Expr("IF(last_reply_at<=?, ?, last_reply_avatar)", ts, update.FromAvatar)).
+		Set("last_reply_text", dbr.Expr("IF(last_reply_at<=?, ?, last_reply_text)", ts, text)).
+		Set("last_reply_type", dbr.Expr("IF(last_reply_at<=?, ?, last_reply_type)", ts, messageType)).
+		Set("last_reply_at", dbr.Expr("GREATEST(last_reply_at, ?)", ts)).
+		Set("reply_count", dbr.Expr("reply_count+?", increment)).
+		Set("reply_users_json", string(usersJSON)).
+		Set("expire_at", dbr.Expr("GREATEST(expire_at, ?)", expireAt)).
+		Set("hot", dbr.Expr("IF(reply_count+?>=10,1,hot)", increment)).
+		Set("hot_until", dbr.Expr("IF(reply_count+?>=10,GREATEST(hot_until,?),hot_until)", increment, hotUntil)).
+		Set("updated_at", dbr.Expr("NOW()")).
+		Where("status=1 AND expire_at>=? AND (room_id=? OR channel_id=?)", ts, roomID, roomID).
+		Exec()
+	if err != nil {
+		return nil, err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return nil, ErrRoomExpired
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return room, nil
 }
 
 func (d *db) expired(now int64, limit uint64) ([]*TopicRoom, error) {
 	rooms := make([]*TopicRoom, 0)
-	_, err := d.session.Select("room_id", "title", "channel_id", "channel_type").From("topic_rooms").Where("status=1 AND expire_at<=?", now).Limit(limit).Load(&rooms)
+	_, err := d.session.Select("room_id", "title", "channel_id", "channel_type", "creator_uid").From("topic_rooms").Where("status=1 AND expire_at<=?", now).OrderBy("expire_at ASC").Limit(limit).Load(&rooms)
 	return rooms, err
 }
 
@@ -359,6 +595,59 @@ func (d *db) queryUserMeta(uid string) (UserMeta, error) {
 		meta.Name = rows[0].Name
 	}
 	return meta, nil
+}
+
+func (d *db) queryUserMetas(uids []string) (map[string]UserMeta, error) {
+	uids = compactUIDsForDB(uids)
+	result := make(map[string]UserMeta, len(uids))
+	for _, uid := range uids {
+		result[uid] = UserMeta{UID: uid, Avatar: fmt.Sprintf("users/%s/avatar", uid)}
+	}
+	if len(uids) == 0 {
+		return result, nil
+	}
+
+	const batchSize = 500
+	for start := 0; start < len(uids); start += batchSize {
+		end := start + batchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		batch := uids[start:end]
+		if d.hasUserCountryColumns() {
+			rows := make([]*struct {
+				UID         string `db:"uid"`
+				Name        string `db:"name"`
+				CountryCode string `db:"country_code"`
+				Country     string `db:"country"`
+			}, 0, len(batch))
+			if _, err := d.session.Select("uid", "name", "country_code", "country").From("user").Where("uid in ?", batch).Load(&rows); err != nil {
+				return nil, err
+			}
+			for _, row := range rows {
+				result[row.UID] = UserMeta{
+					UID:         row.UID,
+					Name:        row.Name,
+					Avatar:      fmt.Sprintf("users/%s/avatar", row.UID),
+					CountryCode: row.CountryCode,
+					Country:     row.Country,
+				}
+			}
+			continue
+		}
+
+		rows := make([]*struct {
+			UID  string `db:"uid"`
+			Name string `db:"name"`
+		}, 0, len(batch))
+		if _, err := d.session.Select("uid", "name").From("user").Where("uid in ?", batch).Load(&rows); err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			result[row.UID] = UserMeta{UID: row.UID, Name: row.Name, Avatar: fmt.Sprintf("users/%s/avatar", row.UID)}
+		}
+	}
+	return result, nil
 }
 
 func (d *db) enrichRoomUserCountries(r *TopicRoom) {
@@ -590,6 +879,9 @@ func dedupReplyUsers(creatorUID string, in []ReplyAvatar, max int) []ReplyAvatar
 	seen := map[string]struct{}{}
 	out := make([]ReplyAvatar, 0, max)
 	for _, u := range in {
+		if creatorUID != "" && u.UID == creatorUID {
+			continue
+		}
 		key := u.UID
 		if key == "" {
 			key = u.Avatar
@@ -607,6 +899,14 @@ func dedupReplyUsers(creatorUID string, in []ReplyAvatar, max int) []ReplyAvatar
 		}
 	}
 	return out
+}
+
+func nullableString(value string) interface{} {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func previewText(t string) string {

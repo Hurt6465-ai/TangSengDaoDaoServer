@@ -1,16 +1,25 @@
 package chatrooms
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServer/pkg/util"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
-	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
+	"go.uber.org/zap"
+)
+
+var (
+	ErrPermissionDenied = errors.New("该用户无权执行此操作")
+	ErrRoomExpired      = errors.New("该话题已结束")
 )
 
 type Service struct {
@@ -21,11 +30,16 @@ type Service struct {
 	topicChannelCache map[string]topicChannelCacheItem
 	lastReplyMu       sync.Mutex
 	lastReplyPending  map[string]*lastReplyFlushItem
+	recentMessageIDs  map[string]int64
+	flushStartOnce    sync.Once
+	workerWG          sync.WaitGroup
+	deleteNotifySem   chan struct{}
 }
 
 type lastReplyFlushItem struct {
-	Req   *MessageWebhookReq
-	Count int
+	Latest       *MessageWebhookReq
+	Count        int
+	Participants map[string]*MessageWebhookReq
 }
 
 type topicChannelCacheItem struct {
@@ -35,37 +49,90 @@ type topicChannelCacheItem struct {
 
 const (
 	topicChannelCacheTTL             = 5 * time.Minute
+	topicChannelCacheMaxEntries      = 4096
 	topicLastReplyFlushInterval      = 3 * time.Second
+	topicLastReplyFlushRetries       = 3
+	topicRecentMessageIDTTL          = 10 * time.Minute
+	topicRecentMessageIDMaxEntries   = 20000
 	topicRoomDeletedNotifyBatchSize  = 100
 	topicRoomDeletedNotifyBatchSleep = 30 * time.Millisecond
+	topicRoomCleanupGrace            = 10 * time.Second
+	topicRoomDeleteNotifyConcurrency = 8
 )
 
 func NewService(ctx *config.Context) *Service {
-	svc := &Service{ctx: ctx, db: newDB(ctx), TTL: DefaultTTL, topicChannelCache: map[string]topicChannelCacheItem{}, lastReplyPending: map[string]*lastReplyFlushItem{}}
-	// 事件驱动更新：避免话题有回复但 expire_at 不续期，导致“正在聊的话题 3 小时后消失”。
+	svc := &Service{
+		ctx:               ctx,
+		db:                newDB(ctx),
+		TTL:               DefaultTTL,
+		topicChannelCache: map[string]topicChannelCacheItem{},
+		lastReplyPending:  map[string]*lastReplyFlushItem{},
+		recentMessageIDs:  map[string]int64{},
+		deleteNotifySem:   make(chan struct{}, topicRoomDeleteNotifyConcurrency),
+	}
 	ctx.AddMessagesListener(svc.listenerMessages)
-	svc.startLastReplyFlushLoop()
 	return svc
 }
 
-func (s *Service) List(uid string, req RoomListReq) ([]*TopicRoom, string, int, error) {
-	return s.db.list(uid, req)
+func (s *Service) Start(ctx context.Context) {
+	s.flushStartOnce.Do(func() {
+		s.startLastReplyFlushLoop(ctx)
+	})
 }
 
-func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
+func (s *Service) WaitWorkers() {
+	s.workerWG.Wait()
+}
+
+func (s *Service) List(uid string, isAdmin bool, req RoomListReq) ([]*TopicRoom, string, int, error) {
+	rooms, cursor, hasMore, err := s.db.list(uid, req)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	for _, room := range rooms {
+		s.prepareRoomForResponse(room, uid, isAdmin)
+	}
+	return rooms, cursor, hasMore, nil
+}
+
+func (s *Service) Create(req CreateReq, loginUID string, isAdmin bool) (*TopicRoom, error) {
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
 		return nil, errors.New("话题名不能为空")
 	}
+	if len([]rune(title)) > MaxRoomTitleLength {
+		return nil, errors.New("话题名过长")
+	}
 	if loginUID == "" {
 		return nil, errors.New("未登录")
 	}
-	if req.Tag == "" {
-		req.Tag = "闲谈"
+
+	language := strings.TrimSpace(req.Language)
+	if len([]rune(language)) > MaxRoomLanguageLength {
+		return nil, errors.New("语言字段过长")
 	}
-	if req.Language == "" {
-		req.Language = "中文"
+
+	requestNo := strings.TrimSpace(req.CreateRequestNo)
+	if len(requestNo) > MaxCreateRequestLength {
+		return nil, errors.New("create_request_no过长")
 	}
+	if requestNo != "" {
+		existing, err := s.db.getByCreateRequest(loginUID, requestNo)
+		if err == nil && existing != nil {
+			if existing.Status != 1 || existing.ExpireAt <= time.Now().UnixMilli() {
+				return nil, ErrRoomExpired
+			}
+			if err := s.syncIMChannelWithStoredMembers(existing); err != nil {
+				return nil, err
+			}
+			s.prepareRoomForResponse(existing, loginUID, isAdmin)
+			return existing, nil
+		}
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
+
 	user, err := s.db.queryUserMeta(loginUID)
 	if err != nil {
 		return nil, err
@@ -73,14 +140,16 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 	if user.UID == "" {
 		user.UID = loginUID
 	}
+
 	ts := time.Now().UnixMilli()
-	roomID := fmt.Sprintf("topic_%d", time.Now().UnixNano())
+	roomID := "topic_" + util.GenerUUID()
 	room := &TopicRoom{
 		RoomID:             roomID,
+		CreateRequestNo:    requestNo,
 		Title:              title,
-		Tag:                req.Tag,
-		Language:           req.Language,
-		BackgroundIndex:    int(ts%12) + 1,
+		Tag:                normalizeRoomTag(req.Tag),
+		Language:           language,
+		BackgroundIndex:    int(ts%20) + 1,
 		ChannelID:          roomID,
 		ChannelType:        ChannelTypeGroup,
 		CreatorUID:         user.UID,
@@ -93,111 +162,182 @@ func (s *Service) Create(req CreateReq, loginUID string) (*TopicRoom, error) {
 		CreatedAt:          ts,
 		ExpireAt:           ts + int64(s.ttl()/time.Millisecond),
 	}
+	if room.Language == "" {
+		room.Language = "中文"
+	}
+
 	if err := s.db.create(room); err != nil {
+		if requestNo != "" {
+			if existing, queryErr := s.db.getByCreateRequest(loginUID, requestNo); queryErr == nil && existing != nil {
+				if existing.Status != 1 || existing.ExpireAt <= time.Now().UnixMilli() {
+					return nil, ErrRoomExpired
+				}
+				if err := s.syncIMChannelWithStoredMembers(existing); err != nil {
+					return nil, err
+				}
+				s.prepareRoomForResponse(existing, loginUID, isAdmin)
+				return existing, nil
+			}
+		}
 		return nil, err
 	}
+
 	s.setTopicChannelCache(room.ChannelID, true)
 	if err := s.syncIMChannel(room, []string{room.CreatorUID}); err != nil {
-		_ = s.db.softDelete(room.RoomID)
+		s.setTopicChannelCache(room.ChannelID, false)
+		if cleanupErr := s.db.deleteFailedCreate(room.RoomID); cleanupErr != nil {
+			log.Error("回滚创建失败的话题聊天室失败", zap.Error(cleanupErr), zap.String("room_id", room.RoomID))
+		}
+		if deleteErr := s.deleteIMChannel(room.ChannelID); deleteErr != nil {
+			log.Error("回滚创建失败的话题IM频道失败", zap.Error(deleteErr), zap.String("channel_id", room.ChannelID))
+		}
 		return nil, err
 	}
-	_ = s.refreshGroupAvatar(room.ChannelID, []string{room.CreatorUID})
+
+	s.prepareRoomForResponse(room, loginUID, isAdmin)
 	return room, nil
 }
 
-func (s *Service) Enter(req RoomReq, uid string) (*TopicRoom, error) {
-	roomID := req.RoomID
+func (s *Service) Enter(req RoomReq, uid string, isAdmin bool) (*TopicRoom, error) {
+	roomID := roomIDFromReq(req)
 	if roomID == "" {
-		roomID = req.ChannelID
+		return nil, ErrNotFound
 	}
+	if uid == "" {
+		return nil, errors.New("未登录")
+	}
+
 	room, err := s.db.get(roomID)
 	if err != nil {
 		return nil, err
 	}
 	s.setTopicChannelCache(room.ChannelID, true)
-	if uid != "" {
-		user, _ := s.db.queryUserMeta(uid)
-		if err := s.db.addMemberToRoom(room, uid, user.Name, user.Avatar); err != nil {
-			return nil, err
-		}
 
-		// 进公开话题房只增量添加当前用户。不要每次拉全量成员再 syncIMChannel，
-		// 否则房间人数上来后，每进一人都会变成一次大查询 + 大订阅同步。
-		if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
-			return nil, err
-		}
-		_ = s.refreshGroupAvatar(room.ChannelID, topicRoomAvatarSeedUIDs(room, uid))
+	user, err := s.db.queryUserMeta(uid)
+	if err != nil {
+		return nil, err
 	}
+	if user.UID == "" {
+		user.UID = uid
+	}
+	if err := s.db.addMemberToRoom(room, uid, user.Name, user.Avatar); err != nil {
+		return nil, err
+	}
+
+	// 外部 IM 写入失败时保留数据库成员记录；客户端重试 Enter 是幂等的，
+	// 会再次补加订阅者，避免回滚数据库后又与已经成功的 IM 写入产生反向不一致。
+	if err := s.addIMSubscribers(room.ChannelID, []string{uid}); err != nil {
+		return nil, err
+	}
+	if err := s.db.markRead(room.RoomID, uid, time.Now().UnixMilli()); err != nil {
+		return nil, err
+	}
+
+	room, err = s.db.get(room.RoomID)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.db.loadUnread(room, uid)
+	s.prepareRoomForResponse(room, uid, isAdmin)
 	return room, nil
 }
 
-func (s *Service) Pin(req RoomReq) (*TopicRoom, error) {
-	roomID := req.RoomID
+func (s *Service) Read(req RoomReq, uid string, isAdmin bool) (*TopicRoom, error) {
+	roomID := roomIDFromReq(req)
 	if roomID == "" {
-		roomID = req.ChannelID
+		return nil, ErrNotFound
 	}
-	return s.db.updatePin(roomID, req.Pinned)
+	if uid == "" {
+		return nil, errors.New("未登录")
+	}
+	room, err := s.db.get(roomID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.db.markRead(room.RoomID, uid, time.Now().UnixMilli()); err != nil {
+		return nil, err
+	}
+	room.UnreadCount = 0
+	s.prepareRoomForResponse(room, uid, isAdmin)
+	return room, nil
 }
 
-func (s *Service) Delete(req RoomReq) error {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
+func (s *Service) Pin(req RoomReq, requesterUID string, isAdmin bool) (*TopicRoom, error) {
+	if !isAdmin {
+		return nil, ErrPermissionDenied
 	}
-	room, _ := s.db.get(roomID)
-	uids := s.topicRoomMemberUIDs(room)
-	if err := s.db.softDelete(roomID); err != nil {
+	roomID := roomIDFromReq(req)
+	if roomID == "" {
+		return nil, ErrNotFound
+	}
+	room, err := s.db.updatePin(roomID, req.Pinned)
+	if err != nil {
+		return nil, err
+	}
+	s.prepareRoomForResponse(room, requesterUID, isAdmin)
+	return room, nil
+}
+
+func (s *Service) Delete(req RoomReq, requesterUID string, isAdmin bool) error {
+	roomID := roomIDFromReq(req)
+	if roomID == "" {
+		return ErrNotFound
+	}
+	room, err := s.db.get(roomID)
+	if err != nil {
 		return err
 	}
-	if room != nil {
-		s.setTopicChannelCache(room.ChannelID, false)
-		s.notifyTopicRoomDeleted(room.ChannelID, uids, "deleted")
-		_ = s.deleteIMChannel(room.ChannelID)
+	if !isAdmin && requesterUID != room.CreatorUID {
+		return ErrPermissionDenied
+	}
+
+	uids := s.topicRoomMemberUIDs(room)
+	if err := s.db.softDelete(room.RoomID); err != nil {
+		return err
+	}
+	s.setTopicChannelCache(room.ChannelID, false)
+	s.notifyTopicRoomDeleted(room.ChannelID, uids, "deleted")
+	if err := s.deleteIMChannel(room.ChannelID); err != nil {
+		log.Error("删除话题IM频道失败", zap.Error(err), zap.String("channel_id", room.ChannelID))
 	}
 	return nil
 }
 
-func (s *Service) MessageWebhook(req *MessageWebhookReq) (*TopicRoom, error) {
-	roomID := req.RoomID
-	if roomID == "" {
-		roomID = req.ChannelID
-	}
-	if roomID == "" {
-		return nil, errors.New("缺少 room_id/channel_id")
-	}
-	s.queueLastReply(roomID, req)
-	return s.db.get(roomID)
-}
-
 func (s *Service) CleanupExpired(limit uint64) (int, error) {
 	if limit == 0 {
-		limit = 100
+		limit = 300
 	}
-	rooms, err := s.db.expired(time.Now().UnixMilli(), limit)
+	rooms, err := s.db.expired(time.Now().Add(-topicRoomCleanupGrace).UnixMilli(), limit)
 	if err != nil {
 		return 0, err
 	}
+
 	count := 0
 	for _, room := range rooms {
 		if room == nil {
 			continue
 		}
 		uids := s.topicRoomMemberUIDs(room)
-		if err := s.db.softDelete(room.RoomID); err == nil {
-			s.setTopicChannelCache(room.ChannelID, false)
-			s.notifyTopicRoomDeleted(room.ChannelID, uids, "expired")
-			_ = s.deleteIMChannel(room.ChannelID)
-			count++
+		if err := s.db.softDelete(room.RoomID); err != nil {
+			log.Error("软删除过期话题聊天室失败", zap.Error(err), zap.String("room_id", room.RoomID))
+			continue
 		}
+		s.setTopicChannelCache(room.ChannelID, false)
+		s.notifyTopicRoomDeleted(room.ChannelID, uids, "expired")
+		if err := s.deleteIMChannel(room.ChannelID); err != nil {
+			log.Error("删除过期话题IM频道失败", zap.Error(err), zap.String("channel_id", room.ChannelID))
+		}
+		count++
 	}
 	return count, nil
 }
 
 func (s *Service) IsTopicChannel(channelID string) bool {
 	channelID = strings.TrimSpace(channelID)
-	if channelID == "" {
+	if channelID == "" || !strings.HasPrefix(channelID, "topic_") {
 		return false
 	}
+
 	now := time.Now().UnixMilli()
 	s.topicChannelMu.RLock()
 	item, ok := s.topicChannelCache[channelID]
@@ -205,6 +345,7 @@ func (s *Service) IsTopicChannel(channelID string) bool {
 	if ok && item.ExpiresAt > now {
 		return item.OK
 	}
+
 	ok = s.db.isTopicChannel(channelID)
 	s.setTopicChannelCache(channelID, ok)
 	return ok
@@ -222,6 +363,7 @@ func (s *Service) ChannelGet(channelID string, loginUID string) (*TopicRoom, err
 	if loginUID != "" {
 		_ = s.db.loadUnread(room, loginUID)
 	}
+	s.prepareRoomForResponse(room, loginUID, false)
 	return room, nil
 }
 
@@ -229,6 +371,9 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 	if len(messages) == 0 {
 		return
 	}
+
+	validMessages := make([]*config.MessageResp, 0, len(messages))
+	uids := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		if msg == nil || msg.ChannelType != common.ChannelTypeGroup.Uint8() || msg.ChannelID == "" {
 			continue
@@ -236,16 +381,38 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if !s.IsTopicChannel(msg.ChannelID) {
 			continue
 		}
-		user, _ := s.db.queryUserMeta(msg.FromUID)
+		validMessages = append(validMessages, msg)
+		if msg.FromUID != "" {
+			uids = append(uids, msg.FromUID)
+		}
+	}
+	if len(validMessages) == 0 {
+		return
+	}
+
+	userMap, err := s.db.queryUserMetas(uids)
+	if err != nil {
+		log.Error("批量查询话题回复用户资料失败", zap.Error(err))
+		userMap = map[string]UserMeta{}
+	}
+
+	for _, msg := range validMessages {
+		user := userMap[msg.FromUID]
 		if user.UID == "" {
 			user.UID = msg.FromUID
+			user.Avatar = fmt.Sprintf("users/%s/avatar", msg.FromUID)
 		}
 		text, msgType := messagePreview(msg)
 		createdAt := int64(msg.Timestamp) * 1000
 		if createdAt <= 0 {
 			createdAt = time.Now().UnixMilli()
 		}
+		messageID := ""
+		if msg.MessageID > 0 {
+			messageID = strconv.FormatInt(msg.MessageID, 10)
+		}
 		s.queueLastReply(msg.ChannelID, &MessageWebhookReq{
+			MessageID:       messageID,
 			ChannelID:       msg.ChannelID,
 			FromUID:         user.UID,
 			FromName:        user.Name,
@@ -264,6 +431,7 @@ func messagePreview(msg *config.MessageResp) (string, string) {
 	if err != nil || payload == nil {
 		return "[消息]", "message"
 	}
+
 	msgType := "message"
 	if v, ok := payload["type"]; ok {
 		msgType = fmt.Sprint(v)
@@ -279,12 +447,20 @@ func messagePreview(msg *config.MessageResp) (string, string) {
 	return previewText(msgType), msgType
 }
 
-func (s *Service) startLastReplyFlushLoop() {
+func (s *Service) startLastReplyFlushLoop(ctx context.Context) {
+	s.workerWG.Add(1)
 	go func() {
+		defer s.workerWG.Done()
 		ticker := time.NewTicker(topicLastReplyFlushInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.flushPendingLastReplies()
+		for {
+			select {
+			case <-ctx.Done():
+				s.FlushPendingLastReplies()
+				return
+			case <-ticker.C:
+				s.FlushPendingLastReplies()
+			}
 		}
 	}()
 }
@@ -294,6 +470,7 @@ func (s *Service) queueLastReply(roomID string, req *MessageWebhookReq) {
 	if roomID == "" || req == nil {
 		return
 	}
+
 	cloned := *req
 	if cloned.RoomID == "" {
 		cloned.RoomID = roomID
@@ -301,31 +478,132 @@ func (s *Service) queueLastReply(roomID string, req *MessageWebhookReq) {
 	if cloned.ChannelID == "" {
 		cloned.ChannelID = roomID
 	}
+	if cloned.CreatedAt <= 0 {
+		cloned.CreatedAt = time.Now().UnixMilli()
+	}
+
+	participantKey := strings.TrimSpace(cloned.FromUID)
+	if participantKey == "" {
+		participantKey = strings.TrimSpace(cloned.FromAvatar)
+	}
+
 	s.lastReplyMu.Lock()
+	defer s.lastReplyMu.Unlock()
+
+	if cloned.MessageID != "" {
+		now := time.Now().UnixMilli()
+		messageKey := roomID + ":" + cloned.MessageID
+		if expiresAt := s.recentMessageIDs[messageKey]; expiresAt > now {
+			return
+		}
+		if s.recentMessageIDs == nil {
+			s.recentMessageIDs = map[string]int64{}
+		}
+		if len(s.recentMessageIDs) >= topicRecentMessageIDMaxEntries {
+			for key, expiresAt := range s.recentMessageIDs {
+				if expiresAt <= now || len(s.recentMessageIDs) >= topicRecentMessageIDMaxEntries {
+					delete(s.recentMessageIDs, key)
+				}
+				if len(s.recentMessageIDs) < topicRecentMessageIDMaxEntries {
+					break
+				}
+			}
+		}
+		s.recentMessageIDs[messageKey] = time.Now().Add(topicRecentMessageIDTTL).UnixMilli()
+	}
+
 	if s.lastReplyPending == nil {
 		s.lastReplyPending = map[string]*lastReplyFlushItem{}
 	}
 	item := s.lastReplyPending[roomID]
 	if item == nil {
-		s.lastReplyPending[roomID] = &lastReplyFlushItem{Req: &cloned, Count: 1}
-	} else {
-		item.Req = &cloned
-		item.Count++
+		item = &lastReplyFlushItem{Participants: map[string]*MessageWebhookReq{}}
+		s.lastReplyPending[roomID] = item
 	}
-	s.lastReplyMu.Unlock()
+	item.Count++
+	if item.Latest == nil || cloned.CreatedAt >= item.Latest.CreatedAt {
+		latest := cloned
+		item.Latest = &latest
+	}
+	if participantKey != "" {
+		old := item.Participants[participantKey]
+		if old == nil || cloned.CreatedAt >= old.CreatedAt {
+			participant := cloned
+			item.Participants[participantKey] = &participant
+		}
+	}
 }
 
-func (s *Service) flushPendingLastReplies() {
+func (s *Service) FlushPendingLastReplies() {
 	s.lastReplyMu.Lock()
 	pending := s.lastReplyPending
 	s.lastReplyPending = map[string]*lastReplyFlushItem{}
 	s.lastReplyMu.Unlock()
 
 	for roomID, item := range pending {
-		if item == nil || item.Req == nil {
+		if item == nil || item.Latest == nil || item.Count <= 0 {
 			continue
 		}
-		_, _ = s.db.updateLastReplyWithCount(roomID, item.Req, item.Count)
+		if err := s.flushLastReplyItem(roomID, item); err != nil {
+			log.Error("刷新话题最后回复失败，已重新入队", zap.Error(err), zap.String("room_id", roomID), zap.Int("count", item.Count))
+			s.requeueLastReplyItem(roomID, item)
+		}
+	}
+}
+
+func (s *Service) flushLastReplyItem(roomID string, item *lastReplyFlushItem) error {
+	participants := make([]*MessageWebhookReq, 0, len(item.Participants))
+	for _, participant := range item.Participants {
+		if participant != nil {
+			cloned := *participant
+			participants = append(participants, &cloned)
+		}
+	}
+	sort.SliceStable(participants, func(i, j int) bool {
+		return participants[i].CreatedAt > participants[j].CreatedAt
+	})
+
+	var err error
+	for attempt := 1; attempt <= topicLastReplyFlushRetries; attempt++ {
+		_, err = s.db.updateLastReplyBatch(roomID, item.Latest, item.Count, participants, s.ttl())
+		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrRoomExpired) {
+			return nil
+		}
+		if attempt < topicLastReplyFlushRetries {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+	}
+	return err
+}
+
+func (s *Service) requeueLastReplyItem(roomID string, failed *lastReplyFlushItem) {
+	if failed == nil || failed.Latest == nil || failed.Count <= 0 {
+		return
+	}
+	s.lastReplyMu.Lock()
+	defer s.lastReplyMu.Unlock()
+	if s.lastReplyPending == nil {
+		s.lastReplyPending = map[string]*lastReplyFlushItem{}
+	}
+	current := s.lastReplyPending[roomID]
+	if current == nil {
+		current = &lastReplyFlushItem{Participants: map[string]*MessageWebhookReq{}}
+		s.lastReplyPending[roomID] = current
+	}
+	current.Count += failed.Count
+	if current.Latest == nil || failed.Latest.CreatedAt >= current.Latest.CreatedAt {
+		cloned := *failed.Latest
+		current.Latest = &cloned
+	}
+	for key, participant := range failed.Participants {
+		if participant == nil {
+			continue
+		}
+		old := current.Participants[key]
+		if old == nil || participant.CreatedAt >= old.CreatedAt {
+			cloned := *participant
+			current.Participants[key] = &cloned
+		}
 	}
 }
 
@@ -334,34 +612,38 @@ func (s *Service) setTopicChannelCache(channelID string, ok bool) {
 	if channelID == "" {
 		return
 	}
+
+	now := time.Now().UnixMilli()
 	s.topicChannelMu.Lock()
+	defer s.topicChannelMu.Unlock()
 	if s.topicChannelCache == nil {
 		s.topicChannelCache = map[string]topicChannelCacheItem{}
 	}
-	s.topicChannelCache[channelID] = topicChannelCacheItem{OK: ok, ExpiresAt: time.Now().Add(topicChannelCacheTTL).UnixMilli()}
-	s.topicChannelMu.Unlock()
-}
-
-func topicRoomAvatarSeedUIDs(room *TopicRoom, enteringUID string) []string {
-	if room == nil {
-		return compactUIDs([]string{enteringUID})
-	}
-	uids := make([]string, 0, DefaultMaxReplyAvatars+3)
-	if enteringUID != "" {
-		uids = append(uids, enteringUID)
-	}
-	if room.CreatorUID != "" {
-		uids = append(uids, room.CreatorUID)
-	}
-	if room.LastReplyUID != "" {
-		uids = append(uids, room.LastReplyUID)
-	}
-	for _, u := range room.ReplyUsers {
-		if u.UID != "" {
-			uids = append(uids, u.UID)
+	if len(s.topicChannelCache) >= topicChannelCacheMaxEntries {
+		for key, item := range s.topicChannelCache {
+			if item.ExpiresAt <= now || len(s.topicChannelCache) >= topicChannelCacheMaxEntries {
+				delete(s.topicChannelCache, key)
+			}
+			if len(s.topicChannelCache) < topicChannelCacheMaxEntries {
+				break
+			}
 		}
 	}
-	return compactUIDs(uids)
+	s.topicChannelCache[channelID] = topicChannelCacheItem{OK: ok, ExpiresAt: time.Now().Add(topicChannelCacheTTL).UnixMilli()}
+}
+
+func (s *Service) syncIMChannelWithStoredMembers(room *TopicRoom) error {
+	if room == nil {
+		return nil
+	}
+	uids, err := s.db.memberUIDs(room.ChannelID)
+	if err != nil {
+		return err
+	}
+	if len(uids) == 0 && room.CreatorUID != "" {
+		uids = []string{room.CreatorUID}
+	}
+	return s.syncIMChannel(room, uids)
 }
 
 func (s *Service) syncIMChannel(room *TopicRoom, subscribers []string) error {
@@ -394,7 +676,10 @@ func (s *Service) topicRoomMemberUIDs(room *TopicRoom) []string {
 	if room == nil || room.ChannelID == "" {
 		return nil
 	}
-	uids, _ := s.db.memberUIDs(room.ChannelID)
+	uids, err := s.db.memberUIDs(room.ChannelID)
+	if err != nil {
+		log.Error("查询话题房成员失败", zap.Error(err), zap.String("channel_id", room.ChannelID))
+	}
 	if len(uids) == 0 && room.CreatorUID != "" {
 		uids = []string{room.CreatorUID}
 	}
@@ -414,12 +699,20 @@ func (s *Service) notifyTopicRoomDeleted(channelID string, subscribers []string,
 		reason = "deleted"
 	}
 	uidCopy := append([]string(nil), uids...)
-	go s.sendTopicRoomDeletedBatches(channelID, uidCopy, reason)
+	if s.deleteNotifySem != nil {
+		s.deleteNotifySem <- struct{}{}
+	}
+	go func() {
+		if s.deleteNotifySem != nil {
+			defer func() { <-s.deleteNotifySem }()
+		}
+		s.sendTopicRoomDeletedBatches(channelID, uidCopy, reason)
+	}()
 }
 
 func (s *Service) sendTopicRoomDeletedBatches(channelID string, uids []string, reason string) {
 	for i, uid := range uids {
-		_ = s.ctx.SendCMD(config.MsgCMDReq{
+		if err := s.ctx.SendCMD(config.MsgCMDReq{
 			ChannelID:   uid,
 			ChannelType: common.ChannelTypePerson.Uint8(),
 			CMD:         "topicRoomDeleted",
@@ -429,7 +722,9 @@ func (s *Service) sendTopicRoomDeletedBatches(channelID string, uids []string, r
 				"channel_type": common.ChannelTypeGroup.Uint8(),
 				"reason":       reason,
 			},
-		})
+		}); err != nil {
+			log.Error("发送话题房删除通知失败", zap.Error(err), zap.String("channel_id", channelID), zap.String("uid", uid))
+		}
 		if (i+1)%topicRoomDeletedNotifyBatchSize == 0 {
 			time.Sleep(topicRoomDeletedNotifyBatchSleep)
 		}
@@ -463,30 +758,27 @@ func compactUIDs(in []string) []string {
 	return out
 }
 
-func (s *Service) refreshGroupAvatar(channelID string, uids []string) error {
-	if channelID == "" {
-		return nil
+func roomIDFromReq(req RoomReq) string {
+	roomID := strings.TrimSpace(req.RoomID)
+	if roomID == "" {
+		roomID = strings.TrimSpace(req.ChannelID)
 	}
-	members := compactUIDs(uids)
-	if len(members) == 0 {
-		return nil
+	return roomID
+}
+
+func (s *Service) prepareRoomForResponse(room *TopicRoom, loginUID string, isAdmin bool) {
+	if room == nil {
+		return
 	}
-	if len(members) > 9 {
-		members = members[:9]
+	room.Tag = normalizeRoomTag(room.Tag)
+	room.CanPin = 0
+	room.CanDelete = 0
+	if isAdmin {
+		room.CanPin = 1
+		room.CanDelete = 1
+	} else if loginUID != "" && room.CreatorUID == loginUID {
+		room.CanDelete = 1
 	}
-	eventID, err := s.ctx.EventBegin(&wkevent.Data{
-		Event: event.GroupAvatarUpdate,
-		Type:  wkevent.CMD,
-		Data: &config.CMDGroupAvatarUpdateReq{
-			GroupNo: channelID,
-			Members: members,
-		},
-	}, nil)
-	if err != nil {
-		return err
-	}
-	s.ctx.EventCommit(eventID)
-	return nil
 }
 
 func (s *Service) ttl() time.Duration {

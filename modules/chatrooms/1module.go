@@ -1,9 +1,7 @@
 package chatrooms
 
 import (
-	"context"
 	"embed"
-	"time"
 
 	wkcommon "github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
@@ -21,11 +19,12 @@ func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		x := ctx.(*config.Context)
 		api := New(x)
-		StartCleanupLoop(context.Background(), api.service, 10*time.Minute, 100)
 		return register.Module{
 			Name:     "chatrooms",
 			SQLDir:   register.NewSQLFS(sqlFS),
 			Swagger:  swaggerContent,
+			Start:    api.Start,
+			Stop:     api.Stop,
 			SetupAPI: func() register.APIRouter { return api },
 			IMDatasource: register.IMDatasource{
 				HasData: func(channelID string, channelType uint8) register.IMDatasourceType {
@@ -43,7 +42,7 @@ func init() {
 						"large":      1,
 						"topic_room": 1,
 						"name":       room.Title,
-						// 先用发布者头像，避免群资料页/会话列表出现空白头像；后台仍会异步生成 groups/{groupNo}/avatar。
+						// 话题房固定使用发布者头像，避免每次成员变化都生成组合群头像。
 						"logo":                     room.CreatorAvatar,
 						"creator_uid":              room.CreatorUID,
 						"creator_name":             room.CreatorName,
@@ -85,8 +84,7 @@ func newChannelRespWithTopicRoom(room *TopicRoom) *model.ChannelResp {
 	resp.Channel.ChannelID = room.ChannelID
 	resp.Channel.ChannelType = uint8(wkcommon.ChannelTypeGroup)
 	resp.Name = room.Title
-	// 先返回发布者头像，保证群资料页、顶部标题和消息列表不再空白；
-	// 组合群头像由 GroupAvatarUpdate 事件异步生成，不再阻塞进入聊天室。
+	// 话题房固定返回发布者头像，保证群资料页、顶部标题和消息列表一致。
 	resp.Logo = room.CreatorAvatar
 	resp.Save = 1
 	resp.Category = "topic_room"
@@ -107,6 +105,8 @@ func newChannelRespWithTopicRoom(room *TopicRoom) *model.ChannelResp {
 		"participant_count":        room.ParticipantCount,
 		"unread_count":             room.UnreadCount,
 		"mention_unread_count":     room.MentionUnreadCount,
+		"can_delete":               room.CanDelete,
+		"can_pin":                  room.CanPin,
 		"expire_at":                room.ExpireAt,
 	}
 	return resp

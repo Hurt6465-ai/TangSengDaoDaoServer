@@ -1,6 +1,9 @@
 package chatrooms
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	DefaultTTL             = 3 * time.Hour
@@ -8,10 +11,23 @@ const (
 	DefaultMaxReplyAvatars = 6
 	DefaultRoomListLimit   = 30
 	MaxRoomListLimit       = 50
+	MaxRoomTitleLength     = 120
+	MaxRoomLanguageLength  = 32
+	MaxCreateRequestLength = 64
+
+	RoomTagSpeaking = "练口语"
+	RoomTagPartner  = "找搭子"
+	RoomTagWork     = "工作"
+	RoomTagMovie    = "影视"
+	RoomTagGame     = "游戏"
+	RoomTagStudy    = "学习"
+	RoomTagFriend   = "交友"
+	RoomTagChat     = "闲谈"
 )
 
 type TopicRoom struct {
 	RoomID             string        `json:"room_id" db:"room_id"`
+	CreateRequestNo    string        `json:"-" db:"create_request_no"`
 	Title              string        `json:"title" db:"title"`
 	Tag                string        `json:"tag" db:"tag"`
 	Language           string        `json:"language" db:"language"`
@@ -36,6 +52,8 @@ type TopicRoom struct {
 	ReplyUsersJSON     string        `json:"-" db:"reply_users_json"`
 	UnreadCount        int           `json:"unread_count" db:"-"`
 	MentionUnreadCount int           `json:"mention_unread_count" db:"-"`
+	CanDelete          int           `json:"can_delete" db:"-"`
+	CanPin             int           `json:"can_pin" db:"-"`
 	Pinned             int           `json:"pinned" db:"pinned"`
 	Hot                int           `json:"hot" db:"hot"`
 	HotUntil           int64         `json:"hot_until" db:"hot_until"`
@@ -55,9 +73,10 @@ type ReplyAvatar struct {
 }
 
 type CreateReq struct {
-	Title    string `json:"title" binding:"required"`
-	Tag      string `json:"tag"`
-	Language string `json:"language"`
+	Title           string `json:"title" binding:"required"`
+	Tag             string `json:"tag"`
+	Language        string `json:"language"`
+	CreateRequestNo string `json:"create_request_no"`
 }
 
 type RoomReq struct {
@@ -81,6 +100,7 @@ type ListResp struct {
 }
 
 type MessageWebhookReq struct {
+	MessageID       string   `json:"message_id"`
 	RoomID          string   `json:"room_id"`
 	ChannelID       string   `json:"channel_id"`
 	FromUID         string   `json:"from_uid"`
@@ -101,4 +121,27 @@ type UserMeta struct {
 	Avatar      string
 	CountryCode string
 	Country     string
+}
+
+func normalizeRoomTag(tag string) string {
+	switch strings.TrimSpace(tag) {
+	case RoomTagSpeaking:
+		return RoomTagSpeaking
+	case RoomTagPartner:
+		return RoomTagPartner
+	case RoomTagWork:
+		return RoomTagWork
+	case RoomTagMovie:
+		return RoomTagMovie
+	case "音乐", RoomTagGame:
+		return RoomTagGame
+	case RoomTagStudy:
+		return RoomTagStudy
+	case RoomTagFriend:
+		return RoomTagFriend
+	case "", "闲聊", RoomTagChat:
+		return RoomTagChat
+	default:
+		return RoomTagChat
+	}
 }
