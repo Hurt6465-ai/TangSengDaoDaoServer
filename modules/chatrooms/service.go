@@ -378,7 +378,11 @@ func (s *Service) listenerMessages(messages []*config.MessageResp) {
 		if msg == nil || msg.ChannelType != common.ChannelTypeGroup.Uint8() || msg.ChannelID == "" {
 			continue
 		}
-		if !s.IsTopicChannel(msg.ChannelID) {
+		messageAt := int64(msg.Timestamp) * 1000
+		if messageAt <= 0 {
+			messageAt = time.Now().UnixMilli()
+		}
+		if !s.IsTopicChannel(msg.ChannelID) && !s.db.isTopicChannelAt(msg.ChannelID, messageAt) {
 			continue
 		}
 		validMessages = append(validMessages, msg)

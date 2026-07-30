@@ -242,7 +242,7 @@ func (d *db) get(roomID string) (*TopicRoom, error) {
 	_, err := d.session.Select("room_id", "title", "tag", "language", "background_url", "background_index", "channel_id", "channel_type",
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
-		From("topic_rooms").Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).Limit(1).Load(&rooms)
+		From("topic_rooms").Where("status=1 AND expire_at>? AND (room_id=? OR channel_id=?)", time.Now().UnixMilli(), roomID, roomID).Limit(1).Load(&rooms)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +265,7 @@ func (d *db) getActiveRoomRaw(roomID string) (*TopicRoom, error) {
 		"creator_uid", "creator_name", "creator_avatar", "last_reply_uid", "last_reply_name", "last_reply_avatar",
 		"last_reply_text", "last_reply_type", "last_reply_at", "reply_count", "participant_count", "reply_users_json", "pinned", "hot", "hot_until", "status", "created_at", "expire_at").
 		From("topic_rooms").
-		Where("status=1 AND expire_at>? AND (room_id=? OR channel_id=?)", time.Now().UnixMilli(), roomID, roomID).
+		Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).
 		Limit(1).
 		Load(&rooms)
 	if err != nil {
@@ -335,6 +335,22 @@ func (d *db) isTopicChannel(channelID string) bool {
 	}
 	var count int
 	err := d.session.Select("count(*)").From("topic_rooms").Where("status=1 AND expire_at>? AND channel_id=?", time.Now().UnixMilli(), channelID).LoadOne(&count)
+	return err == nil && count > 0
+}
+
+func (d *db) isTopicChannelAt(channelID string, messageAt int64) bool {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return false
+	}
+	if messageAt <= 0 {
+		messageAt = time.Now().UnixMilli()
+	}
+	var count int
+	err := d.session.Select("count(*)").
+		From("topic_rooms").
+		Where("status=1 AND expire_at>=? AND channel_id=?", messageAt, channelID).
+		LoadOne(&count)
 	return err == nil && count > 0
 }
 
