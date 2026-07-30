@@ -6,21 +6,128 @@ paths:
   /v1/chatrooms/list:
     get:
       summary: List active open topic chatrooms
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 30
+        - in: query
+          name: cursor
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Active topic room page
   /v1/chatrooms/create:
     post:
       summary: Create an open topic chatroom
-      description: Supports create_request_no for idempotent retries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+      responses:
+        '200':
+          description: Created room; create_request_no is idempotent per creator
+        '410':
+          description: The idempotent request refers to an ended room
   /v1/chatrooms/enter:
     post:
       summary: Enter a topic chatroom and mark it read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomRequest'
+      responses:
+        '200':
+          description: Entered room
+        '410':
+          description: Room ended or does not exist
   /v1/chatrooms/read:
     post:
       summary: Mark a joined topic chatroom read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomRequest'
+      responses:
+        '200':
+          description: Room marked read
+        '410':
+          description: Room ended, missing, or the user has not joined it
   /v1/chatrooms/pin:
     post:
       summary: Pin or unpin a topic chatroom
-      description: Administrator only.
+      description: Admin or superAdmin only
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/RoomRequest'
+                - type: object
+                  properties:
+                    pinned:
+                      type: integer
+                      enum: [0, 1]
+      responses:
+        '200':
+          description: Updated room
+        '403':
+          description: Permission denied
+        '410':
+          description: Room ended or does not exist
   /v1/chatrooms/delete:
     post:
       summary: Delete a topic chatroom
-      description: Creator or administrator only.
+      description: Creator, admin, or superAdmin only
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomRequest'
+      responses:
+        '200':
+          description: Room deleted
+        '403':
+          description: Permission denied
+        '410':
+          description: Room ended or does not exist
+components:
+  schemas:
+    CreateRoomRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          maxLength: 120
+        tag:
+          type: string
+          enum: [练口语, 找搭子, 工作, 影视, 游戏, 学习, 交友, 闲谈]
+        language:
+          type: string
+          maxLength: 32
+        create_request_no:
+          type: string
+          maxLength: 64
+    RoomRequest:
+      type: object
+      properties:
+        room_id:
+          type: string
+        channel_id:
+          type: string
+        channel_type:
+          type: integer
+          default: 2
