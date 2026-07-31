@@ -517,21 +517,35 @@ func (s *Service) EnsureMutualFriends(uid string, toUID string, sourceVercode st
 	}
 
 	if relationshipChanged {
-		fromName := uid
-		if userInfo, queryErr := s.db.QueryByUID(uid); queryErr == nil && userInfo != nil && strings.TrimSpace(userInfo.Name) != "" {
-			fromName = userInfo.Name
+		nameOf := func(userUID string) string {
+			name := userUID
+			if userInfo, queryErr := s.db.QueryByUID(userUID); queryErr == nil && userInfo != nil && strings.TrimSpace(userInfo.Name) != "" {
+				name = userInfo.Name
+			}
+			return name
 		}
-		if err = s.ctx.SendCMD(config.MsgCMDReq{
-			CMD:         common.CMDFriendAccept,
-			Subscribers: []string{uid, toUID},
-			Param: map[string]interface{}{
-				"to_uid":    toUID,
-				"from_uid":  uid,
-				"from_name": fromName,
-				"source":    sourceVercode,
-			},
-		}); err != nil {
-			s.Warn("发送好友确认CMD失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+		// 两端分别发送“对方UID”，不能给双方复用同一个 to_uid，
+		// 否则其中一端会把自己的联系人状态当成好友更新。
+		notices := []struct {
+			subscriber string
+			peerUID    string
+		}{
+			{subscriber: uid, peerUID: toUID},
+			{subscriber: toUID, peerUID: uid},
+		}
+		for _, notice := range notices {
+			if sendErr := s.ctx.SendCMD(config.MsgCMDReq{
+				CMD:         common.CMDFriendAccept,
+				Subscribers: []string{notice.subscriber},
+				Param: map[string]interface{}{
+					"to_uid":    notice.peerUID,
+					"from_uid":  notice.peerUID,
+					"from_name": nameOf(notice.peerUID),
+					"source":    sourceVercode,
+				},
+			}); sendErr != nil {
+				s.Warn("发送好友确认CMD失败", zap.Error(sendErr), zap.String("uid", notice.subscriber), zap.String("to_uid", notice.peerUID))
+			}
 		}
 	}
 	// 双向刷新频道资料；CMD 丢失时联系人/会话也能及时看到新的好友状态。

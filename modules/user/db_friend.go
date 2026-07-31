@@ -109,7 +109,9 @@ func (d *friendDB) ensureMutualFriendsTx(uid, toUID, sourceVercode string, versi
 			"version":    version,
 			"initiator":  initiator,
 		}
-		if strings.TrimSpace(existing.SourceVercode) == "" || existing.IsDeleted != 0 || existing.IsAlone != 0 {
+		// 只给“本次新建”或“从已删除状态恢复”的方向写入交友来源。
+		// 已经存在的有效单向好友必须保留原来源，否则取消匹配会误删原关系。
+		if existing.IsDeleted != 0 {
 			updates["source_vercode"] = sourceVercode
 		}
 		_, updateErr := tx.Update("friend").SetMap(updates).Where("uid=? AND to_uid=?", owner, target).Exec()
@@ -187,6 +189,24 @@ func (d *friendDB) removeMutualFriendsIfSourceTx(uid, toUID, sourceVercode strin
 		return false, false, err
 	}
 	if err = remove(second, first, right, rightManaged); err != nil {
+		return false, false, err
+	}
+	// 如果匹配前已有一个有效单向好友，本次只会创建另一个方向。
+	// 取消匹配后要把原方向恢复为单向状态，不能继续伪装成双向好友。
+	restoreAlone := func(owner, target string, model *FriendModel, oppositeRemoved bool, managed bool) error {
+		if managed || !oppositeRemoved || model == nil || model.IsDeleted != 0 {
+			return nil
+		}
+		_, updateErr := tx.Update("friend").SetMap(map[string]interface{}{
+			"is_alone": 1,
+			"version":  version,
+		}).Where("uid=? AND to_uid=?", owner, target).Exec()
+		return updateErr
+	}
+	if err = restoreAlone(first, second, left, rightManaged, leftManaged); err != nil {
+		return false, false, err
+	}
+	if err = restoreAlone(second, first, right, leftManaged, rightManaged); err != nil {
 		return false, false, err
 	}
 	removedForward, removedReverse := leftManaged, rightManaged
