@@ -2,7 +2,9 @@ package user
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/db"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
@@ -43,6 +45,178 @@ func (d *friendDB) Insert(m *FriendModel) error {
 	friendKey := fmt.Sprintf("%s%s", CacheKeyFriends, m.UID)
 	err = d.ctx.GetRedisConn().SAdd(friendKey, m.ToUID)
 	return err
+}
+
+func (d *friendDB) addFriendCache(uid, toUID string) error {
+	if uid == "" || toUID == "" {
+		return nil
+	}
+	friendKey := fmt.Sprintf("%s%s", CacheKeyFriends, uid)
+	return d.ctx.GetRedisConn().SAdd(friendKey, toUID)
+}
+
+func (d *friendDB) removeFriendCache(uid, toUID string) error {
+	if uid == "" || toUID == "" {
+		return nil
+	}
+	friendKey := fmt.Sprintf("%s%s", CacheKeyFriends, uid)
+	return d.ctx.GetRedisConn().SRem(friendKey, toUID)
+}
+
+// ensureMutualFriendsTx 在同一事务内幂等建立两条好友记录。
+// 只有双方此前不是有效双向好友时，created 才为 true。
+func (d *friendDB) ensureMutualFriendsTx(uid, toUID, sourceVercode string, version int64, tx *dbr.Tx) (bool, bool, error) {
+	if uid == "" || toUID == "" || uid == toUID {
+		return false, false, nil
+	}
+	first, second := uid, toUID
+	if first > second {
+		first, second = second, first
+	}
+	query := func(owner, target string) (*FriendModel, error) {
+		var model *FriendModel
+		_, err := tx.SelectBySql(`SELECT * FROM friend WHERE uid=? AND to_uid=? LIMIT 1 FOR UPDATE`, owner, target).Load(&model)
+		return model, err
+	}
+	left, err := query(first, second)
+	if err != nil {
+		return false, false, err
+	}
+	right, err := query(second, first)
+	if err != nil {
+		return false, false, err
+	}
+	alreadyMutual := left != nil && right != nil && left.IsDeleted == 0 && right.IsDeleted == 0 && left.IsAlone == 0 && right.IsAlone == 0
+	managedBySource := alreadyMutual && ((left != nil && left.SourceVercode == sourceVercode) ||
+		(right != nil && right.SourceVercode == sourceVercode))
+	if alreadyMutual {
+		// 已经是有效双向好友时不要重复更新版本或覆盖来源。
+		return managedBySource, false, nil
+	}
+
+	upsert := func(owner, target string, initiator int, existing *FriendModel) error {
+		if existing == nil {
+			_, insertErr := tx.InsertInto("friend").Columns(
+				"uid", "to_uid", "flag", "version", "vercode", "source_vercode", "is_deleted", "is_alone", "initiator",
+			).Values(
+				owner, target, 0, version, fmt.Sprintf("%s@%d", util.GenerUUID(), common.Friend), sourceVercode, 0, 0, initiator,
+			).Exec()
+			return insertErr
+		}
+		updates := map[string]interface{}{
+			"is_deleted": 0,
+			"is_alone":   0,
+			"version":    version,
+			"initiator":  initiator,
+		}
+		if strings.TrimSpace(existing.SourceVercode) == "" || existing.IsDeleted != 0 || existing.IsAlone != 0 {
+			updates["source_vercode"] = sourceVercode
+		}
+		_, updateErr := tx.Update("friend").SetMap(updates).Where("uid=? AND to_uid=?", owner, target).Exec()
+		return updateErr
+	}
+
+	leftInitiator := 0
+	rightInitiator := 0
+	if first == uid {
+		leftInitiator = 1
+	} else {
+		rightInitiator = 1
+	}
+	if err = upsert(first, second, leftInitiator, left); err != nil {
+		return false, false, err
+	}
+	if err = upsert(second, first, rightInitiator, right); err != nil {
+		return false, false, err
+	}
+	// 记录至少一个由本次业务来源创建的方向；取消时只回滚对应方向，不误删原有关系。
+	leftAfter, err := query(first, second)
+	if err != nil {
+		return false, false, err
+	}
+	rightAfter, err := query(second, first)
+	if err != nil {
+		return false, false, err
+	}
+	managedBySource = (leftAfter != nil && leftAfter.SourceVercode == sourceVercode) ||
+		(rightAfter != nil && rightAfter.SourceVercode == sourceVercode)
+	return managedBySource, true, nil
+}
+
+// removeMutualFriendsIfSourceTx 只删除由指定业务来源创建的方向。
+// 若匹配前已有单向好友，只回滚匹配自动补出的另一方向，原关系保持不变。
+// 返回值顺序为 uid->toUID、toUID->uid 是否由该来源管理。
+func (d *friendDB) removeMutualFriendsIfSourceTx(uid, toUID, sourceVercode string, version int64, tx *dbr.Tx) (bool, bool, error) {
+	if uid == "" || toUID == "" || sourceVercode == "" || uid == toUID {
+		return false, false, nil
+	}
+	first, second := uid, toUID
+	if first > second {
+		first, second = second, first
+	}
+	query := func(owner, target string) (*FriendModel, error) {
+		var model *FriendModel
+		_, err := tx.SelectBySql(`SELECT * FROM friend WHERE uid=? AND to_uid=? LIMIT 1 FOR UPDATE`, owner, target).Load(&model)
+		return model, err
+	}
+	left, err := query(first, second)
+	if err != nil {
+		return false, false, err
+	}
+	right, err := query(second, first)
+	if err != nil {
+		return false, false, err
+	}
+	leftManaged := left != nil && left.SourceVercode == sourceVercode
+	rightManaged := right != nil && right.SourceVercode == sourceVercode
+	if !leftManaged && !rightManaged {
+		return false, false, nil
+	}
+	remove := func(owner, target string, model *FriendModel, managed bool) error {
+		if !managed || model == nil || (model.IsDeleted == 1 && model.IsAlone == 1) {
+			return nil
+		}
+		_, updateErr := tx.Update("friend").SetMap(map[string]interface{}{
+			"is_deleted": 1,
+			"is_alone":   1,
+			"version":    version,
+		}).Where("uid=? AND to_uid=? AND source_vercode=?", owner, target, sourceVercode).Exec()
+		return updateErr
+	}
+	if err = remove(first, second, left, leftManaged); err != nil {
+		return false, false, err
+	}
+	if err = remove(second, first, right, rightManaged); err != nil {
+		return false, false, err
+	}
+	removedForward, removedReverse := leftManaged, rightManaged
+	if first != uid {
+		removedForward, removedReverse = rightManaged, leftManaged
+	}
+	return removedForward, removedReverse, nil
+}
+
+func (d *friendDB) isMutualFriend(uid, toUID string) (bool, error) {
+	if uid == "" || toUID == "" || uid == toUID {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(`SELECT COUNT(*) FROM friend
+		WHERE ((uid=? AND to_uid=?) OR (uid=? AND to_uid=?))
+		  AND is_deleted=0 AND is_alone=0`, uid, toUID, toUID, uid).LoadOne(&count)
+	return count == 2, err
+}
+
+func (d *friendDB) hasWhitelistRelationship(uid, toUID string) (bool, error) {
+	if uid == "" || toUID == "" || uid == toUID {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(`SELECT
+		(SELECT COUNT(*) FROM friend WHERE uid=? AND to_uid=? AND is_deleted=0) +
+		(SELECT COUNT(*) FROM partner_contacts WHERE uid=? AND to_uid=? AND (status=1 OR (status=0 AND requester_uid=?)))`,
+		uid, toUID, uid, toUID, uid).LoadOne(&count)
+	return count > 0, err
 }
 
 // IsFriend 是否是好友

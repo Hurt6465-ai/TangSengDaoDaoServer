@@ -1,15 +1,19 @@
 package user
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/base/event"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServer/modules/source"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/log"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/util"
+	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/pkg/wkevent"
 	"go.uber.org/zap"
 )
 
@@ -41,6 +45,12 @@ type IService interface {
 	GetFriends(uid string) ([]*FriendResp, error)
 	//添加一个好友
 	AddFriend(uid string, friend *FriendReq) error
+	// EnsureMutualFriends 幂等建立双向好友关系。返回 true 表示该好友关系由 sourceVercode 管理。
+	EnsureMutualFriends(uid string, toUID string, sourceVercode string) (bool, error)
+	// RemoveMutualFriendsIfSource 只删除由 sourceVercode 创建的好友方向，保留匹配前已有关系。
+	RemoveMutualFriendsIfSource(uid string, toUID string, sourceVercode string) (bool, error)
+	// SetBlacklist 幂等设置用户黑名单，并同步到 WuKongIM。
+	SetBlacklist(uid string, toUID string, enabled bool) error
 	//添加一个用户
 	AddUser(user *AddUserReq) error
 	// 通过qrvercode获取用户信息
@@ -451,6 +461,239 @@ func (s *Service) AddFriend(uid string, friend *FriendReq) error {
 	if err != nil {
 		s.Error("添加好友失败", zap.Error(err))
 		return err
+	}
+	return nil
+}
+
+// EnsureMutualFriends 幂等建立双向好友关系，供交友匹配等已经获得双方明确同意的业务复用。
+// 返回值表示关系是否由 sourceVercode 管理；IM 白名单通过事务内事件持久化，
+// 即使 WuKongIM 暂时不可用也不会把已经成功的匹配误报为失败。
+func (s *Service) EnsureMutualFriends(uid string, toUID string, sourceVercode string) (bool, error) {
+	uid = strings.TrimSpace(uid)
+	toUID = strings.TrimSpace(toUID)
+	if uid == "" || toUID == "" {
+		return false, errors.New("好友ID不能为空")
+	}
+	if uid == toUID {
+		return false, errors.New("不能添加自己为好友")
+	}
+	sourceVercode = normalizeMutualSourceVercode(sourceVercode)
+
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	version := s.ctx.GenSeq(common.FriendSeqKey)
+	managedBySource, relationshipChanged, err := s.friendDB.ensureMutualFriendsTx(uid, toUID, sourceVercode, version, tx)
+	if err != nil {
+		return false, err
+	}
+	// 无论好友记录是新建、恢复还是原本已存在，都持久化一次白名单修复事件。
+	// 事件与好友事务一起提交，避免数据库成功但 IM 临时失败导致状态永久不一致。
+	eventID, err := s.ctx.EventBegin(&wkevent.Data{
+		Event: event.FriendSure,
+		Type:  wkevent.None,
+		Data: map[string]interface{}{
+			"uid":    uid,
+			"to_uid": toUID,
+		},
+	}, tx)
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	s.ctx.EventCommit(eventID)
+
+	// 事务提交后再维护 Redis 派生缓存，避免数据库回滚但缓存已写入。
+	if err = s.friendDB.addFriendCache(uid, toUID); err != nil {
+		s.Warn("更新好友缓存失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+	}
+	if err = s.friendDB.addFriendCache(toUID, uid); err != nil {
+		s.Warn("更新好友缓存失败", zap.Error(err), zap.String("uid", toUID), zap.String("to_uid", uid))
+	}
+
+	if relationshipChanged {
+		fromName := uid
+		if userInfo, queryErr := s.db.QueryByUID(uid); queryErr == nil && userInfo != nil && strings.TrimSpace(userInfo.Name) != "" {
+			fromName = userInfo.Name
+		}
+		if err = s.ctx.SendCMD(config.MsgCMDReq{
+			CMD:         common.CMDFriendAccept,
+			Subscribers: []string{uid, toUID},
+			Param: map[string]interface{}{
+				"to_uid":    toUID,
+				"from_uid":  uid,
+				"from_name": fromName,
+				"source":    sourceVercode,
+			},
+		}); err != nil {
+			s.Warn("发送好友确认CMD失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+		}
+	}
+	// 双向刷新频道资料；CMD 丢失时联系人/会话也能及时看到新的好友状态。
+	if err = s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+	); err != nil {
+		s.Warn("发送好友频道更新失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+	}
+	if err = s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+	); err != nil {
+		s.Warn("发送好友频道更新失败", zap.Error(err), zap.String("uid", toUID), zap.String("to_uid", uid))
+	}
+	return managedBySource, nil
+}
+
+// RemoveMutualFriendsIfSource 只删除由指定业务来源创建的好友方向。
+// 数据库和 Redis 在此处维护；IM 白名单由调用方按其他聊天关系统一判断后移除。
+func (s *Service) RemoveMutualFriendsIfSource(uid string, toUID string, sourceVercode string) (bool, error) {
+	uid = strings.TrimSpace(uid)
+	toUID = strings.TrimSpace(toUID)
+	sourceVercode = strings.TrimSpace(sourceVercode)
+	if uid == "" || toUID == "" || sourceVercode == "" || uid == toUID {
+		return false, nil
+	}
+	sourceVercode = normalizeMutualSourceVercode(sourceVercode)
+
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	version := s.ctx.GenSeq(common.FriendSeqKey)
+	removedForward, removedReverse, err := s.friendDB.removeMutualFriendsIfSourceTx(uid, toUID, sourceVercode, version, tx)
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	if !removedForward && !removedReverse {
+		return false, nil
+	}
+
+	if removedForward {
+		if err = s.friendDB.removeFriendCache(uid, toUID); err != nil {
+			s.Warn("移除好友缓存失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+		}
+		if err = s.ctx.SendFriendDelete(&config.MsgFriendDeleteReq{FromUID: uid, ToUID: toUID}); err != nil {
+			s.Warn("发送删除好友CMD失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+		}
+	}
+	if removedReverse {
+		if err = s.friendDB.removeFriendCache(toUID, uid); err != nil {
+			s.Warn("移除好友缓存失败", zap.Error(err), zap.String("uid", toUID), zap.String("to_uid", uid))
+		}
+		if err = s.ctx.SendFriendDelete(&config.MsgFriendDeleteReq{FromUID: toUID, ToUID: uid}); err != nil {
+			s.Warn("发送删除好友CMD失败", zap.Error(err), zap.String("uid", toUID), zap.String("to_uid", uid))
+		}
+	}
+	if err = s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+	); err != nil {
+		s.Warn("发送好友频道更新失败", zap.Error(err), zap.String("uid", uid), zap.String("to_uid", toUID))
+	}
+	if err = s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+	); err != nil {
+		s.Warn("发送好友频道更新失败", zap.Error(err), zap.String("uid", toUID), zap.String("to_uid", uid))
+	}
+	return true, nil
+}
+
+// normalizeMutualSourceVercode 保证 source_vercode 可被现有来源解析器安全读取。
+// 现有解析器要求字符串至少包含一个“@类型”；业务来源使用未占用的 999 类型，界面不显示错误来源文案。
+func normalizeMutualSourceVercode(value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		raw = "mutual_consent"
+	}
+	if !strings.Contains(raw, "@") {
+		raw += "@999"
+	}
+	if len(raw) <= 100 {
+		return raw
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("business:%x@999", sum[:16])
+}
+
+// SetBlacklist 幂等设置黑名单。数据库先落盘，IM 同步失败时返回错误供调用方重试。
+func (s *Service) SetBlacklist(uid string, toUID string, enabled bool) error {
+	uid = strings.TrimSpace(uid)
+	toUID = strings.TrimSpace(toUID)
+	if uid == "" || toUID == "" {
+		return errors.New("黑名单用户ID不能为空")
+	}
+	if uid == toUID {
+		return errors.New("不能屏蔽自己")
+	}
+
+	blacklist := 0
+	if enabled {
+		blacklist = 1
+	}
+	settingVersion := s.ctx.GenSeq(common.UserSettingSeqKey)
+	friendVersion := s.ctx.GenSeq(common.FriendSeqKey)
+	tx, err := s.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	_, err = tx.InsertBySql(`INSERT INTO user_setting(uid,to_uid,blacklist,version,created_at,updated_at)
+		VALUES(?,?,?,?,NOW(),NOW())
+		ON DUPLICATE KEY UPDATE blacklist=VALUES(blacklist),version=VALUES(version),updated_at=NOW()`,
+		uid, toUID, blacklist, settingVersion).Exec()
+	if err != nil {
+		return err
+	}
+	if enabled {
+		if _, err = tx.DeleteFrom("feed_follows").Where("(follower_uid=? AND following_uid=?) OR (follower_uid=? AND following_uid=?)", uid, toUID, toUID, uid).Exec(); err != nil {
+			return err
+		}
+	}
+	if err = s.friendDB.updateVersionTx(friendVersion, uid, toUID, tx); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	if enabled {
+		err = s.ctx.IMBlacklistAdd(config.ChannelBlacklistReq{
+			ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+			UIDs:       []string{toUID},
+		})
+	} else {
+		err = s.ctx.IMBlacklistRemove(config.ChannelBlacklistReq{
+			ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+			UIDs:       []string{toUID},
+		})
+	}
+	if err != nil {
+		return err
+	}
+	if updateErr := s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+	); updateErr != nil {
+		s.Warn("发送黑名单频道更新失败", zap.Error(updateErr), zap.String("uid", uid), zap.String("to_uid", toUID))
+	}
+	if updateErr := s.ctx.SendChannelUpdate(
+		config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+		config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+	); updateErr != nil {
+		s.Warn("发送黑名单频道更新失败", zap.Error(updateErr), zap.String("uid", toUID), zap.String("to_uid", uid))
 	}
 	return nil
 }

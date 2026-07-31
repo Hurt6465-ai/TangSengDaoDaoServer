@@ -20,39 +20,79 @@ func (f *Friend) handleFriendSure(data []byte, commit config.EventCommit) {
 		commit(err)
 		return
 	}
-	uid := req["uid"].(string)
-	toUID := req["to_uid"].(string)
+	uid, _ := req["uid"].(string)
+	toUID, _ := req["to_uid"].(string)
 	if uid == "" || toUID == "" {
 		commit(errors.New("好友ID不能为空"))
 		return
 	}
-	loginUidList := make([]string, 0, 1)
-	loginUidList = append(loginUidList, toUID)
+	mutual, err := f.hasMutualFriend(uid, toUID)
+	if err != nil {
+		commit(err)
+		return
+	}
+	if !mutual {
+		// 事件可能在取消匹配或删除好友后才被消费；此时不能重新加回白名单。
+		commit(nil)
+		return
+	}
 	err = f.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
 		ChannelReq: config.ChannelReq{
 			ChannelID:   uid,
 			ChannelType: common.ChannelTypePerson.Uint8(),
 		},
-		UIDs: loginUidList,
+		UIDs: []string{toUID},
 	})
 	if err != nil {
 		commit(errors.New("添加IM白名单错误"))
 		return
 	}
-	applyUIDList := make([]string, 0, 1)
-	applyUIDList = append(applyUIDList, uid)
 	err = f.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
 		ChannelReq: config.ChannelReq{
 			ChannelID:   toUID,
 			ChannelType: common.ChannelTypePerson.Uint8(),
 		},
-		UIDs: applyUIDList,
+		UIDs: []string{uid},
 	})
 	if err != nil {
 		commit(errors.New("添加IM白名单错误"))
 		return
 	}
+	// 再确认一次，覆盖“检查后立刻取消匹配”的并发窗口。
+	mutual, err = f.hasMutualFriend(uid, toUID)
+	if err != nil {
+		commit(err)
+		return
+	}
+	if !mutual {
+		keepForward, forwardErr := f.db.hasWhitelistRelationship(uid, toUID)
+		keepReverse, reverseErr := f.db.hasWhitelistRelationship(toUID, uid)
+		if forwardErr != nil || reverseErr != nil {
+			if forwardErr != nil {
+				commit(forwardErr)
+			} else {
+				commit(reverseErr)
+			}
+			return
+		}
+		if !keepForward {
+			_ = f.ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
+				ChannelReq: config.ChannelReq{ChannelID: uid, ChannelType: common.ChannelTypePerson.Uint8()},
+				UIDs:       []string{toUID},
+			})
+		}
+		if !keepReverse {
+			_ = f.ctx.IMWhitelistRemove(config.ChannelWhitelistReq{
+				ChannelReq: config.ChannelReq{ChannelID: toUID, ChannelType: common.ChannelTypePerson.Uint8()},
+				UIDs:       []string{uid},
+			})
+		}
+	}
 	commit(nil)
+}
+
+func (f *Friend) hasMutualFriend(uid, toUID string) (bool, error) {
+	return f.db.isMutualFriend(uid, toUID)
 }
 
 // 处理删除好友
