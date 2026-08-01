@@ -55,7 +55,7 @@ paths:
         - {name: scope, in: query, schema: {type: string, enum: [global, nearby]}}
         - {name: session_id, in: query, schema: {type: string}}
         - {name: country_mode, in: query, schema: {type: string, enum: [smart, same_country, foreign_open]}}
-        - {name: gender, in: query, schema: {type: string, enum: [all, female, male]}}
+        - {name: gender, in: query, deprecated: true, schema: {type: string, enum: [all, female, male]}, description: 兼容旧客户端；服务端忽略该参数并使用资料中的 gender_preference，未设置时默认异性}
         - {name: age_min, in: query, schema: {type: integer}}
         - {name: age_max, in: query, schema: {type: integer}}
         - {name: intent, in: query, schema: {type: string, enum: [all, serious, marriage, long_term, long_term_open_short, short_term_open_long, short_term, friends, open]}}
