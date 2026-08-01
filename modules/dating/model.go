@@ -1056,16 +1056,9 @@ func fitsRequestFilters(viewer, target *DatingProfileResp, req RecommendReq) boo
 	if req.AgeMax > 0 && target.Age > 0 && target.Age > req.AgeMax {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(req.Gender)) {
-	case "female", "woman", "0":
-		if target.Sex != 0 {
-			return false
-		}
-	case "male", "man", "1":
-		if target.Sex != 1 {
-			return false
-		}
-	}
+	// Gender matching is enforced by the two saved profile preferences in
+	// fitsMutualFilters. Request-level gender values are intentionally ignored so
+	// a stale or modified client cannot override the server-side preference.
 	if !matchesDatingIntentFilter(req.Intent, target.Intent) {
 		return false
 	}
@@ -1099,13 +1092,36 @@ func fitsMutualFilters(viewer, target *DatingProfileResp) bool {
 	if viewer.Age > 0 && (viewer.Age < target.MinAge || viewer.Age > target.MaxAge) {
 		return false
 	}
-	if viewer.GenderPreference >= 0 && target.Sex != viewer.GenderPreference {
+	viewerPreference := effectiveGenderPreference(viewer)
+	if viewerPreference >= 0 && target.Sex != viewerPreference {
 		return false
 	}
-	if target.GenderPreference >= 0 && viewer.Sex != target.GenderPreference {
+	targetPreference := effectiveGenderPreference(target)
+	if targetPreference >= 0 && viewer.Sex != targetPreference {
 		return false
 	}
 	return true
+}
+
+// effectiveGenderPreference keeps the legacy -1 value backward compatible while
+// avoiding accidental same-sex recommendations for users who never selected a
+// preference. Explicit 0/1 choices are still respected, so same-sex matching is
+// available only after the user deliberately selects it.
+func effectiveGenderPreference(profile *DatingProfileResp) int {
+	if profile == nil {
+		return -1
+	}
+	if profile.GenderPreference == 0 || profile.GenderPreference == 1 {
+		return profile.GenderPreference
+	}
+	switch profile.Sex {
+	case 0:
+		return 1
+	case 1:
+		return 0
+	default:
+		return -1
+	}
 }
 
 func rankDatingProfiles(list []*DatingProfileResp, viewer *DatingProfileResp, scope string) []*DatingProfileResp {

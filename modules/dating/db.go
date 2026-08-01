@@ -410,13 +410,10 @@ func (d *db) recommend(loginUID string, viewer *DatingProfileResp, req Recommend
 		sessionID = "default"
 	}
 	activeAfter := time.Now().UnixMilli() - DatingActiveWindowMS
-	desiredSex := viewer.GenderPreference
-	switch strings.ToLower(strings.TrimSpace(req.Gender)) {
-	case "female", "woman", "0":
-		desiredSex = 0
-	case "male", "man", "1":
-		desiredSex = 1
-	}
+	// The saved profile preference is authoritative. Legacy clients can still
+	// send the gender query parameter, but it must not override the user's
+	// server-side preference. An unset preference defaults to the opposite sex.
+	desiredSex := effectiveGenderPreference(viewer)
 	effectiveAgeMin, effectiveAgeMax := viewer.MinAge, viewer.MaxAge
 	if req.AgeMin > effectiveAgeMin {
 		effectiveAgeMin = req.AgeMin

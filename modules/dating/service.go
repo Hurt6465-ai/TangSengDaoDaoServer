@@ -279,7 +279,9 @@ func (s *Service) Recommend(uid string, req RecommendReq) (*RecommendResp, error
 	}
 	baseReq := RecommendReq{
 		Scope: scope, SessionID: req.SessionID, CountryMode: req.CountryMode,
-		Gender: req.Gender, AgeMin: req.AgeMin, AgeMax: req.AgeMax, Intent: req.Intent,
+		// Gender selection is stored in the dating profile and enforced by the
+		// server. Do not let a request query override that preference.
+		Gender: "", AgeMin: req.AgeMin, AgeMax: req.AgeMax, Intent: req.Intent,
 		AllowRepeat: req.AllowRepeat,
 	}
 
