@@ -2,7 +2,6 @@ package user
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/common"
 	"github.com/TangSengDaoDao/TangSengDaoDaoServerLib/config"
