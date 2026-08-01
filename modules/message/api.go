@@ -177,6 +177,17 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 	}
 
 	var partnerGuard *partnerPendingGuard
+	activatePartnerReply := func() {
+		if partnerGuard == nil || !partnerGuard.ReceiverReply {
+			return
+		}
+		if activateErr := m.activatePartnerContactAfterReply(uid, req.ReceiveChannelID); activateErr != nil {
+			m.Error("激活语伴临时会话失败", zap.Error(activateErr), zap.String("uid", uid), zap.String("to_uid", req.ReceiveChannelID))
+			return
+		}
+		partnerGuard.Pending = false
+		partnerGuard.MessageCount = 0
+	}
 	if req.ReceiveChannelType == common.ChannelTypePerson.Uint8() {
 		sendUserIsFriend, err := m.userService.IsFriend(uid, req.ReceiveChannelID)
 		if err != nil {
@@ -202,6 +213,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 				return
 			}
 			if partnerGuard.DuplicateDelivered {
+				activatePartnerReply()
 				c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, nil, true))
 				return
 			}
@@ -230,7 +242,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 		}
 	}
 	var imResp *config.MsgSendResp
-	if partnerGuard != nil && partnerGuard.Requester && partnerGuard.NeedsReconcile {
+	if partnerGuard != nil && partnerGuard.Reserved && partnerGuard.NeedsReconcile {
 		var found bool
 		imResp, found, err = m.reconcilePartnerPendingMessage(uid, req.ReceiveChannelID, partnerGuard)
 		if err != nil {
@@ -239,11 +251,12 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			return
 		}
 		if found {
+			activatePartnerReply()
 			c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, imResp, true))
 			return
 		}
 	}
-	if partnerGuard != nil && partnerGuard.Requester {
+	if partnerGuard != nil && partnerGuard.Reserved {
 		imResp, err = m.sendPartnerMessageStable(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload, partnerGuard.IMClientMsgNo)
 	} else {
 		imResp, err = m.sendMessageWithResult(req.ReceiveChannelID, req.ReceiveChannelType, uid, req.Payload)
@@ -265,14 +278,7 @@ func (m *Message) sendMsg(c *wkhttp.Context) {
 			m.Error("确认语伴pending消息投递状态失败", zap.Error(completeErr), zap.String("uid", uid), zap.String("client_msg_no", partnerGuard.ClientMsgNo))
 		}
 	}
-	if partnerGuard != nil && partnerGuard.ReceiverReply {
-		if activateErr := m.activatePartnerContactAfterReply(uid, req.ReceiveChannelID); activateErr != nil {
-			m.Error("激活语伴临时会话失败", zap.Error(activateErr), zap.String("uid", uid), zap.String("to_uid", req.ReceiveChannelID))
-		} else {
-			partnerGuard.Pending = false
-			partnerGuard.MessageCount = 0
-		}
-	}
+	activatePartnerReply()
 	if partnerGuard != nil {
 		c.JSON(http.StatusOK, newPartnerMessageSendResponse(partnerGuard, imResp, false))
 		return

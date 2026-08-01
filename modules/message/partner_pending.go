@@ -241,10 +241,9 @@ func (m *Message) preparePartnerTemporaryMessage(fromUID, toUID, clientMsgNo str
 	guard := &partnerPendingGuard{Handled: true, MessageCount: contact.RequesterMsgCount}
 	switch contact.Status {
 	case partnerContactActive:
-		if err = tx.Commit(); err != nil {
-			return nil, err
-		}
-		return guard, nil
+		// A newly active relation may still be routed through this gateway by a client
+		// that has not received the latest state yet. Keep accepting that request, but
+		// use its client_msg_no for the same stable delivery guarantees as pending sends.
 	case partnerContactIgnored, partnerContactBlocked:
 		return nil, errPartnerRelationDenied
 	case partnerContactPending:
@@ -252,18 +251,20 @@ func (m *Message) preparePartnerTemporaryMessage(fromUID, toUID, clientMsgNo str
 	default:
 		return nil, errPartnerRelationDenied
 	}
-	contentType := partnerPayloadContentType(payload)
-	if !isPartnerContentType(contentType) {
-		return nil, errPartnerUnsupportedContent
-	}
-	if contact.RequesterUID != fromUID {
-		guard.ReceiverReply = true
+	// Preserve compatibility for an old active-relation proxy caller that did not
+	// provide client_msg_no. New Android clients always provide one, including the
+	// receiver's first reply and the short active-transition window.
+	if contact.Status == partnerContactActive && strings.TrimSpace(clientMsgNo) == "" {
 		if err = tx.Commit(); err != nil {
 			return nil, err
 		}
 		return guard, nil
 	}
-	guard.Requester = true
+
+	contentType := partnerPayloadContentType(payload)
+	if !isPartnerContentType(contentType) {
+		return nil, errPartnerUnsupportedContent
+	}
 	clientMsgNo, err = normalizePartnerClientMsgNo(clientMsgNo, payload)
 	if err != nil {
 		return nil, err
@@ -276,6 +277,15 @@ func (m *Message) preparePartnerTemporaryMessage(fromUID, toUID, clientMsgNo str
 	guard.IMClientMsgNo = stablePartnerIMClientMsgNo(fromUID, clientMsgNo)
 	guard.PayloadHash = payloadHash
 	guard.ContentType = contentType
+	reservedCount := 0
+	if contact.Status == partnerContactPending {
+		if contact.RequesterUID == fromUID {
+			guard.Requester = true
+			reservedCount = 1
+		} else {
+			guard.ReceiverReply = true
+		}
+	}
 	var rows []partnerPendingMessageRow
 	_, err = tx.SelectBySql(`SELECT receiver_uid,client_msg_no,content_type,payload_hash,status,reserved_count,im_client_msg_no,im_message_id,updated_at,IFNULL(next_check_at,0) next_check_at FROM partner_pending_message WHERE sender_uid=? AND client_msg_no=? LIMIT 1 FOR UPDATE`, fromUID, clientMsgNo).Load(&rows)
 	if err != nil {
@@ -335,32 +345,39 @@ func (m *Message) preparePartnerTemporaryMessage(fromUID, toUID, clientMsgNo str
 			return nil, errPartnerMessageInProgress
 		}
 	}
-	if contact.RequesterMsgCount >= partnerPendingMaxMessages {
+	if guard.Requester && contact.RequesterMsgCount >= partnerPendingMaxMessages {
 		return nil, errPartnerPendingLimit
 	}
 	now := time.Now().UnixMilli()
-	next := contact.RequesterMsgCount + 1
+	next := contact.RequesterMsgCount
+	if guard.Requester {
+		next++
+	}
 	if len(rows) == 0 {
-		_, err = tx.InsertInto("partner_pending_message").Columns("sender_uid", "receiver_uid", "client_msg_no", "content_type", "payload_hash", "reserved_count", "status", "im_client_msg_no", "created_at", "updated_at").Values(fromUID, toUID, clientMsgNo, contentType, payloadHash, 1, partnerPendingMessageReserved, guard.IMClientMsgNo, now, now).Exec()
+		_, err = tx.InsertInto("partner_pending_message").Columns("sender_uid", "receiver_uid", "client_msg_no", "content_type", "payload_hash", "reserved_count", "status", "im_client_msg_no", "created_at", "updated_at").Values(fromUID, toUID, clientMsgNo, contentType, payloadHash, reservedCount, partnerPendingMessageReserved, guard.IMClientMsgNo, now, now).Exec()
 	} else {
-		_, err = tx.Update("partner_pending_message").Set("reserved_count", 1).Set("status", partnerPendingMessageReserved).Set("im_client_msg_no", guard.IMClientMsgNo).Set("im_message_id", "").Set("failed_reason", "").Set("next_check_at", 0).Set("updated_at", now).Where("sender_uid=? AND client_msg_no=?", fromUID, clientMsgNo).Exec()
+		_, err = tx.Update("partner_pending_message").Set("reserved_count", reservedCount).Set("status", partnerPendingMessageReserved).Set("im_client_msg_no", guard.IMClientMsgNo).Set("im_message_id", "").Set("failed_reason", "").Set("next_check_at", 0).Set("updated_at", now).Where("sender_uid=? AND client_msg_no=?", fromUID, clientMsgNo).Exec()
 	}
 	if err != nil {
 		return nil, err
 	}
-	result, err := tx.Update("partner_contacts").Set("requester_msg_count", next).Set("last_msg_at", now).Set("updated_at", now).Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=? AND IFNULL(requester_msg_count,0)=?", fromUID, toUID, toUID, fromUID, partnerContactPending, fromUID, contact.RequesterMsgCount).Exec()
-	if err != nil {
-		return nil, err
-	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return nil, errPartnerPendingLimit
+	if guard.Requester {
+		result, updateErr := tx.Update("partner_contacts").Set("requester_msg_count", next).Set("last_msg_at", now).Set("updated_at", now).Where("((uid=? AND to_uid=?) OR (uid=? AND to_uid=?)) AND status=? AND requester_uid=? AND IFNULL(requester_msg_count,0)=?", fromUID, toUID, toUID, fromUID, partnerContactPending, fromUID, contact.RequesterMsgCount).Exec()
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		n, _ := result.RowsAffected()
+		if n == 0 {
+			return nil, errPartnerPendingLimit
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	guard.Reserved = true
-	guard.MessageCount = next
+	if guard.Requester {
+		guard.MessageCount = next
+	}
 	return guard, nil
 }
 
