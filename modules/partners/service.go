@@ -1102,8 +1102,27 @@ func (s *Service) fillGreetingQuota(uid string, resp *GreetingResp) *GreetingRes
 	if resp == nil {
 		return nil
 	}
+	fillGreetingMessageIdentity(uid, resp)
 	resp.GreetingQuotaResp = s.GreetingQuota(uid)
 	return resp
+}
+
+// fillGreetingMessageIdentity exposes the exact idempotency identity used for the
+// server-side WuKongIM send. Android can persist a sender-side copy with this same
+// client_msg_no, so a later IM sync refreshes that row instead of creating a duplicate.
+func fillGreetingMessageIdentity(uid string, resp *GreetingResp) {
+	if resp == nil || uid == "" || resp.ToUID == "" || resp.LastGreetAt <= 0 || strings.TrimSpace(resp.Text) == "" {
+		return
+	}
+	if resp.ClientMsgNo == "" {
+		resp.ClientMsgNo = greetingIMClientMsgNo(uid, resp.ToUID, resp.LastGreetAt)
+	}
+	if resp.Timestamp <= 0 {
+		resp.Timestamp = resp.LastGreetAt
+		if resp.Timestamp > 100000000000 {
+			resp.Timestamp /= 1000
+		}
+	}
 }
 
 func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error) {
@@ -1134,14 +1153,14 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	}
 	if contact != nil {
 		if contact.Status == PartnerContactStatusActive {
-			return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusActive, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已经可以聊天"}), nil
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusActive, Requester: contact.RequesterUID == uid, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "已经可以聊天"}), nil
 		}
 		if contact.Status == PartnerContactStatusBlocked || contact.Status == PartnerContactStatusIgnored {
 			return nil, ErrGreetingBlacklisted
 		}
 		if contact.Status == PartnerContactStatusPending {
 			if contact.RequesterUID != uid {
-				return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}), nil
+				return s.fillGreetingQuota(uid, &GreetingResp{Status: 200, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, Requester: false, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: "对方已打招呼，可以直接回复"}), nil
 			}
 			// Unknown results (status=0) are retried with the same stable WuKong
 			// client_msg_no. Definite failures (status=2) must be rolled back instead;
@@ -1151,7 +1170,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 					return nil, deliveryErr
 				} else if delivery != nil && delivery.SendStatus == 2 {
 					if rollbackErr := s.db.rollbackPendingGreetingSend(uid, toUID, delivery.LastGreetAt); rollbackErr != nil {
-						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "上次招呼发送失败，状态恢复中，请稍后重试"}), rollbackErr
+						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "上次招呼发送失败，状态恢复中，请稍后重试"}), rollbackErr
 					}
 					s.signalPartnerIMPermissionOutbox()
 					// The rollback transaction removed the stale pending contact and daily
@@ -1160,7 +1179,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 					recoveredFailedGreeting = true
 				} else if delivery != nil && delivery.SendStatus == 0 {
 					if retryErr := s.deliverGreetingRow(delivery); retryErr != nil {
-						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "招呼消息投递确认中，请稍后重试"}), retryErr
+						return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: delivery.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Text: delivery.Text, Msg: "招呼消息投递确认中，请稍后重试"}), retryErr
 					}
 				}
 			}
@@ -1174,7 +1193,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 					status = 429
 					msg = ErrPendingMessageLimit.Error()
 				}
-				return s.fillGreetingQuota(uid, &GreetingResp{Status: status, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), nil
+				return s.fillGreetingQuota(uid, &GreetingResp{Status: status, ToUID: toUID, TargetUID: toUID, LastGreetAt: contact.LastMsgAt, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: contact.RequesterMsgCount, MaxGreetingCount: MaxPendingGreetingMessages, Msg: msg}), nil
 			}
 		}
 	}
@@ -1188,7 +1207,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 	}
 	cooldownMs := int64(GreetingSameTargetCooldown / time.Millisecond)
 	if stats.LastTargetGreetAt > 0 && now-stats.LastTargetGreetAt < cooldownMs {
-		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
+		resp := &GreetingResp{Status: 429, ToUID: toUID, TargetUID: toUID, LastGreetAt: stats.LastTargetGreetAt, NextAllowedAt: stats.LastTargetGreetAt + cooldownMs, HelloSent: 1, GreetingStatus: 1, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: MaxPendingGreetingMessages, MaxGreetingCount: MaxPendingGreetingMessages, Msg: ErrGreetingDuplicate.Error()}
 		return s.fillGreetingQuota(uid, resp), ErrGreetingDuplicate
 	}
 	if !recoveredFailedGreeting && !s.allowNewGreetingRate(uid, now) {
@@ -1221,6 +1240,7 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		releaseDaily()
 		return nil, err
 	}
+	resp.Requester = true
 	resp.RequesterMsgCount = 1
 	resp.MaxGreetingCount = MaxPendingGreetingMessages
 	// Permission changes are committed to partner_im_permission_outbox together with
@@ -1232,13 +1252,13 @@ func (s *Service) RecordGreeting(uid string, req GreetReq) (*GreetingResp, error
 		// Keep the pending relation and daily reservation; retries use the same stable
 		// IM client_msg_no, so this cannot create a second visible greeting.
 		if !isDefiniteGreetingSendError(err) {
-			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼消息投递确认中，请稍后重试"}), err
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼消息投递确认中，请稍后重试"}), err
 		}
 		// A definite IM 4xx means the message was not accepted and is safe to roll back.
 		// Contact counters, permission cleanup and the daily reservation are committed
 		// atomically so a retry cannot decrement any of them twice.
 		if rollbackErr := s.db.rollbackPendingGreetingSend(uid, toUID, resp.LastGreetAt); rollbackErr != nil {
-			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼发送失败，状态回滚处理中，请稍后重试"}), rollbackErr
+			return s.fillGreetingQuota(uid, &GreetingResp{Status: 503, ToUID: toUID, TargetUID: toUID, LastGreetAt: resp.LastGreetAt, HelloSent: 0, GreetingStatus: 0, ContactStatus: PartnerContactStatusPending, Requester: true, RequesterMsgCount: 1, MaxGreetingCount: MaxPendingGreetingMessages, Text: resp.Text, Msg: "招呼发送失败，状态回滚处理中，请稍后重试"}), rollbackErr
 		}
 		s.signalPartnerIMPermissionOutbox()
 		return nil, err

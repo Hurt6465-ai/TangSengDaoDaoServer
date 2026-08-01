@@ -125,9 +125,14 @@ type GreetingResp struct {
 	HelloSent         int    `json:"hello_sent"`
 	GreetingStatus    int    `json:"greeting_status"`
 	ContactStatus     int    `json:"contact_status"`
+	Requester         bool   `json:"requester"`
 	RequesterMsgCount int    `json:"requester_msg_count"`
 	MaxGreetingCount  int    `json:"max_greeting_count"`
 	Text              string `json:"text,omitempty"`
+	ClientMsgNo       string `json:"client_msg_no,omitempty"`
+	MessageID         string `json:"message_id,omitempty"`
+	MessageSeq        uint32 `json:"message_seq"`
+	Timestamp         int64  `json:"timestamp"`
 	Msg               string `json:"msg,omitempty"`
 	GreetingQuotaResp
 }
