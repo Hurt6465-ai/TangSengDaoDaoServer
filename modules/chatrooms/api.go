@@ -35,6 +35,7 @@ func (cr *Chatrooms) Start() error {
 		cr.workerCancel = cancel
 		cr.service.Start(workerCtx)
 		StartCleanupLoop(workerCtx, cr.service, time.Minute, 300)
+		StartPurgeLoop(workerCtx, cr.service, time.Hour, 200)
 	})
 	return nil
 }

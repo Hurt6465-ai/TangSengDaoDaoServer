@@ -332,6 +332,20 @@ func (s *Service) CleanupExpired(limit uint64) (int, error) {
 	return count, nil
 }
 
+// PurgeDeleted permanently removes topic-room business records that have
+// already been soft-deleted for at least retention. Active rooms are never
+// selected by this method.
+func (s *Service) PurgeDeleted(retention time.Duration, limit uint64) (int, error) {
+	if retention <= 0 {
+		retention = topicRoomPurgeRetention
+	}
+	if limit == 0 {
+		limit = 200
+	}
+	cutoff := time.Now().Add(-retention).UnixMilli()
+	return s.db.purgeDeleted(cutoff, limit)
+}
+
 func (s *Service) IsTopicChannel(channelID string) bool {
 	channelID = strings.TrimSpace(channelID)
 	if channelID == "" || !strings.HasPrefix(channelID, "topic_") {

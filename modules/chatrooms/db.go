@@ -426,8 +426,14 @@ func (d *db) softDelete(roomID string) error {
 	}
 	defer tx.RollbackUnlessCommitted()
 
+	// Once the room becomes inactive, expire_at is repurposed as the soft-delete
+	// timestamp. The purge query can therefore use the existing
+	// (status, expire_at) index and retain the room for a full retention period
+	// even when expiration cleanup was delayed.
+	softDeletedAt := time.Now().UnixMilli()
 	result, err := tx.Update("topic_rooms").
 		Set("status", 0).
+		Set("expire_at", softDeletedAt).
 		Set("updated_at", dbr.Expr("NOW()")).
 		Where("status=1 AND (room_id=? OR channel_id=?)", roomID, roomID).
 		Exec()
@@ -941,4 +947,88 @@ func previewText(t string) string {
 		}
 		return fmt.Sprintf("[%s]", t)
 	}
+}
+
+// purgeDeleted permanently removes topic-room business metadata after the
+// retention period. Only status=0 rooms are eligible, so active rooms cannot be
+// removed even if their timestamps are malformed.
+func (d *db) purgeDeleted(cutoff int64, limit uint64) (int, error) {
+	if limit == 0 {
+		limit = 200
+	}
+
+	rooms := make([]*TopicRoom, 0)
+	_, err := d.session.Select("room_id", "channel_id").
+		From("topic_rooms").
+		Where("status=0 AND expire_at<=?", cutoff).
+		OrderBy("expire_at ASC", "room_id ASC").
+		Limit(limit).
+		Load(&rooms)
+	if err != nil {
+		return 0, err
+	}
+	if len(rooms) == 0 {
+		return 0, nil
+	}
+
+	roomIDs := make([]string, 0, len(rooms))
+	channelIDs := make([]string, 0, len(rooms))
+	seenChannels := make(map[string]struct{}, len(rooms))
+	for _, room := range rooms {
+		if room == nil || room.RoomID == "" {
+			continue
+		}
+		roomIDs = append(roomIDs, room.RoomID)
+		channelID := room.ChannelID
+		if channelID == "" {
+			channelID = room.RoomID
+		}
+		if _, ok := seenChannels[channelID]; !ok {
+			seenChannels[channelID] = struct{}{}
+			channelIDs = append(channelIDs, channelID)
+		}
+	}
+	if len(roomIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	if _, err = tx.DeleteFrom("topic_room_members").Where("room_id in ?", roomIDs).Exec(); err != nil {
+		return 0, err
+	}
+	if len(channelIDs) > 0 {
+		// These tables are shared with ordinary groups, therefore every delete is
+		// scoped to channel IDs that came from already soft-deleted topic rooms.
+		if _, err = tx.DeleteFrom("group_setting").Where("group_no in ?", channelIDs).Exec(); err != nil {
+			return 0, err
+		}
+		if _, err = tx.DeleteFrom("group_member").Where("group_no in ?", channelIDs).Exec(); err != nil {
+			return 0, err
+		}
+		if _, err = tx.DeleteFrom("`group`").
+			Where("group_no in ? AND category=? AND status=?", channelIDs, "topic_room", 2).
+			Exec(); err != nil {
+			return 0, err
+		}
+	}
+
+	result, err := tx.DeleteFrom("topic_rooms").
+		Where("room_id in ? AND status=0 AND expire_at<=?", roomIDs, cutoff).
+		Exec()
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
 }
