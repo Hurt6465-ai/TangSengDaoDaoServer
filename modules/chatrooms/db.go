@@ -961,7 +961,7 @@ func (d *db) purgeDeleted(cutoff int64, limit uint64) (int, error) {
 	_, err := d.session.Select("room_id", "channel_id").
 		From("topic_rooms").
 		Where("status=0 AND expire_at<=?", cutoff).
-		OrderBy("expire_at ASC", "room_id ASC").
+		OrderBy("expire_at ASC, room_id ASC").
 		Limit(limit).
 		Load(&rooms)
 	if err != nil {
